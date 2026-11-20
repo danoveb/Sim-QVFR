@@ -303,21 +303,21 @@ Card foveation_card() {
 // Periphery resolution and Focus density are the most it uses; it lowers them 1% at a time while the GPU time per frame runs
 // over the first limit and raises them again while it runs under the second.
 Card regulator_card() {
-    Card c{Tab::Picture, L"GPU regulator", Applies::Live};
+    Card c{Tab::Picture, tr(L"GPU regulator"), Applies::Live};
     c.body = [](Body& b) {
         const GpuRegulatorSettings& r = app.s.regulator;
-        b.toggle(kRegFocus, L"Regulate focus density", r.focus,
-                 r.focus ? L"Lowered and raised 1% at a time, never above the set density." : L"Off");
-        b.toggle(kRegPeriphery, L"Regulate periphery resolution", r.periphery,
-                 r.periphery ? L"Lowered and raised 1% at a time, never above the set resolution." : L"Off");
-        b.sliders({kRegDecrease, L"Lower above", r.decreaseAbove, L" ms", L"", true},
-                  {kRegIncrease, L"Raise below", r.increaseBelow, L" ms", L"", true});
-        b.sliders({kRegLowerFrames, L"Frames before lowering", r.lowerFrames, L" frames"},
-                  {kRegRaiseFrames, L"Frames before raising", r.raiseFrames, L" frames"});
+        b.toggle(kRegFocus, tr(L"Regulate focus density"), r.focus,
+                 r.focus ? tr(L"Lowered and raised 1% at a time, never above the set density.") : tr(L"Off"));
+        b.toggle(kRegPeriphery, tr(L"Regulate periphery resolution"), r.periphery,
+                 r.periphery ? tr(L"Lowered and raised 1% at a time, never above the set resolution.") : tr(L"Off"));
+        b.sliders({kRegDecrease, tr(L"Lower above"), r.decreaseAbove, L" ms", L"", true},
+                  {kRegIncrease, tr(L"Raise below"), r.increaseBelow, L" ms", L"", true});
+        b.sliders({kRegLowerFrames, tr(L"Frames before lowering"), r.lowerFrames, L" frames"},
+                  {kRegRaiseFrames, tr(L"Frames before raising"), r.raiseFrames, L" frames"});
         b.note(r.increaseBelow > r.decreaseAbove
-                   ? L"Raise below is held at Lower above: nothing is raised while the frames are over the limit."
-                   : r.on() ? L"GPU time of the eye passes per frame, as the log’s scene span. Between the two limits nothing changes."
-                            : L"Switch on what to regulate: the sliders below act once one is on.");
+                   ? tr(L"Raise below is held at Lower above: nothing is raised while the frames are over the limit.")
+                   : r.on() ? tr(L"GPU time of the eye passes per frame, as the log’s scene span. Between the two limits nothing changes.")
+                            : tr(L"Switch on what to regulate: the sliders below act once one is on."));
     };
     c.reset = [](Settings& s) { s.regulator = GpuRegulatorSettings{}; };
     return c;
