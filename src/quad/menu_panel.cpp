@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../lang.h"
 #include "../log.h"
 
 namespace simqvfr {
@@ -12,7 +13,18 @@ namespace {
 constexpr uint32_t kBackground = 0x16181c, kHighlight = 0x0a6e78, kLabel = 0xe8eaed, kDim = 0x9aa0a6,
                    kCapped = 0xff6b5e;  // a value that did not take, and why
 constexpr uint8_t kAlpha = 0xe6;
-constexpr int kMargin = 36, kLineHeight = 50, kTitleHeight = 64;
+constexpr int kCornerRadius = 32;  // as the overlay's card
+constexpr int kMargin = 36, kLineHeight = kMenuLineHeight, kTitleHeight = 64;
+constexpr int kTabsHeight = 48, kRowHeight = 36, kNoteHeight = 34;
+constexpr uint32_t kHeading = 0x7fd4dc;  // a section's heading: the highlight's teal, lighter (readable on the panel)
+
+// The rows above the list: title, tabs, the Launch max row (or not), the stats or subtitle, the page switch.
+int list_top(bool resolutionShown) {
+    return 16 + kTitleHeight + kTabsHeight + (resolutionShown ? kRowHeight : 0) + kRowHeight + 8 + kLineHeight;
+}
+// Where the notes end: the footer's top, or the hint's.
+int notes_bottom(bool footer) { return kPanelHeight - (footer ? 96 : 56); }
+int row_height(const MenuLine& line) { return line.header ? kMenuHeaderHeight : kLineHeight; }
 
 COLORREF gdi(uint32_t rgb) { return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff); }
 
@@ -30,12 +42,67 @@ void text(HDC dc, HFONT font, const std::wstring& s, int left, int top, int righ
     DrawTextW(dc, s.c_str(), static_cast<int>(s.size()), &r, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 }
 
+int text_width(HDC dc, HFONT font, const std::wstring& s) {
+    SelectObject(dc, font);
+    SIZE size{};
+    GetTextExtentPoint32W(dc, s.c_str(), static_cast<int>(s.size()), &size);
+    return static_cast<int>(size.cx);
+}
+
+// A label and its value on one row `width` px wide ("Launch max  4775x1250 (6.0 MP)"): the value whole, the label cut
+// with an ellipsis when the two don't fit (a longer language; English fits).
+std::wstring label_value(HDC dc, HFONT font, const std::wstring& label, const std::wstring& value, int width) {
+    const std::wstring gap = L"  ", ellipsis = L"…";
+    if (text_width(dc, font, label + gap + value) <= width)
+        return label + gap + value;
+    std::wstring cut = label;
+    while (!cut.empty() && text_width(dc, font, cut + ellipsis + gap + value) > width)
+        cut.pop_back();
+    return cut.empty() ? value : cut + ellipsis + gap + value;
+}
+
 }  // namespace
+
+int menu_list_height(bool resolutionShown, size_t notes, bool footer) {
+    const int shown = static_cast<int>(std::min<size_t>(notes, 3));
+    return notes_bottom(footer) - (shown ? 6 + shown * kNoteHeight : 0) - 6 - list_top(resolutionShown);
+}
+
+int menu_first_visible(const std::vector<MenuLine>& lines, int first, int heightPx) {
+    const int n = static_cast<int>(lines.size());
+    if (n <= 1)
+        return 1;
+    first = std::clamp(first, 1, n - 1);
+    int selected = -1;
+    for (int i = 1; i < n; ++i)
+        if (lines[i].selected)
+            selected = i;
+    const auto fits = [&](int from, int to) {  // lines from..to (inclusive) in the height
+        int h = 0;
+        for (int i = from; i <= to; ++i)
+            h += row_height(lines[i]);
+        return h <= heightPx;
+    };
+    if (selected >= 1) {
+        // Up past the top: the selected line first, with its section's heading if that is right above it.
+        if (selected < first)
+            first = selected > 1 && lines[selected - 1].header ? selected - 1 : selected;
+        // Down past the bottom: as little scroll as shows it.
+        while (first < selected && !fits(first, selected))
+            ++first;
+    }
+    // No empty room at the end while lines above are hidden.
+    while (first > 1 && fits(first - 1, n - 1))
+        --first;
+    return first;
+}
 
 std::vector<uint32_t> draw_menu_panel(const std::wstring& title, const MenuResolution& resolution,
                                       const MenuStats& stats, const std::vector<MenuLine>& lines,
                                       const std::vector<std::wstring>& notes, const std::wstring& hint,
-                                      const std::wstring& subtitle, const std::wstring& footer) {
+                                      const std::wstring& subtitle, const std::wstring& footer,
+                                      const std::wstring& frame, bool frameBad,
+                                      const std::vector<std::wstring>& tabs, int tab, int first) {
     std::vector<uint32_t> out(static_cast<size_t>(kPanelWidth) * kPanelHeight, 0);
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
@@ -58,59 +125,152 @@ std::vector<uint32_t> draw_menu_panel(const std::wstring& title, const MenuResol
         return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                            CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     };
-    HFONT titleFont = font(38, FW_SEMIBOLD), lineFont = font(34, FW_NORMAL), smallFont = font(26, FW_NORMAL);
+    HFONT titleFont = font(38, FW_SEMIBOLD), lineFont = font(34, FW_NORMAL), smallFont = font(26, FW_NORMAL),
+          tabFont = font(26, FW_SEMIBOLD), headingFont = font(24, FW_SEMIBOLD);
     SetBkMode(dc, TRANSPARENT);
     fill(dc, 0, 0, kPanelWidth, kPanelHeight, kBackground);
-    text(dc, titleFont, title, kMargin, 16, kPanelWidth - kMargin, 16 + kTitleHeight, kLabel, DT_LEFT);
+    // The title, cut with an ellipsis where a longer language would run past the panel or leave the frame times beside
+    // it less than kFrameRoom.
+    constexpr int kFrameRoom = 200;
+    const int titleWidth = std::min(text_width(dc, titleFont, title),
+                                    kPanelWidth - 2 * kMargin - (frame.empty() ? 0 : kFrameRoom + 28));
+    text(dc, titleFont, title, kMargin, 16, frame.empty() ? kPanelWidth - kMargin : kMargin + titleWidth + 1,
+         16 + kTitleHeight, kLabel, DT_LEFT | DT_END_ELLIPSIS);
+    // The frame times, from the performance overlay, beside the title: a step's effect without turning to the overlay.
+    if (!frame.empty())  // right-aligned, after the title (the longest, "QVFR (API path) settings", leaves ~480 px)
+        text(dc, smallFont, frame, kMargin + titleWidth + 28, 16, kPanelWidth - kMargin, 16 + kTitleHeight,
+             frameBad ? kCapped : kDim, DT_RIGHT | DT_END_ELLIPSIS);
     int y = 16 + kTitleHeight;
+    // The pages as tabs: the current one filled, as the launcher's tab rail marks where you are.
+    {
+        int x = kMargin - 14;
+        // Each tab its name's width; names too long for the strip together (a longer language) share it: the longest
+        // cut to an even share, with an ellipsis.
+        const int strip = kPanelWidth - 2 * kMargin + 28;
+        std::vector<int> widths;
+        int total = 0;
+        for (const std::wstring& name : tabs) {
+            widths.push_back(text_width(dc, tabFont, name) + 28);
+            total += widths.back() + 8;
+        }
+        if (total - 8 > strip && !tabs.empty()) {
+            int room = strip - 8 * (static_cast<int>(tabs.size()) - 1), wide = static_cast<int>(tabs.size());
+            for (bool changed = true; changed && wide > 0;) {  // the narrow ones keep their width, the rest share
+                changed = false;
+                const int share = room / wide;
+                for (int& w : widths)
+                    if (w > 0 && w <= share) {
+                        room -= w;
+                        --wide;
+                        w = -w;  // kept (marked)
+                        changed = true;
+                    }
+            }
+            const int share = wide > 0 ? room / wide : 0;
+            for (int& w : widths)
+                w = w < 0 ? -w : share;
+        }
+        for (size_t i = 0; i < tabs.size(); ++i) {
+            const int w = widths[i];
+            const bool on = static_cast<int>(i) == tab;
+            if (on)
+                fill(dc, x, y + 4, x + w, y + kTabsHeight - 8, kHighlight);
+            text(dc, tabFont, tabs[i], x + 4, y + 4, x + w - 4, y + kTabsHeight - 8, on ? kLabel : kDim,
+                 DT_CENTER | DT_END_ELLIPSIS);
+            x += w + 8;
+        }
+        if (!tabs.empty())
+            fill(dc, kMargin - 14, y + kTabsHeight - 4, kPanelWidth - kMargin + 14, y + kTabsHeight - 2, kHighlight);
+        y += kTabsHeight;
+    }
     // ACE's render target: the most this launch allows and what renders now.
     if (resolution.shown) {
-        text(dc, smallFont, L"Max  " + resolution.max, kMargin, y, kPanelWidth / 2, y + 36, kDim, DT_LEFT);
-        text(dc, smallFont, L"Now  " + resolution.current, kPanelWidth / 2, y, kPanelWidth - kMargin, y + 36, kLabel,
-             DT_RIGHT);
+        const int half = kPanelWidth / 2 - kMargin;  // each side's room: the label cut, never the size
+        text(dc, smallFont, label_value(dc, smallFont, lang::tr(L"Launch max"), resolution.max, half), kMargin, y,
+             kPanelWidth / 2, y + 36, kDim, DT_LEFT);
+        text(dc, smallFont, label_value(dc, smallFont, lang::tr(L"Now"), resolution.current, half), kPanelWidth / 2, y,
+             kPanelWidth - kMargin, y + 36, kLabel, DT_RIGHT);
         y += 36;
     }
     if (!subtitle.empty()) {  // the Foveated DLSS page: Cheeky's credit line
-        text(dc, smallFont, subtitle, kMargin, y, kPanelWidth - kMargin, y + 36, kDim, DT_LEFT);
+        text(dc, smallFont, subtitle, kMargin, y, kPanelWidth - kMargin, y + 36, kDim, DT_LEFT | DT_END_ELLIPSIS);
     } else {
         // The focus area's sharpness at its centre and what the foveation saves.
+        const int half = kPanelWidth / 2 - kMargin;
         const std::wstring ppd = stats.centerPpd > 0 ? std::to_wstring(stats.centerPpd) : L"\u2014";
-        const std::wstring saved = stats.savedPercent >= 0 ? std::to_wstring(stats.savedPercent) + L"%"
-                                                           : L"None (" + std::to_wstring(-stats.savedPercent) + L"% more)";
-        text(dc, smallFont, L"Center PPD  " + ppd, kMargin, y, kPanelWidth / 2, y + 36, kLabel, DT_LEFT);
-        text(dc, smallFont, L"Pixels saved  " + saved, kPanelWidth / 2, y, kPanelWidth - kMargin, y + 36, kLabel,
-             DT_RIGHT);
+        const std::wstring saved =
+            stats.savedPercent >= 0
+                ? std::to_wstring(stats.savedPercent) + L"%"
+                : lang::trf(L"None ({percent}% more)", {{L"percent", std::to_wstring(-stats.savedPercent)}});
+        text(dc, smallFont, label_value(dc, smallFont, lang::tr(L"Center PPD"), ppd, half), kMargin, y, kPanelWidth / 2,
+             y + 36, kLabel, DT_LEFT);
+        text(dc, smallFont, label_value(dc, smallFont, lang::tr(L"Pixels saved"), saved, half), kPanelWidth / 2, y,
+             kPanelWidth - kMargin, y + 36, kLabel, DT_RIGHT);
     }
     y += 36 + 8;
-    for (const MenuLine& line : lines) {
+    // A setting's line: its label up to its value (the launcher's long names never run under it), the value right.
+    const auto draw_line = [&](const MenuLine& line, int top) {
         if (line.selected)
-            fill(dc, kMargin - 16, y, kPanelWidth - kMargin + 16, y + kLineHeight, kHighlight);
-        text(dc, lineFont, line.label, kMargin, y, kPanelWidth / 2 + 120, y + kLineHeight, kLabel, DT_LEFT);
+            fill(dc, kMargin - 16, top, kPanelWidth - kMargin + 16, top + kLineHeight, kHighlight);
         const std::wstring value = line.selected ? L"◀  " + line.value + L"  ▶" : line.value;
-        text(dc, lineFont, value, kPanelWidth / 2 - 120, y, kPanelWidth - kMargin, y + kLineHeight,
-             line.capped ? kCapped : kLabel, DT_RIGHT);
-        y += kLineHeight;
-    }
-    y += 6;
+        // The arrows come from a fallback font that GetTextExtentPoint32 measures narrower than it draws: room added.
+        const int valueWidth = text_width(dc, lineFont, value) + (line.selected ? 24 : 0);
+        // The value whole, right-aligned, as far left as it needs (a longer language; the label is cut shorter), to 120
+        // px from the margin at most.
+        const int valueLeft = std::max(kMargin + 120, kPanelWidth - kMargin - valueWidth);
+        text(dc, lineFont, line.label, kMargin, top, valueLeft - 16, top + kLineHeight, kLabel, DT_LEFT | DT_END_ELLIPSIS);
+        text(dc, lineFont, value, valueLeft - 24, top, kPanelWidth - kMargin, top + kLineHeight, line.capped ? kCapped : kLabel,
+             DT_RIGHT);
+    };
     std::vector<std::wstring> red;
     if (resolution.capped)
-        red.push_back(L"Asked for " + resolution.asked + L": more than the max");
+        red.push_back(lang::trf(L"Asked for {size}: more than the max", {{L"size", resolution.asked}}));
     red.insert(red.end(), notes.begin(), notes.end());
-    for (size_t i = 0; i < red.size() && i < 3; ++i, y += 34)
-        text(dc, smallFont, red[i], kMargin, y, kPanelWidth - kMargin, y + 34, kCapped, DT_LEFT | DT_END_ELLIPSIS);
+    // The page switch, pinned; under it the list from `first`, as much as fits above the notes.
+    if (!lines.empty()) {
+        draw_line(lines[0], y);
+        y += kLineHeight;
+    }
+    const int listBottom = y + menu_list_height(resolution.shown, red.size(), !footer.empty());
+    const int from = std::clamp(first, 1, std::max(1, static_cast<int>(lines.size())));
+    if (from > 1)  // lines hidden above
+        text(dc, smallFont, L"▲", kPanelWidth - kMargin + 4, y, kPanelWidth - 6, y + 30, kDim, DT_CENTER);
+    int last = from - 1;
+    for (int i = from; i < static_cast<int>(lines.size()); ++i) {
+        const MenuLine& line = lines[i];
+        if (y + row_height(line) > listBottom)
+            break;
+        if (line.header) {  // the card's name, with a rule over it
+            fill(dc, kMargin, y + 8, kPanelWidth - kMargin, y + 9, kDim);
+            text(dc, headingFont, line.label, kMargin, y + 10, kPanelWidth - kMargin, y + kMenuHeaderHeight, kHeading,
+                 DT_LEFT | DT_END_ELLIPSIS);
+        } else {
+            draw_line(line, y);
+        }
+        y += row_height(line);
+        last = i;
+    }
+    if (last < static_cast<int>(lines.size()) - 1)  // lines hidden below
+        text(dc, smallFont, L"▼", kPanelWidth - kMargin + 4, listBottom - 30, kPanelWidth - 6, listBottom, kDim, DT_CENTER);
+    y = listBottom + 6;
+    for (size_t i = 0; i < red.size() && i < 3; ++i, y += kNoteHeight)
+        text(dc, smallFont, red[i], kMargin, y, kPanelWidth - kMargin, y + kNoteHeight, kCapped, DT_LEFT | DT_END_ELLIPSIS);
     if (!footer.empty())  // the in-game hotkeys, over the menu's own hint
         text(dc, smallFont, footer, kMargin, kPanelHeight - 96, kPanelWidth - kMargin, kPanelHeight - 56, kDim,
              DT_LEFT | DT_END_ELLIPSIS);
-    text(dc, smallFont, hint, kMargin, kPanelHeight - 56, kPanelWidth - kMargin, kPanelHeight - 16, kDim, DT_LEFT);
+    text(dc, smallFont, hint, kMargin, kPanelHeight - 56, kPanelWidth - kMargin, kPanelHeight - 16, kDim,
+         DT_LEFT | DT_END_ELLIPSIS);
     GdiFlush();
-    // GDI writes BGRx; the swapchain wants RGBA with the panel's alpha.
+    // GDI writes BGRx; the swapchain wants RGBA with the panel's alpha (rounded corners), premultiplied (osd.h).
     const auto* src = static_cast<const uint32_t*>(bits);
-    for (size_t i = 0; i < out.size(); ++i) {
-        const uint32_t p = src[i];
-        out[i] = ((p >> 16) & 0xff) | (p & 0xff00) | ((p & 0xff) << 16) | (static_cast<uint32_t>(kAlpha) << 24);
-    }
+    for (int py = 0; py < kPanelHeight; ++py)
+        for (int px = 0; px < kPanelWidth; ++px) {
+            const size_t i = static_cast<size_t>(py) * kPanelWidth + px;
+            const double coverage = panel_corner_coverage(px, py, kPanelWidth, kPanelHeight, kCornerRadius);
+            out[i] = panel_rgba(src[i], static_cast<uint8_t>(kAlpha * coverage + 0.5));
+        }
     SelectObject(dc, previous);
-    for (HFONT f : {titleFont, lineFont, smallFont})
+    for (HFONT f : {titleFont, lineFont, smallFont, tabFont, headingFont})
         DeleteObject(f);
     DeleteObject(bitmap);
     DeleteDC(dc);
@@ -130,7 +290,8 @@ public:
 private:
     bool copy(ID3D12Resource* image, const std::vector<uint32_t>& pixels);
     void shutdown();
-    void wait();
+    bool wait();  // true when the last copy is done (bounded)
+    bool waitLogged_ = false;
     int width_ = kPanelWidth, height_ = kPanelHeight;
     ID3D12Device* device_ = nullptr;
     ID3D12CommandQueue* queue_ = nullptr;
@@ -204,13 +365,40 @@ bool PanelUploadD3D12::initialize(ID3D12Device* device, ID3D12CommandQueue* queu
     return true;
 }
 
-void PanelUploadD3D12::wait() {
-    if (fence_ && event_ && fence_->GetCompletedValue() < value_ && SUCCEEDED(fence_->SetEventOnCompletion(value_, event_)))
+bool PanelUploadD3D12::wait() {
+    if (!fence_)
+        return true;
+    UINT64 done = fence_->GetCompletedValue();
+    if (done < value_ && event_ && SUCCEEDED(fence_->SetEventOnCompletion(value_, event_)))
         WaitForSingleObject(event_, 1000);
+    done = fence_->GetCompletedValue();
+    return done != UINT64_MAX && done >= value_;  // UINT64_MAX: the device is removed
 }
 
 void PanelUploadD3D12::shutdown() {
-    wait();  // the last copy reads the buffer
+    // The last copy reads the buffer: wait in steps (a hung GPU is removed by the driver's timeout, after
+    // which releasing is fine); past the cap leak the objects rather than free them under the GPU.
+    bool idle = true;
+    if (fence_) {
+        for (int step = 0; step < 30 && !wait(); ++step) {
+            if (fence_->GetCompletedValue() == UINT64_MAX)
+                break;
+            if (step == 0)
+                log_line("settings panel: shutdown waiting for the GPU to finish the last copy");
+            if (!event_)
+                Sleep(1000);
+        }
+        const UINT64 done = fence_->GetCompletedValue();
+        idle = done == UINT64_MAX || done >= value_;
+    }
+    if (!idle) {
+        log_line("settings panel: the GPU didn't finish in 30 s: its copy objects are leaked, not released");
+        list_ = nullptr;
+        allocator_ = nullptr;
+        buffer_ = nullptr;
+        fence_ = nullptr;
+        event_ = nullptr;  // the fence may still signal it
+    }
     if (list_)
         list_->Release();
     if (allocator_)
@@ -229,12 +417,18 @@ void PanelUploadD3D12::shutdown() {
     event_ = nullptr;
     device_ = nullptr;
     queue_ = nullptr;
+    value_ = 0;  // a new fence starts at 0
 }
 
 bool PanelUploadD3D12::copy(ID3D12Resource* image, const std::vector<uint32_t>& pixels) {
     if (!list_ || !image || pixels.size() != static_cast<size_t>(width_) * height_)
         return false;
-    wait();  // the previous copy is done with the buffer and the allocator
+    if (!wait()) {  // the previous copy may still read the buffer and the allocator: skip this one
+        if (!waitLogged_)
+            log_line("settings panel: the GPU hasn't finished the previous copy: upload skipped");
+        waitLogged_ = true;
+        return false;
+    }
     std::memcpy(mapped_, pixels.data(), pixels.size() * 4);
     if (FAILED(allocator_->Reset()) || FAILED(list_->Reset(allocator_, nullptr)))
         return false;

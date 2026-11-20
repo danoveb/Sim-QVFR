@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <windows.h>
@@ -16,17 +17,11 @@
 #include "games/lmu/game.h"
 #include "games/lmu/mvr_probe.h"
 #include "games/multi_view.h"
+#include "test_util.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
-}
 
 std::vector<uint8_t> compile(const std::string& source, const char* profile) {
     ComPtr<ID3DBlob> code, errors;
@@ -68,6 +63,18 @@ int SIM_QVFR_TEST_MAIN() {
     }
     check(shaderCode != nullptr, "d3d11.dll's code read before the probe");
     check(lmu::mvr_probe_install(nullptr, true), "installed at instance creation (twins attached, as for multi-view)");
+    // Another tool's throwaway device first, on a thread of its own, released (an overlay finding Present: issue 29,
+    // OpenKneeboard): the game's device, made after it, is still hooked.
+    {
+        bool made = false;
+        std::thread other([&made] {
+            ComPtr<ID3D11Device> throwaway;
+            made = SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                                               &throwaway, nullptr, nullptr)) && throwaway;
+        });
+        other.join();
+        check(made, "another tool's device made and released before the game's");
+    }
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device,
@@ -167,9 +174,7 @@ int SIM_QVFR_TEST_MAIN() {
           "multi-view offered on RTX 20 and newer only: not the GTX 16 series (TU116, TU117, or named GTX), not Pascal or Volta");
     // The layer's decision (games/multi_view.h) from an ini: multi_view=1 for a game that has it, on such a GPU.
     {
-        wchar_t temp[MAX_PATH] = {};
-        GetTempPathW(MAX_PATH, temp);
-        const std::wstring ini = std::wstring(temp) + L"simqvfr-multiview-" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+        const std::wstring ini = temp_path(L"simqvfr-multiview-") + std::to_wstring(GetCurrentProcessId()) + L".ini";
         WritePrivateProfileStringW(L"experiment", L"cpu_profile", L"0", ini.c_str());  // an ini without multi_view
         std::string why;
         check(simqvfr::games::multi_view_on(&lmu::kGame, ini.c_str(), &why), "no multi_view key: on (the default)");

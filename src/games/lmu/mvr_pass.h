@@ -11,7 +11,7 @@
 // those; at sample frames the focus region of pass 0/1's resolved scene is compared with pass 2/3's own (alignment,
 // brightness), the images saved in logs\captures. Gate D (lmu_mvr=2, mvr_keep_focus): the focus region is kept after
 // pass 0/1's resolve, and pass 2/3's resolve (in cubeDX11_ApplyPostProcess) becomes a copy of it into the top-left, so
-// their post-processing runs on the focus view the eye pass drew while they skip the scene (four_passes.cpp). The
+// their post-processing runs on the focus view the eye pass drew while they skip the scene (the four passes' code, gone 2026-11-12). The
 // eyes' post-processing reads only their own corner of the targets.
 #pragma once
 
@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "../../quad/focus_mask.h"
 #include "car_motion.h"
 #include "focus_math.h"
 
@@ -70,6 +71,10 @@ inline constexpr unsigned kPSSetShader = 9, kVSSetShader = 11, kDrawIndexed = 12
                           kDrawIndexedInstancedIndirect = 39, kDrawInstancedIndirect = 40, kRSSetViewports = 44,
                           kRSSetScissorRects = 45, kCopySubresourceRegion = 46, kResolveSubresource = 57,
                           kExecuteCommandList = 58, kHSSetShader = 60, kDSSetShader = 64;
+// The game's reads of its viewports (YEBIS's start reads the bound one to size its region): given the game's own.
+inline constexpr unsigned kRSGetViewports = 95;
+// FSR seen at the d3d11 level (mvr_fsr_watch): its compute pass's writes into the eye's image.
+inline constexpr unsigned kCSSetUnorderedAccessViews = 68;
 // The draws and CopySubresourceRegion only with the focus post (mvr_focus_replay) or instancing (the draws doubled);
 // DrawAuto and the indirect draws only with instancing (their instance count can't be doubled: the eye's alone);
 // PSSetShader only with texture sharpening possible (mvr_mip_bias_hooks); VSSetConstantBuffers, Map, Unmap and the input
@@ -82,7 +87,8 @@ inline constexpr unsigned kHooked[] = {kVSSetShader,       kGSSetShader,        
                                        kDrawAuto,          kDrawIndexedInstancedIndirect, kDrawInstancedIndirect,
                                        kPSSetShader,       kVSSetConstantBuffers, kMap, kUnmap,
                                        kIASetVertexBuffers, kIASetIndexBuffer, kOMSetBlendState,
-                                       kOMSetDepthStencilState, kExecuteCommandList};
+                                       kOMSetDepthStencilState, kExecuteCommandList, kRSGetViewports,
+                                       kCSSetUnorderedAccessViews};
 }  // namespace context_slot
 
 // The game's immediate context hooked (VSSetShader, the render targets, viewports, scissors, resolves). False: off.
@@ -135,18 +141,38 @@ void mvr_pass_end(int pass);
 // the list executed with the two views as they were and its replayed calls handled like the game's.
 void mvr_replay_lists_plain(bool on);
 // R6c: the lens mask's draws (its vertex shader's role, yebis_shaders.h VsRole) are drawn like the scene's, or dropped
-// while `*stale` (a live FOV crop change since the game built the mask: four_passes.cpp maskStale). Null: never dropped.
+// while `*stale` (a live FOV crop change since the game built the mask: qvfr_frame.cpp maskStale). Null: never dropped.
 void mvr_mask_stale(const std::atomic<bool>* stale);
-// The lens mask's draws dropped since the last call (four_passes' log).
+// The lens mask's draws dropped since the last call (qvfr_frame's log).
 int mvr_mask_dropped();
+// lmu_mask_ab (a measurement): the lens mask's draws and the focus mask dropped while `drop` (the A/B's side without
+// them). Between passes.
+void mvr_mask_ab_drop(bool drop);
+// DLSS's depth before the transparents that write depth ([experiment] lmu_dlss_glass_depth; mvr_pass_glass.h): the car's
+// glass is drawn blended and writing depth, so the depth at the pass's end holds the glass where the world is seen
+// through it, and DLSS's vectors there were a point half a metre away's. 1: at the first blended draw writing the
+// scene's depth after opaque depth in an eye pass (with DLSS on), the depth copied as it stands (dlss_depth_copy_list)
+// and read by DLSS; the car slots' target left as the surface behind the glass too. 0: as before (no copy). Before
+// mvr_pass_install (its blend and depth state hooks are chosen there).
+void mvr_glass_depth(int mode);
+// This frame's side of an A/B (lmu_dlss_glass_ab): DLSS reads the copy (true), or only the measurement does. Between
+// frames.
+void mvr_glass_read(bool read);
+// The focus mask (quad/focus_mask.h; [quad] focus_mask, live): in eye passes 0-1 that draw their focus view, right before
+// the first draw that tests the scene's depth (after the game cleared it), the focus view's texels outside `area`'s
+// shape by more than `marginTexels` get the nearest depth (the far one's opposite by the bound depth test: LMU's reversed
+// GREATER, or LESS), so the scene's draws skip them. Into the focus viewport alone, with its own state from a command
+// list that restores the game's (NVIDIA's single-pass stereo off around it). The eyes are never masked. Between frames.
+void mvr_focus_mask(bool on, const simqvfr::FocusArea& area, unsigned marginTexels);
 // R6b: a Draw with the VR UI panel's vertex shader outside the passes in a frame without focus finals (the menus): `fn`
 // right before it (after = false) and right after it (true), the game's state bound; it may draw the panel again
 // elsewhere with mvr_redraw_panel. Null: none.
 using PanelFn = void (*)(ID3D11DeviceContext* context, bool after, unsigned vertexCount, unsigned startVertex);
 void mvr_panel_draws(PanelFn fn);
-// The source of the game's latest CopySubresourceRegion into `dst` in this frame or the one before (raw, compared only),
-// null if none: LMU's submit copies each eye's image into that eye's swapchain image that way, which names the eye images
-// from the d3d11 calls. Hooked with the focus post.
+// The source of the game's latest CopySubresourceRegion into `dst` in this frame or the one before, null if none: LMU's
+// submit copies each eye's image into that eye's swapchain image that way, which names the eye images from the d3d11
+// calls. Hooked with the focus post. Raw, but referenced by the copy record (the game may have released it): valid on
+// the render thread until its next copies, so take a reference of your own right away.
 ID3D11Resource* mvr_copy_source(ID3D11Resource* dst);
 // Eye `eye`'s final as its pass's final blit last drew into it (raw), null if none yet.
 ID3D11Texture2D* mvr_eye_final(int eye);
@@ -191,12 +217,33 @@ const char* mvr_shape_missing(int eye);
 // counts say, the default). Unknown: found by their bindings.
 void mvr_roles_known_for_tests(int copy, int blit);
 void mvr_shape_force_bad(bool bad);
+// Tests: RSGetViewports calls from this image taken as the game's (else ours: they see what is bound).
+void mvr_test_reads_as_game(bool on);
 // LMU's FSR is on (each eye's post-processing ends in FSR's compute upscale of the whole scene target into the eye's
 // image, no final blit to draw the focus final with): the focus composite is put beside the eye in the scene's
 // target right after YEBIS's composite, so FSR's own upscale carries it beside the eye into the eye's image, where
 // the focus final is then taken from. `eye0`, `eye1`: the eyes' images (compared only; the bind of one after the
 // composite is where FSR has written it), null while unknown.
 void mvr_fsr(bool on, ID3D11Resource* eye0, ID3D11Resource* eye1);
+// Whether FSR is on, seen at the d3d11 level, for a game build whose FSR setting can't be read: FSR's sharpening pass
+// writes the eye's image from a compute shader (an unordered access view of it; the final blit draws it instead). On
+// before mvr_pass_install: CSSetUnorderedAccessViews is hooked. mvr_fsr_written: an eye's image (mvr_fsr's) bound for
+// compute writes since the last call (it starts again).
+void mvr_fsr_watch(bool on);
+bool mvr_fsr_written();
+// The size of the scene target the last tracked pass began on (the game's main targets); false before the first.
+bool mvr_scene_size(unsigned& width, unsigned& height);
+// DLSS's camera on any game build (view_pair.h): the per-draw buffer's viewMatrix and viewProjMatrix read as car
+// tracking reads its worldMatrix (its hooks, without its table when the cars are off). Before mvr_pass_install.
+void mvr_view_track(bool on);
+// The game's reads of its viewports (mvr_pass_binds.h rs_get_viewports), for an A/B ([experiment] lmu_viewport_reads):
+// 1 every caller but Sim-QVFR given the game's own viewports while ours are bound (as since 1.2.1), 2 only the game's
+// exe (YEBIS's own read), other DLLs the bound ones, 0 RSGetViewports not hooked. Before mvr_pass_install.
+void mvr_viewport_reads(int mode);
+// This frame's distinct (view, viewProj) pairs eye pass `pass` (0-1) has drawn so far, each 32 floats (view, then
+// viewProj), up to `max`, and per pair its draws with an identity worldMatrix (the static world's; may be null); how
+// many.
+int mvr_view_pairs(int pass, float (*pairs)[32], unsigned* worldDraws, int max);
 // The VR UI panel's canvas (2560x1440 with one mip level, sampled trilinearly: docs/recon-lmu.md "run 8") is drawn
 // about a fifth of its size into a periphery at 20% of native: minified without mips it aliases, and the HUD, menus and
 // MFD shimmer as the panel moves on the pixel grid. On: the panel's doubled draws sample a copy of it with its mips
@@ -227,9 +274,12 @@ void mvr_car_slots(int level);
 // The slots' gate images (logs\captures\lmu-car-slots-*.png, up to two frames' worth, each ~250 ms on the render
 // thread): diagnostics runs only (lmu_car_vectors forced), never the player's option. Off by default.
 void mvr_car_slot_images(bool on);
-// The cars' motion this frame or not (an A/B of its cost, FourPassesRun::carAb; between frames): off, no tracking work,
+// The cars' motion this frame or not (an A/B of its cost, QvfrFrameRun::carAb; between frames): off, no tracking work,
 // no slot target, no motion for DLSS; only the hooks' detours stay. On by default.
 void mvr_car_active(bool on);
+// One eye off ([quad] eye_off; qvfr_frame.cpp): eye pass `eye` (0-1; -1 none) gets no DLSS (nor DLAA, nor the focus
+// view's upscale: it draws none). Between frames.
+void mvr_eye_off(int eye);
 // Tests: the scene's target as the tracker would learn it (MSAA off; null forgets it), and the slot target (null
 // before its first bind).
 void mvr_test_scene_target(ID3D11Resource* scene);
@@ -268,6 +318,9 @@ struct MvrPassStats {
     uint64_t lookups = 0, lookupMisses = 0;  // twin lookups, and those not answered by the cache (GetPrivateData)
     uint64_t contextEntries = 0;             // the context's entries hooked (DrawIndexed's with the focus post only)
     uint64_t contextFunctions = 0;           // the context's functions hooked (every one its entries were seen holding)
+    uint64_t gameViewportReads = 0;          // the game's RSGetViewports answered with its own while ours were bound
+    uint64_t otherViewportReads = 0;         // the same calls from another DLL than the game's exe (NGX's, a tool's)
+    uint64_t extraResolves = 0;              // multisample resolves after a pass's post began (passed on, not a new post)
     uint64_t resolveFunctions = 0;           // of those, ResolveSubresource's
     uint64_t focusCopies = 0, focusComposites = 0, focusFailures = 0;  // the focus post's steps (mvr_focus_replay)
     // Passes whose copy ran but no composite we know followed, and draws into the resolve's target after the copy with
@@ -287,14 +340,20 @@ struct MvrPassStats {
     // final made stands for every step: observe_post_draw's checks only matter in the frames the recovery reads them).
     uint64_t shapeSkippedPasses = 0;
     uint64_t roleLookups = 0, roleLookupMisses = 0;  // pixel shaders' YEBIS roles looked up, and those not cached
+    uint64_t rolesByBind = 0;  // of them, by the game's bind inside a pass (no runtime call; marked_role)
     uint64_t fsrPlaced = 0, fsrFinals = 0;  // FSR: focus composites put beside the eye for its upscale; finals found
     uint64_t uiMipFrames = 0;  // frames whose VR UI canvas was copied with mips for the panel (mvr_ui_mips)
     // R6: the lens mask's draws (by its vertex shader), those with two views, those dropped while stale; the VR UI panel's
     // draws replayed for the menus (mvr_redraw_panel).
     uint64_t maskDraws = 0, maskDrawsTwo = 0, maskDropped = 0, panelReplays = 0;
+    uint64_t maskAbDropped = 0;  // dropped on lmu_mask_ab's side without the mask
+    // The focus mask (mvr_focus_mask): eye passes it was drawn in; its command list recorded (again); passes it was left
+    // out of for the A/B, for a depth test it doesn't know, or for a shape with nothing to mask at that size.
+    uint64_t focusMaskDraws = 0, focusMaskRecords = 0, focusMaskAbSkipped = 0, focusMaskOtherTest = 0, focusMaskEmpty = 0;
     // Instancing: the game's draws made with twice their instances; those with a per-instance layout's twin bound around
-    // them; DrawAuto and indirect draws drawn into the eye alone (no instance count to double).
-    uint64_t doubledDraws = 0, layoutSwaps = 0, eyeOnlyDraws = 0;
+    // them; DrawAuto and indirect draws drawn into the eye alone (no instance count to double); draws into the eye
+    // alone for their input layout (per-instance data without its twin, or a layout the probe didn't see made).
+    uint64_t doubledDraws = 0, layoutSwaps = 0, eyeOnlyDraws = 0, layoutEyeOnly = 0;
     uint64_t instancedTakeovers = 0;  // single-pass stereo refused and instancing took over (once a session)
     // Texture sharpening: passes with a mip bias; pixel shader binds of a twin, of a game shader with none while it
     // was wanted, and the twin lookups (and those not cached).
@@ -309,6 +368,12 @@ struct MvrPassStats {
     // without one while it was bound, blend twins made, motion uploads and the slots in them, gate images saved.
     uint64_t slotPasses = 0, slotBinds = 0, slotViews = 0, slotTwinBinds = 0, slotNoTwin = 0, blendTwins = 0;
     uint64_t motionUploads = 0, motionSlots = 0, slotImages = 0;
+    // DLSS's depth before the transparents (mvr_glass_depth): eye passes with a copy, copies, blended draws writing the
+    // scene's depth, copies refused (the module not ready) or past kGlassCopies, the pass's draws before its first copy
+    // (summed), unblended depth-writing draws after a pass's last copy (their depth isn't in what DLSS reads), and the
+    // passes' draws (summed).
+    uint64_t glassPasses = 0, glassCopies = 0, glassBlendedWriters = 0, glassRefused = 0, glassCapped = 0;
+    uint64_t glassFirstAt = 0, glassOpaqueAfter = 0, glassPassDraws = 0;
     // The game's command lists executed on the immediate context (LMU's sun shadows: worker-recorded, replayed in pass
     // 0's Pre Render): inside a pass, with the two views on as they began, outside the passes; the hooked calls d3d11
     // made while executing them (a runtime that replays a list through the context's own functions).
@@ -330,6 +395,22 @@ void mvr_track_passes(bool on);
 // target binds, resolves and YEBIS draws are recorded and a frame is logged whenever its shape is new this launch, with
 // the game's graphics settings as its own files hold them. 0: off.
 void mvr_pass_trace(int level);
+// Diagnostics, [experiment] lmu_post_census=1 (log only; docs/recon-lmu.md "Zero writes"): every draw of tracked pass 0
+// after its resolve (the post-processing, the final blit, the overlays) logged with its shaders, targets, the game's
+// viewport and scissor, inputs, first vertices and the first constants of each bound buffer; every 900 frames and at the
+// first pass 0 at a new eye size (a live resolution change). Reads buffers back: a stall on those frames. 0: off.
+// 2: also each bound buffer's whole range saved (logs\census) for the first 4 censuses at a new size. 3: the whole pass
+// from its start instead, one line a draw, every constant buffer (slots 0-13) saved once per distinct content; only at
+// the first 4 new sizes (each such frame stalls for a while).
+void mvr_post_census(int level);
+// The live resolution with no write into the game (docs/recon-lmu.md "Census run 3"; the game renders at its own size). For the next eye passes (0-1), until their post begins: every viewport and scissor of the game's render
+// size (0,0 fullW x fullH) cut to the eye's (0,0 eyeW x eyeH), at the game's call and as the pass begins; a full-size R32
+// target's (the post's depth copy) left. Off, or eye = full: nothing cut.
+void mvr_size_cut(bool on, unsigned fullW, unsigned fullH, unsigned eyeW, unsigned eyeH);
+struct MvrSizeCutStats {
+    unsigned long long viewports = 0, scissors = 0, left = 0;  // since the install
+};
+MvrSizeCutStats mvr_size_cut_stats();
 // R4b-2: the tracker drives the passes: `begin(p)` at a tracked pass's begin (before its draws), `end(p)` at its end, on
 // the render thread inside the context's hooks; their work calls mvr_pass_begin / mvr_pass_end as the game's scene
 // render hook did. Null: observe only.
@@ -347,6 +428,7 @@ struct MvrTrackStats {
     uint64_t sceneAtComposite = 0;    // that target learned from YEBIS's composite (its copy read a stage's image)
     uint64_t singleSampleBlits = 0;   // those passes' final blits seen (their end), with the focus post or without
     uint64_t blitsBeforePost = 0;     // blits reading the scene's target before a pass's post began (not taken)
+    uint64_t fsrEnds = 0;             // FSR, MSAA off: passes ended at their eye image without our focus step
     uint64_t passesWithoutPost = 0;   // single-sample passes that ended before reaching YEBIS's copy
     uint64_t sceneRebinds = 0;  // a pass's own multisample scene bound again after its resolve, before YEBIS: kept in it
 };

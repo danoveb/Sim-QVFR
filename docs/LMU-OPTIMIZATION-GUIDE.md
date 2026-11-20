@@ -30,7 +30,12 @@ All settings named here are in **sim-qvfr-launcher.exe**. Most also appear in th
    track in daylight tells you very little.
 4. **Read what limits you** (section 2), then follow section 3 (GPU) or section 4 (CPU).
 5. **Change one setting at a time**, on the same car and track, and compare. The launcher's **Diagnostics** page
-   (Game tab) shows your last session next to the one before, with the settings you changed in between.
+   (Game tab) shows your last session next to the one before, with the settings you changed in between. A change
+   made while you drive starts a new stint with its own entry, so you can tune in the headset and compare afterwards.
+6. **Launch with your highest settings, then tune down.** Live changes can lower the resolution and raise it back to
+   what the game started with, not above. In the headset menu, **Auto-fit to headset rate** (Picture tab, Resolution
+   section) does the GPU side for you: Right starts it, it fits periphery, focus density and focus size to your frame
+   budget while you drive, and Left undoes it.
 
 ---
 
@@ -94,10 +99,12 @@ height times density. A small area can take a high density cheaply.
 
 How sharp the focus area is, as a share of the headset's own pixel density.
 
-- **100-140%** is the useful range when Sim-QVFR composes the picture (SteamVR and most headsets). Above about 130%
-  it smooths edges more but adds little real detail, as the image is resampled to the headset's own resolution.
-- **With runtime composition** (Pimax and Varjo, **Let the runtime compose** on the Rendering card), a higher density
-  does show more detail, as the headset's software draws the focus area at full resolution.
+- **Above 100%** shows more detail, small text most of all, and costs more GPU time. When Sim-QVFR composes the
+  picture (SteamVR and most headsets), the image it sends to the headset grows with the density, up to the largest
+  image your headset's software accepts. With SteamVR's resolution set very high that limit can come early (about
+  200% on a large headset); density past it only smooths edges.
+- **With runtime composition** (Pimax and Varjo, automatic), the headset's software draws the focus area at full
+  resolution itself.
 
 ### 3.4 DLSS (Picture tab, DLSS) — NVIDIA RTX 20 series and newer
 
@@ -209,9 +216,8 @@ Use these freely to make the picture look better:
 | --- | --- | --- |
 | **Feather**, **Corner radius**, **Focus shape** | Picture tab, Foveation | None. They hide the edge of the sharp area. |
 | **Gaze dead-zone**, **Gaze offset**, **Vertical position** | Picture tab, Foveation | None. |
-| **Sharpening** | Picture tab, Resolution | A little GPU time. Crisper edges; too much makes the periphery shimmer. |
+| **Sharpening** | Picture tab, Resolution | A little GPU time. Crisper edges in the focus area; too much makes it shimmer. |
 | **Show a helmet** | Picture tab, View & helmet | Nothing for the game; the headset composites one extra layer. |
-| **Let the runtime compose** | Picture tab, Rendering (Pimax, Varjo) | Usually a sharper focus area for the same settings. With **Sharpening** on, the periphery is sharpened on a copy, which costs a little more. |
 | **Show focus outline** | Picture tab, Foveation | None, but turn it off to drive. |
 
 ---
@@ -229,7 +235,8 @@ Use these freely to make the picture look better:
   nothing heavy runs in the background (a browser with video, a game recorder, another game's launcher).
 - **No change after lowering resolution.** You're CPU-limited (section 4).
 - **A change didn't seem to do anything.** Some settings apply at the **next launch**: the launcher marks each card
-  **Live** or **Next launch**. Settings marked "Now when lowered" apply at once when lowered, but raising them above
+  **Changes now** or **Next game start** (in the cost table below: Live or Next launch). Settings marked "Now when
+  lowered" apply at once when lowered, but raising them above
   what the game started with waits for the next launch.
 - **You want to see what QVFR gives you.** On the Diagnostics page, **Next launch without QVFR** starts LMU once
   without foveated rendering, still measuring, so you can compare the same race with and without it.

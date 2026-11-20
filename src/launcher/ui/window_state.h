@@ -20,15 +20,22 @@
 #include "../session_history.h"
 #include "../settings.h"
 #include "../update_check.h"
+#include "../../engine/fsr_probe.h"
 #include "../../games/game.h"
 #include "../../input/hotkeys.h"
 #include "../../input/pad_input.h"
+#include "../../lang.h"
 #include "canvas.h"
 #include "theme_tokens.h"
 
 namespace simqvfr::launcher::ui::win {
 
 namespace t = tokens;
+// The launcher's text in the chosen language (lang.h): tr(L"English"), trf(L"… {name} …", {{L"name", value}}), and
+// a counted text trn(n, L"{count} game", L"{count} games", {{L"count", …}}) (each language's plural forms).
+using lang::tr;
+using lang::trf;
+using lang::trn;
 
 // The pages, one per tab: the Overview hub (overview.cpp) and the Picture, Headset and Game tabs' cards (picture.cpp,
 // headset.cpp, pane_games.cpp game_page). Manage profiles and About are panels (panels.cpp).
@@ -66,13 +73,17 @@ enum Ctl {
     kNrFocusScale, kNrEdgeBlend, kNrPeriphery, kNrPeripheryScale, kNrPeripheryCoverage, kNrLimit,
     // The performance overlay ([osd], Headset menu pane).
     kOsdOn, kOsdYaw, kOsdPitch, kOsdSize, kOsdPanel,
-    // The runtime composing the views ([experiment] native_quad_views, Resolution pane).
-    kNativeQuad,
+    // The clock ([clock], Headset pane).
+    kClockOn, kClockYaw, kClockPitch, kClockSize, kClockPanel,
     // Sharpening ([quad] sharpen_percent, Resolution pane).
     kSharpen,
     // The GPU regulator ([regulator], Foveation card; a game with GameFeatures::gpuRegulator): the two switches (Focus
     // density, Periphery), the GPU time over which it lowers them and under which it raises them, the frames before a 1% step down and before a 1% step up.
     kRegFocus, kRegPeriphery, kRegDecrease, kRegIncrease, kRegLowerFrames, kRegRaiseFrames,
+    // Colour correction ([quad] color_correction and its values, the Picture tab's Color card).
+    kGradeOn, kGradeExposure, kGradeBrightness, kGradeContrast, kGradeSaturation,
+    // One eye off ([quad] eye_off, Headset tab's Vision card; a game with GameFeatures::eyeOff).
+    kEyeOff,
     // The FOV crop ([crop], Resolution pane).
     kCropOn, kCropTop, kCropBottom, kCropOuter, kCropInner,
     // The helmet overlay ([helmet], Resolution pane).
@@ -81,8 +92,9 @@ enum Ctl {
     kLayerProfile, kLayerList, kLayerOn, kLayerUp, kLayerDown, kLayerApply, kLayerRevert, kLayerReset,
     // The Report an issue pane (its kind, the description box, the button, the zip it made to drag into the
     // issue, exporting the logs alone) and the Diagnostics pane (the CPU capture switch, copying the summary, the
-    // logs folder).
+    // logs folder, Detailed logs, clearing the captures).
     kDiagKind, kDiagDescription, kDiagReport, kDiagZip, kDiagExport, kDiagCapture, kDiagFrameCapture, kDiagBaseline, kDiagCopy, kDiagLogs,
+    kDiagDebugLogs, kDiagClearCaptures,
     // Launch checks (preflight.h): a check's fix button (its index in app.checks), the action bar's badge.
     kCheckFix, kChecksBadge,
     // The Hotkeys pane: an action's key and wheel button (option: its HotkeyAction), the reset button.
@@ -93,8 +105,16 @@ enum Ctl {
     kProfileUse, kProfileShare, kProfileDelete, kProfileUpdate, kProfileRevert, kProfileSave, kProfilePaste,
     // The Headset menu pane: the hotkeys footer ([menu] hotkey_footer).
     kHotkeyFooter,
+    // The Game tab's CPU card: the game's main thread on a core of its own ([cpu] isolate_main_thread).
+    kCpuIsolateMain,
     // The About pane's update check (update_check.h): the start-up switch, Check now, Download, and the action bar's badge.
     kUpdateCheck, kUpdateNow, kUpdateDownload, kUpdateBadge, kUpdateInstall,
+    // The About pane's language ([launcher] language; lang.h): a pop-up of Windows' language, English and lang\*.ini.
+    kLanguage,
+    // The About pane's Go back: the version the last install replaced put back (install.h's restore_backup).
+    kUpdateRollback,
+    // The About pane's Skip this version and Don't skip ([launcher] update_skip).
+    kUpdateSkip, kUpdateUnskip,
     // The Games pane: a game's tab on or off (option: its index in games::all_games), the game whose colour is edited
     // (option the same), the colour wheel, its brightness, and the game's own colour back.
     kGameShown, kColorGame, kColorWheel, kColorValue, kColorReset, kAntiCheat,
@@ -144,7 +164,7 @@ struct FocusStop {
 // The theme the window uses: Windows' app theme, or one chosen with the theme button ([launcher] ui_theme).
 enum class ThemeChoice { System, Light, Dark };
 
-inline constexpr wchar_t kLayerProfileNames[2][40] = {L"Launches from here", L"Every app"};
+inline constexpr wchar_t kLayerProfileNames[2][40] = {I18N(L"Launches from here"), I18N(L"Every app")};
 
 inline constexpr wchar_t kFgMultipliers[3][4] = {L"2x", L"3x", L"4x"};
 
@@ -153,7 +173,7 @@ inline constexpr wchar_t kFgQuarters[4][8] = {L"25%", L"50%", L"75%", L"100%"};
 inline constexpr wchar_t kSupportUrl[] = L"https://ko-fi.com/williem3";
 
 // The OpenXR layers card's More (its list, for troubleshooting): Launch checks' Open OpenXR layers opens it.
-inline constexpr wchar_t kLayersMore[] = L"the add-ons and their order";
+inline constexpr wchar_t kLayersMore[] = I18N(L"the add-ons and their order");
 
 // The README's guide to installing Cheeky Foveated DLSS (a launch check's How to install).
 inline constexpr wchar_t kCheekyGuideUrl[] = L"https://github.com/Williem3/Sim-QVFR#foveated-dlss-optional-nvidia-rtx-only";
@@ -171,8 +191,12 @@ inline constexpr UINT kAccessActivateMessage = WM_APP + 5, kAccessValueMessage =
 // A screen reader chose an item of the open pop-up menu (wParam its index).
 inline constexpr UINT kAccessMenuMessage = WM_APP + 7;
 
+// AMD's FSR provider query, done on a worker (engine/fsr_probe.h): its message carries a new fsr::Offer.
+inline constexpr UINT kFsrProbedMessage = WM_APP + 8;
+
 // Dev: a development build (no version to compare): the newest release is shown, not offered as an update.
-enum class Update { Off, Checking, UpToDate, Available, Dev, Failed };
+// Skipped: a newer release the user chose to skip ([launcher] update_skip): shown in About, no badge.
+enum class Update { Off, Checking, UpToDate, Available, Skipped, Dev, Failed };
 
 struct UpdateResult {
     bool ok = false;
@@ -184,15 +208,19 @@ struct UpdateResult {
 // InstallResult.
 inline constexpr UINT kInstallProgressMessage = WM_APP + 3, kInstallDoneMessage = WM_APP + 4;
 
+// Going back to the version an install replaced (install.h's restore_backup), done on a worker: its progress as
+// kInstallProgressMessage, its outcome a new InstallResult.
+inline constexpr UINT kRestoreDoneMessage = WM_APP + 9;
+
 // The Hotkeys pane catching a wheel or controller button: polled this often.
 inline constexpr UINT_PTR kCaptureTimer = 2;
 
 inline constexpr UINT kCaptureMs = 30;
 
 // The hotkeys' names, in HotkeyAction's order.
-inline constexpr const wchar_t* kHotkeyLabels[kHotkeyActions] = {L"Open or close", L"Up",      L"Down",         L"Left",
-                                                          L"Right",         L"Overlay",       L"Helmet visor",
-                                                          L"CPU capture",   L"Frame capture"};
+inline constexpr const wchar_t* kHotkeyLabels[kHotkeyActions] = {
+    I18N(L"Open or close"), I18N(L"Up"),          I18N(L"Down"),        I18N(L"Left"),         I18N(L"Right"),
+    I18N(L"Overlay"),       I18N(L"Helmet visor"), I18N(L"CPU capture"), I18N(L"Frame capture")};
 
 struct Hit {
     Ctl id;
@@ -266,13 +294,14 @@ void open_sheet(Sheet sheet);
 // A notice with OK; `then` once it's closed.
 void notify(const std::wstring& title, const std::wstring& text, std::function<void()> then = nullptr);
 
-inline constexpr wchar_t kMethodNames[2][40] = {L"Quad View Foveated Rendering", L"Two-loop Foveated Interlaced (legacy)"};
+inline constexpr wchar_t kMethodNames[2][40] = {I18N(L"Quad View Foveated Rendering"),
+                                                I18N(L"Two-loop Foveated Interlaced (legacy)")};
 
-inline constexpr wchar_t kModeNames[2][16] = {L"Eye tracked", L"Fixed"};
+inline constexpr wchar_t kModeNames[2][16] = {I18N(L"Eye tracked"), I18N(L"Fixed")};
 
-inline constexpr wchar_t kColorNames[3][8] = {L"Teal", L"Magenta", L"Green"};
+inline constexpr wchar_t kColorNames[3][8] = {I18N(L"Teal"), I18N(L"Magenta"), I18N(L"Green")};
 
-inline constexpr wchar_t kShapeNames[2][16] = {L"Rectangle", L"Custom corners"};
+inline constexpr wchar_t kShapeNames[2][16] = {I18N(L"Rectangle"), I18N(L"Custom corners")};
 
 inline constexpr float kMinWidth = 880, kMinHeight = 600, kDefaultWidth = 1280, kDefaultHeight = 838;  // a 1280 x 800 page
 
@@ -341,6 +370,11 @@ struct App {
     // Report an issue: the kind (kIssueKinds) and the description, a native multi-line edit over the canvas
     // at reportEditRect (empty when this frame drew none), with its font and background brush.
     int reportKind = 0;
+    // The launcher's language ([launcher] language: auto, en or a lang\ file's code), the files found when the
+    // launcher started (read_language) and the code in use ("" for English).
+    std::wstring languageChoice = L"auto";
+    std::vector<lang::Info> languages;
+    std::wstring languageInUse;
     HWND reportEdit = nullptr;
     Rect reportEditRect;
     HFONT reportFont = nullptr;
@@ -365,6 +399,9 @@ struct App {
     uint64_t hashedStamp = 0;
     std::string exeSha;
     bool hashing = false;
+    // Which AMD FSR this PC gets (a PC without an NVIDIA RTX card: the FSR card), asked once on a worker at start.
+    fsr::Offer fsrOffer;
+    bool fsrProbing = false;
     // The Hotkeys pane: the action catching a press (-1: none), from the keyboard or (capturePad) a wheel or
     // controller, whose controls already held when it started don't count (captureHeld).
     int captureAction = -1;
@@ -386,6 +423,11 @@ struct App {
     bool installing = false;
     InstallProgress installProgress;
     std::wstring installError;
+    // Go back: the backup the last install left (refresh_backup), going back to it (its progress in installProgress,
+    // `installing` set too, so neither starts while the other runs), or how the last try failed.
+    std::optional<Backup> backup;
+    bool restoring = false;
+    std::wstring restoreError;
     // The help under the pointer (kHelp's index, -1: none) and the ⓘ it belongs to, as last drawn.
     int tip = -1;
     Rect tipAnchor;
@@ -478,15 +520,33 @@ std::wstring not_yet();
 // picture.cpp: Sim-QVFR's own DLSS can be used with these settings (a game with it, QVFR, an RTX card, multi-view
 // rendering); otherwise `why` says what's missing.
 bool own_dlss_available(std::wstring* why = nullptr);
+// picture.cpp: this PC upscales with AMD FSR instead (no NVIDIA RTX card: AMD, Intel, older NVIDIA): the FSR card in
+// DLSS's place, the same [dlss] settings.
+bool fsr_pc();
+// picture.cpp: the game's own upscaler, DLSS or FSR, can be used with these settings (a game with it, QVFR).
+bool own_upscaler_available(std::wstring* why = nullptr);
+// "DLSS" or "FSR", as this PC gets it.
+const wchar_t* upscaler_name();
+// app_actions.cpp: AMD's FSR provider query started on a worker (once).
+void start_fsr_probe();
+// picture.cpp: the game draws its focus views by multi-view rendering (GameFeatures::multiView or layerMultiView: LMU,
+// ATS, ETS2), and how on this PC: NVIDIA's multi-view rendering on an RTX 20 series or newer, Sim-QVFR's own
+// (instancing) elsewhere. `full`: with why, for the Rendering card.
+bool multi_view_game();
+std::wstring multi_view_way(bool full = false);
 Color col(uint32_t rgb, float alpha = 1);
 bool layers_dirty();
 
 // app_actions.cpp
 COLORREF colorref(uint32_t rgb);
 t::Accent builtin_accent(const games::GameInfo& game);
-std::wstring game_id(const games::GameInfo& game);
 t::Accent game_accent(const games::GameInfo& game);
 ThemeChoice read_theme_choice();
+// [launcher] language read and its lang\ file made current (at start-up), and the About pane's pop-up: its items
+// (Windows' language, English, each file in its own name) and the choice saved and applied at once.
+void read_language();
+int language_items(std::vector<std::wstring>& items);
+void choose_language(int option);
 void cycle_theme();
 void apply_theme();
 bool eye_warning();
@@ -511,10 +571,18 @@ bool installable();
 bool game_running();
 void start_install();
 void install_done(InstallResult* r);
+void refresh_backup();
+void skip_release(bool skip);
+void start_restore();
+void restore_done(InstallResult* r);
 
 // help.cpp
 extern const Help kHelp[];
+// kHelp by a label as drawn (current language or English): its index (-1 none) and its text in the current language.
+int help_index(const std::wstring& label);
 const wchar_t* help_for(const std::wstring& label);
+// shell.cpp: `text` cut to `w` in `style` with an ellipsis when it doesn't fit.
+std::wstring fit(const std::wstring& text, const t::TypeStyle& style, float w);
 void help_icon(const std::wstring& label, float x, float y);
 void help_tip();
 
@@ -540,6 +608,9 @@ bool copy_text(const std::wstring& text);
 void copy_summary();
 std::wstring clipboard_text();
 bool report_edit_fits();
+// The diagnostics' captures and image dumps (log_retention.h diagnostics_paths) to the Recycle Bin; Windows asks first where a drive
+// has none.
+void clear_captures();
 
 // pane_report.cpp
 void export_logs();

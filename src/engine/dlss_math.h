@@ -194,6 +194,29 @@ inline M4 reversed_depth(const M4& p) {
     return r;
 }
 
+// The camera's near and far planes (metres) from a projection's depth terms, depth = m10 + m14 / distance (either
+// convention: the distances at depth 0 and 1, the nearer is the near plane), as AMD FSR takes them. `infinite`: no
+// finite far plane (m10 0 under reversed depth) or one past 1e6 m; `far` is then 1e6.
+inline bool near_far(double m10, double m14, double& nearM, double& farM, bool& infinite) {
+    const double atZero = m10 != 0 ? -m14 / m10 : -1, atOne = m10 != 1 ? m14 / (1 - m10) : -1;
+    const bool zeroOk = atZero > 0 && std::isfinite(atZero), oneOk = atOne > 0 && std::isfinite(atOne);
+    if (!zeroOk && !oneOk)
+        return false;
+    nearM = !zeroOk ? atOne : !oneOk ? atZero : (std::min)(atZero, atOne);
+    farM = zeroOk && oneOk ? (std::max)(atZero, atOne) : 1e6;
+    infinite = !(zeroOk && oneOk) || farM > 1e6;
+    if (infinite)
+        farM = 1e6;
+    return nearM > 0 && nearM < farM;
+}
+
+// A projection's vertical field of view (radians) from its y scale (row-major m11 = 2 / (tan up - tan down)), with the
+// view's clip remap's y scale `c` (a focus view drawn through its eye's clip: 1 for the eye).
+inline double vertical_fov(double m11, double c = 1) {
+    const double s = m11 * c;
+    return s > 0 ? 2 * std::atan(1 / s) : 0;
+}
+
 // An eye's view matrix in the tracking space, from its OpenXR pose (orientation x, y, z, w and position; the eye's
 // frame in the tracking space, right-handed, -z forward): tracking space -> the game's view space (left-handed, +z
 // forward), row vectors. What is fixed to the player's seat (the cockpit, the car) stands still in the tracking space,
@@ -282,7 +305,7 @@ inline bool motion_vector(const M4& r, double clipX, double clipY, unsigned widt
     return true;
 }
 
-// The gate's colour verdict on one class of points (dlss_views.cpp kCheckShader), from the frame's mean difference from
+// The gate's colour verdict on one class of points (dlss_views_shaders.h kCheckShader), from the frame's mean difference from
 // the one before where the points stood (`still`), where their vectors say they were (`along`) and a pixel off that
 // (`off`). Fit: clearly better than standing; fit to the pixel: too little motion to beat standing, but clearly better
 // than a pixel off; else no better than none, or worse. Detail finer than a pixel (far scenery at a small view size)

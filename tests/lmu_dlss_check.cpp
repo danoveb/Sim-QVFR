@@ -2,7 +2,11 @@
 // with a stand-in for the game's side. Not part of the test suite (no _test suffix): it needs an NVIDIA RTX GPU, a build
 // with the NGX SDK and a folder holding nvngx_dlss.dll.
 //
-//   sim_qvfr_tests lmu_dlss_check <folder with nvngx_dlss.dll> [frames]
+//   sim_qvfr_tests lmu_dlss_check <folder with nvngx_dlss.dll> [frames] [fsr=<folder with AMD's two FSR DLLs>]
+//
+// With fsr=: the same parts with AMD FSR running the views (DlssRun::upscaler 1, engine/fsr_upscale.h: our D3D12 device
+// beside this D3D11 one, FSR 3.1 on an NVIDIA GPU); NVIDIA's preset and refusal checks are left out, FSR's own lines
+// checked instead.
 //
 // Each frame, as the game and the layer's hooks would: the stereo views located (their FOV jittered by the module), the
 // projection built from that FOV as LMU builds it, a camera that moves, an eye and its focus view side by side in a
@@ -37,20 +41,31 @@
 #include "engine/dlss_views.h"
 #include "engine/ngx_dlss.h"
 #include "log.h"
+#include "test_util.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
-int failures = 0;
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
-}
-
 ComPtr<ID3D11Device> device;
 ComPtr<ID3D11DeviceContext> context;
+
+// The GPU through everything queued, as a game's frame pacing keeps it from running ahead (an event query waited for).
+// FSR's bridge skips an evaluation with six frames of its work still queued (fsr::kBacklog): this check's frames,
+// unpaced, would run that far ahead in a millisecond.
+bool paced = false;
+void pace() {
+    if (!paced)
+        return;
+    D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+    ComPtr<ID3D11Query> query;
+    if (FAILED(device->CreateQuery(&qd, &query)))
+        return;
+    context->End(query.Get());
+    BOOL done = FALSE;
+    for (int i = 0; i < 20000 && context->GetData(query.Get(), &done, sizeof(done), 0) != S_OK; ++i)
+        Sleep(0);
+}
 
 // One row of an RGBA16F texture, as floats (red only).
 std::vector<float> row_of(ID3D11Texture2D* texture, unsigned x, unsigned y, unsigned w) {
@@ -112,6 +127,20 @@ Out ps(float4 pos : SV_Position) {
     float4 b = mul(float4(ndc, 0.01, 1), clipToWorld);
     float3 p0 = a.xyz / a.w;
     float3 dir = normalize(b.xyz / b.w - p0);
+    // The glass (frame.y > 0, drawn after the scene, as a car's glass is): the window inside the frame, at the frame's
+    // plane 0.4 m ahead, its depth written (LMU's glass: blended, depth written); nothing elsewhere.
+    if (frame.y > 0) {
+        float3 g0 = mul(float4(p0, 1), worldToCamera).xyz, gd = mul(float4(dir, 0), worldToCamera).xyz;
+        float tg = gd.z > 1e-4 ? (0.4 - g0.z) / gd.z : -1;
+        float3 gh = g0 + gd * tg;
+        if (!(tg > 0 && abs(gh.x) <= 0.3 && gh.y >= -0.12 && gh.y <= 0.17))
+            discard;
+        float4 gc = mul(float4(p0 + dir * tg, 1), worldToClip);
+        Out glass;
+        glass.depth = saturate(gc.z / gc.w);
+        glass.colour = float4(0.5, 0.5, 0.5, 1);
+        return glass;
+    }
     float level = dir.y < 0 ? 0 : 4;
     float t = (level - p0.y) / (abs(dir.y) > 1e-6 ? dir.y : 1e-6);
     t = t > 0 ? t : 1e4;
@@ -208,7 +237,8 @@ bool make_scene(Scene& s) {
 // (and its factor) if given.
 bool draw_scene_view(const Scene& s, const simqvfr::dlss::M4& rendered, const float (&view)[16], bool frame, float x, float y,
                      float w, float h, ID3D11RenderTargetView* colour, ID3D11RenderTargetView* msColour,
-                     ID3D11DepthStencilView* dsv, ID3D11BlendState* blend = nullptr, const float* blendFactor = nullptr) {
+                     ID3D11DepthStencilView* dsv, ID3D11BlendState* blend = nullptr, const float* blendFactor = nullptr,
+                     bool glass = false) {
     simqvfr::dlss::M4 inverse;
     if (!simqvfr::dlss::invert(rendered, inverse))
         return false;
@@ -220,6 +250,7 @@ bool draw_scene_view(const Scene& s, const simqvfr::dlss::M4& rendered, const fl
     }
     c.area[0] = x, c.area[1] = y, c.area[2] = w, c.area[3] = h;
     c.frame[0] = frame ? 1.0f : 0.0f;
+    c.frame[1] = glass ? 1.0f : 0.0f;  // the window's glass alone, into the depth (and the multisample colour) only
     context->UpdateSubresource(s.constants.Get(), 0, nullptr, &c, 0, 0);
     ID3D11ShaderResourceView* none[1] = {};
     context->PSSetShaderResources(0, 1, none);
@@ -235,8 +266,10 @@ bool draw_scene_view(const Scene& s, const simqvfr::dlss::M4& rendered, const fl
     context->OMSetDepthStencilState(s.always.Get(), 0);
     if (blend)
         context->OMSetBlendState(blend, blendFactor, 0xffffffff);
-    context->OMSetRenderTargets(1, &colour, nullptr);
-    context->Draw(3, 0);
+    if (!glass) {
+        context->OMSetRenderTargets(1, &colour, nullptr);
+        context->Draw(3, 0);
+    }
     context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     if (msColour) {
         context->OMSetRenderTargets(1, &msColour, dsv);
@@ -283,17 +316,79 @@ double shifted_difference(const std::vector<float>& a, const std::vector<float>&
     return n ? s / n : 0;
 }
 
+// The depth's copy before the glass (dlss_depth_copy_list) timed on the GPU at the game's sizes (LMU, 2026-11: the
+// scene's targets 5190x4168 with MSAA off, 4036x3376 with 8x MSAA; the views cover about this much of them). Printed,
+// not checked. The module must have started (it has, inside a part).
+void time_depth_copies() {
+    struct Size {
+        unsigned w, h, samples;
+    } const sizes[] = {{5190, 4168, 1}, {4036, 3376, 8}, {2990, 2401, 1}};
+    for (const Size& z : sizes) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = z.w, td.Height = z.h, td.MipLevels = td.ArraySize = 1, td.SampleDesc.Count = z.samples;
+        td.Format = DXGI_FORMAT_R32_TYPELESS, td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> t;
+        ComPtr<ID3D11DepthStencilView> v;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
+        dd.Format = DXGI_FORMAT_D32_FLOAT;
+        dd.ViewDimension = z.samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &t)) || FAILED(device->CreateDepthStencilView(t.Get(), &dd, &v)))
+            continue;
+        context->ClearDepthStencilView(v.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+        ID3D11CommandList* list = simqvfr::dlss_depth_copy_list(v.Get(), z.w, z.h);
+        if (!list) {
+            std::printf("     the depth's copy at %ux%u x%u: no list\n", z.w, z.h, z.samples);
+            continue;
+        }
+        D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+        ComPtr<ID3D11Query> disjoint, begin, end;
+        device->CreateQuery(&qd, &disjoint);
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        device->CreateQuery(&qd, &begin);
+        device->CreateQuery(&qd, &end);
+        constexpr int kRuns = 20;
+        context->ExecuteCommandList(list, TRUE);  // warm
+        context->Begin(disjoint.Get());
+        context->End(begin.Get());
+        for (int i = 0; i < kRuns; ++i)
+            context->ExecuteCommandList(list, TRUE);
+        context->End(end.Get());
+        context->End(disjoint.Get());
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        UINT64 a = 0, b = 0;
+        while (context->GetData(disjoint.Get(), &dj, sizeof(dj), 0) == S_FALSE)
+            Sleep(1);
+        context->GetData(begin.Get(), &a, sizeof(a), 0);
+        context->GetData(end.Get(), &b, sizeof(b), 0);
+        const double ms = !dj.Disjoint && dj.Frequency ? 1000.0 * static_cast<double>(b - a) / dj.Frequency / kRuns : -1;
+        std::printf("     the depth's copy before the glass at %ux%u x%u (all of it): %.3f ms on the GPU\n", z.w, z.h,
+                    z.samples, ms);
+    }
+}
+
 }  // namespace
 
 int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
     if (argc < 2) {
-        std::printf("usage: lmu_dlss_check <folder with nvngx_dlss.dll> [frames]\n");
+        std::printf("usage: lmu_dlss_check <folder with nvngx_dlss.dll> [frames] [fsr=<folder with AMD's FSR DLLs>]\n");
         return 2;
     }
-    const int frames = argc > 2 ? (std::max)(120, _wtoi(argv[2])) : 400;
-    wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
-    const std::wstring log = std::wstring(temp) + L"sim-qvfr-lmu-dlss-check.log";
+    std::wstring fsrFolder;
+    bool fsrMode = false, flip = false;
+    int frames = 400;
+    for (int i = 2; i < argc; ++i) {
+        if (std::wcsncmp(argv[i], L"fsr=", 4) == 0)
+            fsrMode = true, fsrFolder = argv[i] + 4;
+        else if (std::wcscmp(argv[i], L"flip") == 0)  // a control: the jitter handed to the upscaler negated both ways
+            flip = true;
+        else
+            frames = (std::max)(120, _wtoi(argv[i]));
+    }
+    paced = fsrMode;
+    if (fsrMode)
+        std::printf("     AMD FSR runs the views (its DLLs from %ls)\n", fsrFolder.c_str());
+    const std::wstring log = temp_path(L"sim-qvfr-lmu-dlss-check.log");
     DeleteFileW(log.c_str());
     SetEnvironmentVariableW(L"SIM_QVFR_LOG", log.c_str());
 
@@ -350,6 +445,12 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
     run.dllFolder = argv[1];
     run.gate = true;
     run.eyePreset = 6;  // the first part: the eyes on preset F (lmu_dlss_eye_preset=F), the focus views on NGX's default
+    run.upscaler = fsrMode ? 1 : 0;
+    run.flipX = run.flipY = flip;
+    // The live part's changes taken at their frame's end, as the check expects (the game waits 500 ms for the player to
+    // stop stepping through the modes).
+    simqvfr::dlss_live_settle_for_tests(0);
+    run.fsrFolder = fsrFolder;
     simqvfr::dlss_start(run);
     check(simqvfr::dlss_wanted(), "the module takes the run (a build with the NGX SDK)");
 
@@ -427,10 +528,13 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
             }
         }
         simqvfr::dlss_frame_end(static_cast<unsigned long long>(f + 1));
+        pace();
     }
     std::printf("     %llu evaluations in %d frames\n", simqvfr::dlss_evaluations_total(), frames);
     check(simqvfr::dlss_wanted(), "the module is still on at the end");
     check(simqvfr::dlss_evaluations_total() == static_cast<unsigned long long>(frames) * 4, "every view of every frame was evaluated");
+    if (fsrMode)
+        check(simqvfr::dlss_upscaler_in_use() == 1, "AMD FSR ran the views");
     std::printf("     the caller's state differed after %d of %d calls\n", stateLost, frames * 2);
     check(stateKept, "the caller's render target, depth target, shader input and viewport are bound as before after every call");
     check(rewritten, "the eye's and the focus view's parts of the scene are rewritten");
@@ -507,6 +611,14 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
     ComPtr<ID3D11ShaderResourceView> objectSlots, objectMotion[2];
     std::vector<float> objectVectors[3];
     unsigned objectVectorsW[3] = {}, objectVectorsH[3] = {};
+    // The car's glass (parts 11-13, without jitter, the car's box on, the window frame in it): 11 the window open (the
+    // world seen through it: the reference), 12 glass writing depth in the window after the scene, the depth copied
+    // before it for DLSS (dlss_depth_copy_list, as LMU's side does at the glass's first draw), 13 the same glass without
+    // the copy (DLSS reads the glass's depth: the control), 14 the copy taken only nearer than 0.3 m (the glass at 0.4 m
+    // isn't: as the control). The eye's vectors at frame 200.
+    std::vector<float> glassVectors[4];
+    unsigned glassVectorsW[4] = {}, glassVectorsH[4] = {};
+    bool glassListMade = true;
     {
         std::vector<uint16_t> ones(static_cast<size_t>(W) * H, 1);
         D3D11_TEXTURE2D_DESC od{};
@@ -527,20 +639,24 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
         }
         check(objectSlots && objectMotion[0] && objectMotion[1], "the moving objects' slot texture and motions are made");
     }
-    for (int part = 0; part < 11; ++part) {
-        const bool control = part == 1, frame = part == 3, single = part == 4, sr = part == 5, liveTest = part == 6,
-                   refusals = part == 7, objectsPart = part >= 8, objects = part >= 9;
+    for (int part = 0; part < 15; ++part) {
+        const bool glassPart = part >= 11, glass = part >= 12, glassCopy = part == 12 || part == 14;
+        const bool control = part == 1, frame = part == 3 || glassPart, single = part == 4, sr = part == 5,
+                   liveTest = part == 6, refusals = part == 7, objectsPart = part >= 8 && part <= 10,
+                   objects = part == 9 || part == 10;
         ID3D11DepthStencilView* const partDsv = single ? dsv1.Get() : dsv.Get();
         ID3D11RenderTargetView* const partColour = single ? resolvedRtv.Get() : otherRtv.Get();
         simqvfr::DlssRun moving = run;
         moving.eyePreset = refusals ? 6 : -1;  // as the focus views' (NGX's default), F in the refusals part
-        moving.car = part == 2 || part == 3;  // part 2: the box alone (nothing in it), part 3: with the frame in it
+        moving.car = part == 2 || part == 3 || glassPart;  // part 2: the box alone (nothing in it), 3: the frame in it
         const double box[6] = {0.8, 0.8, 0.6, 0.6, 1.0, 1.0};  // the frame inside, the floor and the posts outside
         for (int i = 0; i < 6; ++i)
             moving.carBox[i] = box[i];
         moving.viewInverse = control;
         moving.focusScale = sr ? 50 : 100;
-        moving.jitter = moving.jitter && !objectsPart;  // the object parts: the same frames in each
+        moving.jitter = moving.jitter && !objectsPart && !glassPart;  // the object and glass parts: the same frames
+        moving.depthMeasure = glassPart;
+        moving.depthCopyNear = part == 14 ? 0.3 : 3.0;
         simqvfr::ngx::refuse_for_tests(refusals ? sceneEyeW : 0, 6);
         simqvfr::dlss_start(moving);
         // The super resolution part drives as the others (its gate at the 60th and 300th frames), then stands still for
@@ -549,6 +665,7 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
         for (unsigned f = 0; f < partFrames && scene.ps && resolvedRtv; ++f) {
             if (liveTest) {
                 simqvfr::DlssLive change;
+                change.upscaler = fsrMode ? 1 : 0;
                 if (f == 30) {
                     change.on = false;
                     simqvfr::dlss_live(change);
@@ -560,6 +677,9 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
                     simqvfr::dlss_live(change);
                 } else if (f == 105) {  // "ultra quality": NGX has no such mode for an upscale; its quality mode takes 77%
                     change.on = true, change.focusScale = 77, change.preset = 0, change.eyePreset = 11;
+                    simqvfr::dlss_live(change);
+                } else if (f == 112 && fsrMode) {  // FSR: the upscaler switched live to DLSS, the rest as it was
+                    change.on = true, change.focusScale = 77, change.preset = 0, change.eyePreset = 11, change.upscaler = 0;
                     simqvfr::dlss_live(change);
                 }
                 if (f == 31 || f == 61 || f == 90 || f == 119)  // the evaluations so far at each stretch's ends
@@ -574,6 +694,7 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
             if (refusals && f == 30) {  // everything at the eyes' size refused; the eyes' preset changed, so they are made again
                 simqvfr::ngx::refuse_for_tests(sceneEyeW, -1);
                 simqvfr::DlssLive change;
+                change.upscaler = fsrMode ? 1 : 0;
                 change.on = true, change.focusScale = 100, change.preset = 0, change.eyePreset = 11;
                 simqvfr::dlss_live(change);
             }
@@ -647,6 +768,22 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
                                 static_cast<float>(sceneEyeH), resolvedRtv.Get(), partColour, partDsv);
                 draw_scene_view(scene, focusClip, view, frame, static_cast<float>(sceneEyeW), 0, static_cast<float>(rw),
                                 static_cast<float>(rh), resolvedRtv.Get(), partColour, partDsv);
+                if (glass) {  // the glass after the opaque scene, its depth copied first (part 12), as LMU's side does
+                    if (glassCopy) {
+                        ID3D11CommandList* list =
+                            simqvfr::dlss_depth_copy_list(partDsv, sceneEyeW + rw, (std::max)(sceneEyeH, rh));
+                        if (list)
+                            context->ExecuteCommandList(list, TRUE);
+                        else if (f > 2)  // (the module starts at the first pass)
+                            glassListMade = false;
+                        pass.depthCopied = list != nullptr;
+                    }
+                    draw_scene_view(scene, eyeClip, view, frame, 0, 0, static_cast<float>(sceneEyeW),
+                                    static_cast<float>(sceneEyeH), nullptr, partColour, partDsv, nullptr, nullptr, true);
+                    draw_scene_view(scene, focusClip, view, frame, static_cast<float>(sceneEyeW), 0,
+                                    static_cast<float>(rw), static_cast<float>(rh), nullptr, partColour, partDsv, nullptr,
+                                    nullptr, true);
+                }
                 // The game's state at its resolve (MSAA off: at YEBIS's copy, the scene an input of it), then the module.
                 if (single) {
                     ID3D11RenderTargetView* const copyTarget = otherRtv.Get();  // some other target bound, as the copy's
@@ -680,6 +817,11 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
                     }
                 }
                 simqvfr::dlss_after_resolve(context.Get(), resolved.Get(), partDsv, pass);
+                if (glassPart && eye == 0 && f == 200)
+                    simqvfr::dlss_vectors_for_checks(context.Get(), 0, glassVectors[part - 11], glassVectorsW[part - 11],
+                                                     glassVectorsH[part - 11]);
+                if (part == 12 && eye == 1 && f + 1 == partFrames)
+                    time_depth_copies();
                 if (objectsPart && eye == 0 && f == 200)  // the eye's vectors as DLSS got them
                     simqvfr::dlss_vectors_for_checks(context.Get(), 0, objectVectors[part - 8], objectVectorsW[part - 8],
                                                      objectVectorsH[part - 8]);
@@ -731,6 +873,7 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
                 stretchOff = !simqvfr::dlss_wanted() && simqvfr::dlss_focus_scale() == 1.0;
             }
             simqvfr::dlss_frame_end(static_cast<unsigned long long>(frames) + part * sceneFrames + f + 1);
+            pace();
         }
         matricesFail = false;
         simqvfr::dlss_shutdown();
@@ -778,10 +921,10 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
         }
         return v;
     };
-    size_t starts[13];
+    size_t starts[16];
     std::fill(std::begin(starts), std::end(starts), std::string::npos);
     starts[0] = all.find("lmu dlss: DLAA on");
-    for (int i = 1; i < 12 && starts[i - 1] != std::string::npos; ++i)
+    for (int i = 1; i < 16 && starts[i - 1] != std::string::npos; ++i)
         starts[i] = all.find("lmu dlss: DLAA on", starts[i - 1] + 1);
     const auto part_verdicts = [&](int i) {
         return starts[i] == std::string::npos ? Verdicts{} : verdicts(starts[i], starts[i + 1]);
@@ -847,8 +990,9 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
     // The focus views in DLSS performance mode.
     const std::string srPart = starts[6] == std::string::npos ? "" : all.substr(starts[6], starts[7] - starts[6]);
     char made[96];
-    std::snprintf(made, sizeof(made), "view 2's DLSS feature made at %ux%u up to %ux%u (performance", focusW / 2, focusH / 2,
-                  focusW, focusH);
+    std::snprintf(made, sizeof(made), fsrMode ? "view 2's FSR context made at %ux%u up to %ux%u (performance"
+                                              : "view 2's DLSS feature made at %ux%u up to %ux%u (performance",
+                  focusW / 2, focusH / 2, focusW, focusH);
     char gateView[48];
     std::snprintf(gateView, sizeof(gateView), "view 2 (%ux%u)", focusW / 2, focusH / 2);
     std::printf("     super resolution: %d gate lines, depth fit in %d classes, not in %d\n", upscaled.lines, upscaled.depthFit,
@@ -856,8 +1000,9 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
     check(srPart.find("DLSS performance on the focus views") != std::string::npos && srPart.find(made) != std::string::npos &&
               srPart.find("(32 phases)") != std::string::npos,
           "super resolution: the focus views' features made at half size up to their size, 32 jitter phases");
-    check(srPart.find("ngx: (Perf) App hint Preset Unspecified or Overridden, using title default Preset M") != std::string::npos,
-          "super resolution: NGX's line says it took preset M, its default for performance");
+    if (!fsrMode)
+        check(srPart.find("ngx: (Perf) App hint Preset Unspecified or Overridden, using title default Preset M") != std::string::npos,
+              "super resolution: NGX's line says it took preset M, its default for performance");
 
     // The presets per view (the first part: the eyes on F, the focus views on NGX's default), as made and as NGX took them.
     const std::string firstPart = starts[0] == std::string::npos ? "" : all.substr(starts[0], starts[1] - starts[0]);
@@ -870,12 +1015,27 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
         return found != std::string::npos && firstPart.find(what, found) != std::string::npos &&
                firstPart.find(what, found) < at;
     };
-    check(firstPart.find("presets: the eyes F, the focus views default") != std::string::npos && eyeAt != std::string::npos &&
-              focusAt != std::string::npos,
-          "presets: the eyes' features made with F, the focus views' with NGX's default");
-    check(ngx_line_before(eyeAt, "Using App hint Preset F") &&
-              ngx_line_before(focusAt, "using title default Preset K"),
-          "presets: NGX's lines say it took F for the eyes and K (its DLAA default) for the focus views");
+    if (fsrMode) {
+        char fsrEye[96], fsrFocus[96];
+        std::snprintf(fsrEye, sizeof(fsrEye), "view 0's FSR context made at 1600x1280 (native AA");
+        std::snprintf(fsrFocus, sizeof(fsrFocus), "view 2's FSR context made at %ux%u (native AA", focusW, focusH);
+        const size_t providerAt = firstPart.find("FSR provider in use: ");
+        std::printf("     %s\n", providerAt == std::string::npos
+                                     ? "(no provider named)"
+                                     : firstPart.substr(providerAt, firstPart.find('\n', providerAt) - providerAt).c_str());
+        check(firstPart.find("AMD FSR started") != std::string::npos && firstPart.find(fsrEye) != std::string::npos &&
+                  firstPart.find(fsrFocus) != std::string::npos && providerAt != std::string::npos,
+              "FSR: started on our D3D12 device, the eyes' and focus views' contexts made at native AA, the provider named");
+        check(all.find("the evaluation failed") == std::string::npos && all.find("couldn't be made") == std::string::npos,
+              "FSR: no evaluation failed, nothing refused");
+    } else {
+        check(firstPart.find("presets: the eyes F, the focus views default") != std::string::npos && eyeAt != std::string::npos &&
+                  focusAt != std::string::npos,
+              "presets: the eyes' features made with F, the focus views' with NGX's default");
+        check(ngx_line_before(eyeAt, "Using App hint Preset F") &&
+                  ngx_line_before(focusAt, "using title default Preset K"),
+              "presets: NGX's lines say it took F for the eyes and K (its DLAA default) for the focus views");
+    }
     check(srScaled, "super resolution: the focus views asked to be drawn at half size from the frame after NGX started");
     check(upscaled.lines >= 4 && upscaled.depthFit == 2 * upscaled.lines && upscaled.depthNot == 0 &&
               srPart.find(gateView) != std::string::npos,
@@ -896,7 +1056,9 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
                 placement[2][2], bilinearDiff > 0 ? 100 * placement[2][2] / bilinearDiff : 0.0, bilinearDiff);
     // Measured 2026-11-10 (RTX 5070 Ti, nvngx_dlss.dll 310.9.1 from ACE): 32% with the inputs right; 54% with the focus view's
     // jitter computed for its full size instead of its render size (a control, the inputs' likeliest mistake).
-    check(placed && bilinearDiff > 0 && placement[2][2] < 0.45 * bilinearDiff,
+    // FSR 3.1.5 (amd_fidelityfx_upscaler_dx12.dll 4.1.1, on the same 5070 Ti, 2026-11-15): 52% with the inputs right, 93%
+    // with the jitter handed to it negated (`flip`, the control: placed a pixel off too). Its bound sits between.
+    check(placed && bilinearDiff > 0 && placement[2][2] < (fsrMode ? 0.7 : 0.45) * bilinearDiff,
           "super resolution: converged, DLSS's upscale is far nearer the full-size render than a bilinear upscale (jitter "
           "and vectors in render pixels)");
     std::printf("     DLSS given up in a frame: %llu focus views stretched, the row beyond the render %s, differing from the "
@@ -909,16 +1071,22 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
     // The live part.
     const std::string livePart = starts[7] == std::string::npos ? "" : all.substr(starts[7], starts[8] - starts[7]);
     char liveFocus[96];
-    std::snprintf(liveFocus, sizeof(liveFocus), "view 2's DLSS feature made at %ux%u up to %ux%u (quality, preset default",
+    std::snprintf(liveFocus, sizeof(liveFocus),
+                  fsrMode ? "view 2's FSR context made at %ux%u up to %ux%u (quality"
+                          : "view 2's DLSS feature made at %ux%u up to %ux%u (quality, preset default",
                   simqvfr::dlss::render_size(focusW, 0.67), simqvfr::dlss::render_size(focusH, 0.67), focusW, focusH);
     char liveFocusM[80];
-    std::snprintf(liveFocusM, sizeof(liveFocusM), "view 2's DLAA feature made at %ux%u (preset M", focusW, focusH);
+    std::snprintf(liveFocusM, sizeof(liveFocusM),
+                  fsrMode ? "view 2's FSR context made at %ux%u (native AA" : "view 2's DLAA feature made at %ux%u (preset M",
+                  focusW, focusH);
     char liveEye[80];
-    std::snprintf(liveEye, sizeof(liveEye), "view 0's DLAA feature made at %ux%u (preset F", sceneEyeW, sceneEyeH);
+    std::snprintf(liveEye, sizeof(liveEye),
+                  fsrMode ? "view 0's FSR context made at %ux%u (native AA" : "view 0's DLAA feature made at %ux%u (preset F",
+                  sceneEyeW, sceneEyeH);
     std::printf("     live: evaluations %llu at the off, %llu at the on again, %llu at the switch to DLAA M, %llu at the end; "
                 "focus scale %.2f while off, %.2f after\n",
                 liveAt[0], liveAt[1], liveAt[2], liveAt[3], liveScaleOff, liveScaleOn);
-    check(livePart.find("live: off (the features released)") != std::string::npos && liveAt[1] == liveAt[0] &&
+    check(livePart.find("live: off (the features released") != std::string::npos && liveAt[1] == liveAt[0] &&
               !liveWantedOff && liveScaleOff == 1.0,
           "live: off takes at the frame's end: no evaluations, the focus views at their size");
     check(livePart.find("live: on: DLAA on the eyes (preset F), the focus views quality (67%, preset default)") != std::string::npos &&
@@ -926,21 +1094,72 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
               std::fabs(liveScaleOn - 0.67) < 1e-9 && liveAt[2] - liveAt[1] == 4 * 29,
           "live: on again at quality with F on the eyes: features made with them, every view evaluated each frame");
     char liveFocus77[96];
-    std::snprintf(liveFocus77, sizeof(liveFocus77), "view 2's DLSS feature made at %ux%u up to %ux%u (ultra quality",
+    std::snprintf(liveFocus77, sizeof(liveFocus77),
+                  fsrMode ? "view 2's FSR context made at %ux%u up to %ux%u (ultra quality"
+                          : "view 2's DLSS feature made at %ux%u up to %ux%u (ultra quality",
                   simqvfr::dlss::render_size(focusW, 0.77), simqvfr::dlss::render_size(focusH, 0.77), focusW, focusH);
-    check(livePart.find(liveFocusM) != std::string::npos && livePart.find("ngx: (DLAA) Using App hint Preset M") != std::string::npos &&
+    check(livePart.find(liveFocusM) != std::string::npos &&
+              (fsrMode || livePart.find("ngx: (DLAA) Using App hint Preset M") != std::string::npos) &&
               liveAt[3] - liveAt[2] == 4 * 29,
           "live: the focus views to DLAA on preset M (NGX took M), then 77%: every view still evaluated each frame");
     check(livePart.find(liveFocus77) != std::string::npos && livePart.find("couldn't be made") == std::string::npos &&
-              livePart.find("ngx: (Quality) App hint Preset Unspecified or Overridden, using title default Preset K") != std::string::npos,
+              (fsrMode ||
+               livePart.find("ngx: (Quality) App hint Preset Unspecified or Overridden, using title default Preset K") != std::string::npos),
           "live: 77% (\"ultra quality\") made in NGX's quality mode, nothing refused");
+    if (fsrMode) {
+        char liveDlss[96];
+        std::snprintf(liveDlss, sizeof(liveDlss), "view 0's DLAA feature made at %ux%u (preset K", sceneEyeW, sceneEyeH);
+        const size_t switchAt = livePart.find("live: the upscaler is now NVIDIA DLSS");
+        check(switchAt != std::string::npos && livePart.find(liveDlss, switchAt) != std::string::npos &&
+                  livePart.find("NGX started", switchAt) != std::string::npos,
+              "live: FSR switched to DLSS: NGX started, the views' DLSS features made, every view still evaluated");
+    }
 
+    // The car's glass (parts 11-13): where the window is, the vectors with the copy are the open window's; without it,
+    // the glass's (a point 0.4 m ahead, in the car's box: the head's motion alone, where the world drives past).
+    {
+        const auto glass_difference = [&](int a, int b, double& most) {
+            most = 0;
+            if (glassVectors[a].empty() || glassVectors[a].size() != glassVectors[b].size())
+                return -1.0;
+            double sum = 0;
+            for (size_t i = 0; i + 1 < glassVectors[a].size(); i += 2) {
+                const double e = std::hypot(glassVectors[a][i] - glassVectors[b][i], glassVectors[a][i + 1] - glassVectors[b][i + 1]);
+                sum += e;
+                most = (std::max)(most, e);
+            }
+            return sum / (glassVectors[a].size() / 2);
+        };
+        double copyMost = 0, plainMost = 0, farMost = 0;
+        const double copyDiff = glass_difference(1, 0, copyMost), plainDiff = glass_difference(2, 0, plainMost);
+        const double farDiff = glass_difference(3, 2, farMost);
+        std::printf("     the car's glass, the eye's %ux%u vectors at frame 200 against the open window's: with the depth "
+                    "copied before the glass %.4f px on average (at most %.3f), without it %.2f px (at most %.1f)\n",
+                    glassVectorsW[0], glassVectorsH[0], copyDiff, copyMost, plainDiff, plainMost);
+        check(glassListMade, "the car's glass: the depth's copy list is made once the module has started");
+        check(copyDiff >= 0 && copyMost < 0.02, "the car's glass: with the depth copied before it, the vectors are the "
+                                                "world's behind it (to a fiftieth of a pixel everywhere)");
+        check(plainDiff > 0.5 && plainMost > 5, "the car's glass: without the copy, the vectors through it are wrong (the "
+                                                "control)");
+        std::printf("     the copy taken only nearer than 0.3 m (the glass at 0.4 m): %.4f px from the control's on average "
+                    "(at most %.3f)\n",
+                    farDiff, farMost);
+        check(farDiff >= 0 && farMost < 0.02, "the car's glass: farther than the copy's distance, the glass's depth is "
+                                              "left as drawn");
+        const size_t measured = starts[13] == std::string::npos ? std::string::npos
+                                                                : all.find("depth before the transparents, eye", starts[13]);
+        const std::string measure = measured == std::string::npos ? "" : all.substr(measured, all.find('\n', measured) - measured);
+        std::printf("     %s\n", measure.c_str());
+        check(measure.find("drawn nearer, at 0.4") != std::string::npos,
+              "the car's glass: the measurement finds the glass drawn nearer at its 0.4 m");
+    }
     // The refusals part.
     const std::string refusedPart = starts[8] == std::string::npos ? "" : all.substr(starts[8]);
     std::printf("     refusals: evaluations %llu at frame 35, %llu at frame 55; the eyes' jitter %s before, %s after (their "
                 "FOV %s)\n",
                 refusedAt[0], refusedAt[1], refusedJitterEarly ? "on" : "OFF", refusedJitterLate ? "ON" : "off",
                 refusedFovMovedLate ? "MOVED" : "as located");
+    if (!fsrMode) {  // NGX's refusals (ngx::refuse_for_tests): FSR has no presets to refuse
     check(refusedPart.find("view 0: NGX refused preset F") != std::string::npos &&
               refusedPart.find("made with its default for the mode instead") != std::string::npos && refusedJitterEarly,
           "refusals: a refused preset made with NGX's default instead, the eyes jittered and processed");
@@ -949,6 +1168,7 @@ int SIM_QVFR_TEST_MAIN(int argc, wchar_t** argv) {
               refusedPart.find("off for this session") == std::string::npos,
           "refusals: eyes that can't be made get no jitter (their FOV as located), the focus views still processed, DLSS "
           "not given up");
+    }
     simqvfr::ngx::refuse_for_tests(0, 0);
     std::printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

@@ -19,8 +19,15 @@ set(SIM_QVFR_PCH <algorithm> <atomic> <cmath> <cstdint> <cstdio> <cstring> <file
   <windows.h>)
 
 # The release this code is headed for: the About pane names it, and package.ps1 uses it when -Version is left out.
-set(SIM_QVFR_RELEASE "1.1.1-beta")
+set(SIM_QVFR_RELEASE "1.2.2-beta")
 set(SIM_QVFR_VERSION "dev" CACHE STRING "Version shown by the launcher (package.ps1 sets it)")
+# A development build (version "dev") or a release: diagnostic hotkeys and switches exist in development builds only
+# (src/dev_build.h).
+if(SIM_QVFR_VERSION STREQUAL "dev")
+  add_compile_definitions(SIM_QVFR_DEV_BUILD=1)
+else()
+  add_compile_definitions(SIM_QVFR_DEV_BUILD=0)
+endif()
 
 # Windows version info for a binary (src/version_info.rc.in): numbers from the version's leading digits
 # ("1.0.0-beta (abc1234)" -> 1,0,0,0), or from SIM_QVFR_RELEASE in a "dev" build.
@@ -92,14 +99,36 @@ if(SIM_QVFR_NGX AND EXISTS "${NGX_SDK_DIR}/nvngx_dlss.dll")
   set(SIM_QVFR_NGX_DLL "${NGX_SDK_DIR}/nvngx_dlss.dll")
 endif()
 
+# AMD's FSR SDK headers (Kits/FidelityFX/api/include, Kits/FidelityFX/upscalers/include; FidelityFX SDK 2.x), for AMD FSR
+# called by us (src/engine/fsr_upscale.h): not in this repository. Nothing of it is linked: AMD's signed
+# amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll are loaded at run time. Unset: the code builds
+# without it and answers that FSR is unavailable. Its place inside a checkout, gitignored: third_party/amd-fsr-sdk.
+set(SIM_QVFR_FFX_DEFAULT "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd-fsr-sdk/Kits/FidelityFX/upscalers/include/ffx_upscale.h")
+  set(SIM_QVFR_FFX_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd-fsr-sdk")
+endif()
+set(FFX_SDK_DIR "${SIM_QVFR_FFX_DEFAULT}" CACHE PATH "A local AMD FSR SDK (FidelityFX SDK 2.x headers)")
+set(SIM_QVFR_FFX OFF)
+if(FFX_SDK_DIR AND EXISTS "${FFX_SDK_DIR}/Kits/FidelityFX/upscalers/include/ffx_upscale.h")
+  set(SIM_QVFR_FFX ON)
+endif()
+
+# NVIDIA Nsight Aftermath (GPU hang dumps and markers, probe/aftermath.h): a local SDK folder, never committed, and
+# development builds only (a release never has it). Its DLL is loaded at run time from the SDK's own folder.
+set(AFTERMATH_SDK_DIR "" CACHE PATH "A local NVIDIA Nsight Aftermath SDK (its include/ and lib/x64/)")
+set(SIM_QVFR_AFTERMATH OFF)
+if(AFTERMATH_SDK_DIR AND SIM_QVFR_VERSION STREQUAL "dev" AND EXISTS "${AFTERMATH_SDK_DIR}/include/GFSDK_Aftermath.h"
+   AND EXISTS "${AFTERMATH_SDK_DIR}/lib/x64/GFSDK_Aftermath_Lib.x64.dll")
+  set(SIM_QVFR_AFTERMATH ON)
+endif()
 # Every source the layer shares with its tests except the layer itself (sim_qvfr_layer below), compiled once.
 # A test links this and takes only the objects it references.
 add_library(sim_qvfr_core STATIC
   src/games/games.cpp src/games/multi_view.cpp src/log.cpp src/layer_chain.cpp
-  src/probe/probe.cpp src/probe/hang_watch.cpp
-  src/probe/d3d11_capture.cpp src/probe/d3d12_trace.cpp src/probe/dred.cpp src/probe/pass_census.cpp src/probe/pix_capture.cpp src/probe/gpu_frame_timer.cpp src/probe/d3d11_compose_timer.cpp src/probe/gpu_load.cpp src/probe/cpu_load.cpp src/probe/cpu_profile.cpp src/probe/vram_census.cpp src/probe/run_exit.cpp
+  src/probe/probe.cpp src/probe/hang_watch.cpp src/probe/aftermath.cpp
+  src/probe/d3d11_capture.cpp src/probe/d3d12_trace.cpp src/probe/dred.cpp src/probe/pass_census.cpp src/probe/focus_ngx.cpp src/probe/pix_capture.cpp src/probe/gpu_frame_timer.cpp src/probe/d3d11_compose_timer.cpp src/probe/gpu_load.cpp src/probe/cpu_load.cpp src/probe/cpu_placement.cpp src/probe/cpu_isolation.cpp src/probe/cpu_profile.cpp src/probe/vram_census.cpp src/probe/run_exit.cpp
   src/probe/d3d12_vtable_index.c
-  src/games/ace/double_render.cpp src/games/ace/views3.cpp src/games/ace/views4.cpp src/games/ace/batch_watch.cpp src/games/ace/dlss_extent.cpp src/games/ace/adapter.cpp src/games/acc/adapter.cpp src/games/acc/views.cpp src/games/acc/view_share.cpp src/games/acc/mesh_passes.cpp src/games/acc/gates.cpp src/games/acc/fixation.cpp src/games/xplane/adapter.cpp src/games/xplane/four_views.cpp src/games/xplane/four_views_shaders.cpp src/games/xplane/four_views_frame.cpp src/games/xplane/focus_projection.cpp src/games/xplane/spirv_patch.cpp src/games/lmu/adapter.cpp src/games/lmu/view_probe.cpp src/games/lmu/four_passes.cpp src/games/lmu/mvr_probe.cpp src/games/lmu/mvr_pass.cpp src/games/lmu/focus_post.cpp src/games/lmu/dlss_inputs.cpp src/games/lmu/car_motion.cpp src/engine/dlss_views.cpp src/engine/ngx_dlss.cpp src/engine/nr_views.cpp src/engine/ngx_nr.cpp src/games/adapters.cpp src/engine/code_patch.cpp src/engine/object_vtable.cpp src/engine/d3d11_vtables.cpp src/engine/dxbc_patch.cpp src/engine/nvapi_stereo.cpp src/engine/nvapi_gpus.cpp
+  src/games/ace/double_render.cpp src/games/ace/views3.cpp src/games/ace/views4.cpp src/games/ace/replay_probe.cpp src/games/ace/replay_focus.cpp src/games/ace/replay_lighting.cpp src/games/ace/replay_transparents.cpp src/games/ace/replay_post.cpp src/games/ace/replay_eye_live.cpp src/games/ace/replay_samples.cpp src/games/ace/replay_cull.cpp src/games/ace/batch_watch.cpp src/games/ace/dlss_extent.cpp src/games/ace/stereo_flag.cpp src/games/ace/adapter.cpp src/games/acc/adapter.cpp src/games/acc/views.cpp src/games/acc/view_share.cpp src/games/acc/mesh_passes.cpp src/games/acc/gates.cpp src/games/acc/fixation.cpp src/games/xplane/adapter.cpp src/games/xplane/four_views.cpp src/games/xplane/four_views_shaders.cpp src/games/xplane/four_views_frame.cpp src/games/xplane/focus_projection.cpp src/games/xplane/spirv_patch.cpp src/games/xplane/spirv_module.cpp src/games/xplane/spirv_patch_eyes.cpp src/games/xplane/spirv_patch_focus.cpp src/games/xplane/spirv_patch_rays.cpp src/games/xplane/spirv_patch_view_rects.cpp src/games/xplane/spirv_patch_diag.cpp src/games/lmu/adapter.cpp src/games/lmu/view_probe.cpp src/games/lmu/qvfr_frame.cpp src/games/lmu/pass_costs.cpp src/games/lmu/native_menus.cpp src/games/lmu/mvr_probe.cpp src/games/lmu/mvr_pass.cpp src/games/lmu/mvr_pass_trace.cpp src/games/lmu/mvr_pass_census.cpp src/games/lmu/mvr_pass_samples.cpp src/games/lmu/focus_post.cpp src/games/lmu/dlss_inputs.cpp src/games/lmu/car_motion.cpp src/games/scssoftware/adapter.cpp src/games/scssoftware/pass_probe.cpp src/games/scssoftware/corner.cpp src/games/scssoftware/corner_math.cpp src/games/scssoftware/corner_mirrors.cpp src/games/scssoftware/corner_eye_order.cpp src/games/scssoftware/corner_focus.cpp src/games/scssoftware/corner_present.cpp src/games/scssoftware/corner_burst.cpp src/games/scssoftware/corner_diag.cpp src/games/scssoftware/corner_mirror_diag.cpp src/engine/context_hooks.cpp src/engine/dlss_views.cpp src/engine/ngx_dlss.cpp src/engine/nr_views.cpp src/engine/ngx_nr.cpp src/engine/d3d12_bridge.cpp src/engine/fsr_upscale.cpp src/games/adapters.cpp src/engine/code_patch.cpp src/engine/object_vtable.cpp src/engine/d3d11_vtables.cpp src/engine/dxbc_patch.cpp src/engine/nvapi_stereo.cpp src/engine/nvapi_gpus.cpp
   src/quad/compositor.cpp src/quad/helmet_pieces.cpp src/quad/d3d11_compositor.cpp src/quad/d3d11_view_resample.cpp src/quad/d3d11_depth_probe.cpp src/quad/focus_outline.cpp src/quad/settings_menu.cpp src/quad/menu_panel.cpp
   src/quad/osd.cpp src/quad/osd_panel.cpp src/quad/qvfr_optimizer.cpp src/cheeky/cheeky_host.cpp
   src/input/hotkeys.cpp src/profile/profiles.cpp src/input/pad_input.cpp)
@@ -108,10 +137,21 @@ target_compile_definitions(sim_qvfr_core PRIVATE UNICODE _UNICODE WIN32_LEAN_AND
 target_compile_options(sim_qvfr_core PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(sim_qvfr_core PUBLIC minhook bcrypt d3d12 dxgi d3dcompiler windowscodecs ole32 pdh dinput8 dxguid)
 target_precompile_headers(sim_qvfr_core PRIVATE ${SIM_QVFR_PCH})
+if(SIM_QVFR_AFTERMATH)
+  set_property(SOURCE src/probe/aftermath.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${AFTERMATH_SDK_DIR}/include")
+  set_property(SOURCE src/probe/aftermath.cpp APPEND PROPERTY COMPILE_DEFINITIONS SIM_QVFR_AFTERMATH
+               "SIM_QVFR_AFTERMATH_DLL=L\"${AFTERMATH_SDK_DIR}/lib/x64/GFSDK_Aftermath_Lib.x64.dll\"")
+endif()
 if(SIM_QVFR_NGX)
   target_include_directories(sim_qvfr_core PRIVATE "${NGX_SDK_DIR}/include")
   target_compile_definitions(sim_qvfr_core PRIVATE SIM_QVFR_NGX)
   target_link_libraries(sim_qvfr_core PUBLIC debug "${NGX_SDK_DIR}/nvsdk_ngx_s_dbg.lib" optimized "${NGX_SDK_DIR}/nvsdk_ngx_s.lib")
+endif()
+if(SIM_QVFR_FFX)
+  # Only fsr_upscale.cpp includes AMD's headers.
+  set_property(SOURCE src/engine/fsr_upscale.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
+    "${FFX_SDK_DIR}/Kits/FidelityFX/api/include" "${FFX_SDK_DIR}/Kits/FidelityFX/upscalers/include")
+  set_property(SOURCE src/engine/fsr_upscale.cpp APPEND PROPERTY COMPILE_DEFINITIONS SIM_QVFR_FFX)
 endif()
 # C, and C-style COM declarations (CINTERFACE before its includes).
 set_source_files_properties(src/probe/d3d12_vtable_index.c src/engine/d3d11_vtables.cpp
@@ -122,8 +162,9 @@ set_source_files_properties(src/probe/d3d12_vtable_index.c src/engine/d3d11_vtab
 # xrNegotiateLoaderApiLayerInterface, which nothing in the DLL references.
 add_library(sim_qvfr_layer OBJECT src/xr_layer.cpp src/layer/globals.cpp src/layer/config.cpp
   src/layer/gaze_actions.cpp src/layer/gaze.cpp src/layer/quad_state.cpp src/layer/reports.cpp src/layer/session.cpp
-  src/layer/helmet_layer.cpp src/layer/views4.cpp src/layer/two_loops.cpp src/layer/views.cpp src/layer/live_ini.cpp
-  src/layer/hotkey_watch.cpp src/layer/menu.cpp src/layer/overlay.cpp src/layer/optimizer.cpp src/layer/frame.cpp src/layer/native_quad.cpp)
+  src/layer/helmet_layer.cpp src/layer/views4.cpp src/layer/views4_d3d11.cpp src/layer/two_loops.cpp src/layer/views.cpp src/layer/live_ini.cpp
+  src/layer/hotkey_watch.cpp src/layer/menu.cpp src/layer/overlay.cpp src/layer/optimizer.cpp src/layer/frame.cpp src/layer/native_quad.cpp
+  src/layer/eye_off.cpp)
 target_include_directories(sim_qvfr_layer PRIVATE src ${THIRD_PARTY}/openxr/include)
 target_compile_definitions(sim_qvfr_layer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(sim_qvfr_layer PRIVATE /W4 /permissive- /utf-8)
@@ -172,6 +213,18 @@ target_include_directories(d3d12_trace_test PRIVATE src ${THIRD_PARTY}/openxr/in
 target_compile_definitions(d3d12_trace_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(d3d12_trace_test PRIVATE sim_qvfr_core)
 
+# Offline check of the re-emission probe (API-level QVFR gate G5) on a WARP device (tests/replay_probe_test.cpp).
+sim_qvfr_test(replay_probe_test tests/replay_probe_test.cpp)
+target_include_directories(replay_probe_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(replay_probe_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(replay_probe_test PRIVATE sim_qvfr_core)
+
+# Offline check of the focus depth replay (API-level QVFR step R1) on a WARP device (tests/replay_focus_test.cpp).
+sim_qvfr_test(replay_focus_test tests/replay_focus_test.cpp)
+target_include_directories(replay_focus_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(replay_focus_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(replay_focus_test PRIVATE sim_qvfr_core)
+
 # Offline check of the quad compositor on a WARP device (tests/compositor_test.cpp).
 sim_qvfr_test(compositor_test tests/compositor_test.cpp)
 target_include_directories(compositor_test PRIVATE src ${THIRD_PARTY}/openxr/include)
@@ -196,6 +249,14 @@ target_include_directories(dxbc_patch_test PRIVATE src)
 target_compile_definitions(dxbc_patch_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(dxbc_patch_test PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(dxbc_patch_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
+
+# Check of what a detour like LMU's car hooks costs per call (tests/car_hook_cost_check.cpp): not in the suite (no _test
+# suffix; a measurement on a WARP device).
+sim_qvfr_test(car_hook_cost_check tests/car_hook_cost_check.cpp)
+target_include_directories(car_hook_cost_check PRIVATE src ${THIRD_PARTY}/minhook/include)
+target_compile_definitions(car_hook_cost_check PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(car_hook_cost_check PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(car_hook_cost_check PRIVATE minhook d3d11)
 
 # Hardware check of NVIDIA single-pass stereo with converted shaders (tests/nvapi_stereo_check.cpp): not in the suite
 # (no _test suffix; needs an NVIDIA GPU). Optional argument: a folder of a game's vertex shaders, kept local.
@@ -260,6 +321,20 @@ target_compile_definitions(object_vtable_test PRIVATE UNICODE _UNICODE WIN32_LEA
 target_compile_options(object_vtable_test PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(object_vtable_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
 
+# Offline check of the SCS games' eye-pass probe and the D3D11 context hooks on a WARP device (tests/scs_pass_probe_test.cpp).
+sim_qvfr_test(scs_pass_probe_test tests/scs_pass_probe_test.cpp)
+target_include_directories(scs_pass_probe_test PRIVATE src)
+target_compile_definitions(scs_pass_probe_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(scs_pass_probe_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(scs_pass_probe_test PRIVATE sim_qvfr_core d3d11)
+
+# Offline check of the SCS games' corner (their API-level QVFR) on a WARP device (tests/scs_corner_test.cpp).
+sim_qvfr_test(scs_corner_test tests/scs_corner_test.cpp)
+target_include_directories(scs_corner_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(scs_corner_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(scs_corner_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(scs_corner_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
+
 # Offline check of LMU's multi-view rendering in the eye passes on a WARP device (tests/lmu_mvr_pass_test.cpp).
 sim_qvfr_test(lmu_mvr_pass_test tests/lmu_mvr_pass_test.cpp)
 target_include_directories(lmu_mvr_pass_test PRIVATE src)
@@ -274,6 +349,28 @@ target_include_directories(lmu_focus_post_test PRIVATE src ${THIRD_PARTY}/openxr
 target_compile_definitions(lmu_focus_post_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(lmu_focus_post_test PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(lmu_focus_post_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
+sim_qvfr_test(lmu_mvr_tracker_test tests/lmu_mvr_tracker_test.cpp)
+target_include_directories(lmu_mvr_tracker_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(lmu_mvr_tracker_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(lmu_mvr_tracker_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(lmu_mvr_tracker_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
+sim_qvfr_test(lmu_focus_post_msaa_test tests/lmu_focus_post_msaa_test.cpp)
+target_include_directories(lmu_focus_post_msaa_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(lmu_focus_post_msaa_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(lmu_focus_post_msaa_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(lmu_focus_post_msaa_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
+sim_qvfr_test(lmu_focus_post_roles_test tests/lmu_focus_post_roles_test.cpp)
+target_include_directories(lmu_focus_post_roles_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(lmu_focus_post_roles_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(lmu_focus_post_roles_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(lmu_focus_post_roles_test PRIVATE sim_qvfr_core d3d11 d3dcompiler)
+
+# Offline check of the shared D3D11 state guard on a WARP device (tests/d3d11_state_test.cpp).
+sim_qvfr_test(d3d11_state_test tests/d3d11_state_test.cpp)
+target_include_directories(d3d11_state_test PRIVATE src)
+target_compile_definitions(d3d11_state_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(d3d11_state_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(d3d11_state_test PRIVATE d3d11 d3dcompiler)
 
 # Offline check of the D3D11 compositor on a WARP device (tests/d3d11_compositor_test.cpp).
 sim_qvfr_test(d3d11_compositor_test tests/d3d11_compositor_test.cpp)
@@ -286,6 +383,13 @@ sim_qvfr_test(cas_sharpen_test tests/cas_sharpen_test.cpp)
 target_include_directories(cas_sharpen_test PRIVATE src ${THIRD_PARTY}/openxr/include)
 target_compile_definitions(cas_sharpen_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(cas_sharpen_test PRIVATE sim_qvfr_core d3d11)
+# Offline check of colour correction: its settings, the headset menu's Color page and the compositor's grading on a
+# WARP device (tests/color_grade_test.cpp).
+sim_qvfr_test(color_grade_test tests/color_grade_test.cpp)
+target_include_directories(color_grade_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(color_grade_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(color_grade_test PRIVATE /utf-8)
+target_link_libraries(color_grade_test PRIVATE sim_qvfr_core d3d11)
 
 # Offline check of the panels' D3D11 upload on a WARP device (tests/panel_upload_test.cpp).
 sim_qvfr_test(panel_upload_test tests/panel_upload_test.cpp)
@@ -309,6 +413,20 @@ sim_qvfr_test(quad_flow_test tests/quad_flow_test.cpp)
 target_include_directories(quad_flow_test PRIVATE src ${THIRD_PARTY}/openxr/include)
 target_compile_definitions(quad_flow_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(quad_flow_test PRIVATE sim_qvfr_layer)
+
+# The output density (quad/output_density.h): the composed output at the focus views' density (tests/output_density_test.cpp).
+sim_qvfr_test(output_density_test tests/output_density_test.cpp)
+target_include_directories(output_density_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(output_density_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(output_density_test PRIVATE /utf-8)
+target_link_libraries(output_density_test PRIVATE sim_qvfr_core)
+
+# One eye off: the frame's layers as the runtime gets them, and the headset menu's line (tests/eye_off_test.cpp).
+sim_qvfr_test(eye_off_test tests/eye_off_test.cpp)
+target_include_directories(eye_off_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(eye_off_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(eye_off_test PRIVATE /utf-8)
+target_link_libraries(eye_off_test PRIVATE sim_qvfr_core)
 
 # Offline check of native quad views (quad/native_quad.h, layer/native_quad.cpp) against a fake runtime offering
 # PRIMARY_QUAD_VARJO (tests/native_quad_test.cpp).
@@ -399,6 +517,11 @@ sim_qvfr_test(focus_turn_test tests/focus_turn_test.cpp)
 target_include_directories(focus_turn_test PRIVATE src ${THIRD_PARTY}/openxr/include)
 target_compile_definitions(focus_turn_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# Offline check of the focus mask's mesh against the compositor's focus shape (tests/focus_mask_test.cpp).
+sim_qvfr_test(focus_mask_test tests/focus_mask_test.cpp)
+target_include_directories(focus_mask_test PRIVATE src)
+target_compile_definitions(focus_mask_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+
 # Offline check of LMU's multi-view recovery rule (tests/lmu_mvr_recovery_test.cpp).
 sim_qvfr_test(lmu_mvr_recovery_test tests/lmu_mvr_recovery_test.cpp)
 target_include_directories(lmu_mvr_recovery_test PRIVATE src)
@@ -423,6 +546,13 @@ target_compile_definitions(settings_menu_test PRIVATE UNICODE _UNICODE WIN32_LEA
 target_compile_definitions(settings_menu_test PRIVATE SIM_QVFR_DOCUMENTED_INI="${CMAKE_CURRENT_SOURCE_DIR}/manifest/sim-qvfr.ini")
 target_compile_options(settings_menu_test PRIVATE /utf-8)
 target_link_libraries(settings_menu_test PRIVATE sim_qvfr_core)
+
+# Offline check that the launcher, the headset menu and the layer read the shared settings table alike
+# (tests/qvfr_settings_test.cpp; quad/qvfr_settings.h).
+sim_qvfr_test(qvfr_settings_test tests/qvfr_settings_test.cpp)
+target_include_directories(qvfr_settings_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(qvfr_settings_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(qvfr_settings_test PRIVATE /W4 /permissive- /utf-8)
 
 # Offline check of the performance overlay: its numbers, rows and card (tests/osd_test.cpp).
 sim_qvfr_test(osd_test tests/osd_test.cpp)
@@ -465,6 +595,13 @@ target_compile_options(cheeky_host_test PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(cheeky_host_test PRIVATE sim_qvfr_core)
 add_dependencies(cheeky_host_test cheeky_fake_runtime)
 
+# Offline check of the layer's log levels, size limit and rotation (tests/log_level_test.cpp).
+sim_qvfr_test(log_level_test tests/log_level_test.cpp)
+target_include_directories(log_level_test PRIVATE src)
+target_compile_definitions(log_level_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(log_level_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(log_level_test PRIVATE sim_qvfr_core)
+
 # Offline check of the hang watch's module log and its minidump, written by the launcher as the dump helper
 # (tests/hang_watch_test.cpp).
 sim_qvfr_test(hang_watch_test tests/hang_watch_test.cpp)
@@ -478,15 +615,17 @@ add_dependencies(hang_watch_test sim_qvfr_launcher)  # the dump helper, next to 
 configure_file(src/launcher/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/launcher_version.h @ONLY)
 # The launcher's code that launcher_test checks, compiled once for both. An OBJECT library, so the launcher links every
 # object as it did when they were its own sources (none has a static initializer, so their order doesn't matter).
-add_library(sim_qvfr_launcher_shared OBJECT src/games/games.cpp src/launcher/settings.cpp src/launcher/launch_watch.cpp
+add_library(sim_qvfr_launcher_shared OBJECT src/games/games.cpp src/launcher/settings.cpp
+  src/launcher/settings_per_game.cpp src/launcher/settings_runtime.cpp src/launcher/settings_readouts.cpp src/launcher/launch_watch.cpp
   src/launcher/game_tabs.cpp src/launcher/report.cpp src/launcher/launch_plan.cpp src/launcher/layer_order.cpp
   src/launcher/explicit_layers.cpp src/launcher/session_history.cpp src/launcher/preflight.cpp src/input/hotkeys.cpp
   src/launcher/leftovers.cpp
+  src/launcher/log_retention.cpp src/launcher/signature_check.cpp
   src/profile/profiles.cpp src/launcher/update_check.cpp src/launcher/install.cpp src/quad/osd.cpp)
 target_include_directories(sim_qvfr_launcher_shared PRIVATE src)
 target_compile_definitions(sim_qvfr_launcher_shared PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(sim_qvfr_launcher_shared PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(sim_qvfr_launcher_shared PUBLIC bcrypt winhttp version)
+target_link_libraries(sim_qvfr_launcher_shared PUBLIC bcrypt winhttp version wintrust crypt32)
 target_precompile_headers(sim_qvfr_launcher_shared PRIVATE ${SIM_QVFR_PCH})
 
 # Local analysis tools (src/probe/local_analysis.h): the developer's own, in a folder outside the repository, never
@@ -513,7 +652,7 @@ if(SIM_QVFR_LOCAL_DIR AND EXISTS "${SIM_QVFR_LOCAL_DIR}/local_analysis.cpp")
   endforeach()
 endif()
 
-add_executable(sim_qvfr_launcher WIN32 src/launcher/main.cpp src/input/pad_input.cpp src/engine/nvapi_gpus.cpp
+add_executable(sim_qvfr_launcher WIN32 src/launcher/main.cpp src/input/pad_input.cpp src/engine/nvapi_gpus.cpp src/engine/fsr_probe.cpp
   src/launcher/ui/launcher_window.cpp src/launcher/ui/canvas.cpp src/probe/hang_dump.cpp src/launcher/launcher.rc
   src/launcher/ui/window_state.cpp src/launcher/ui/app_actions.cpp src/launcher/ui/update_install.cpp
   src/launcher/ui/controls.cpp src/launcher/ui/help.cpp src/launcher/ui/sheet.cpp src/launcher/ui/form.cpp
@@ -528,8 +667,13 @@ target_compile_definitions(sim_qvfr_launcher PRIVATE UNICODE _UNICODE WIN32_LEAN
 if(SIM_QVFR_NGX)  # the layer has NGX in it: the About pane credits NVIDIA DLSS (the RTX SDKs licence's attribution)
   target_compile_definitions(sim_qvfr_launcher PRIVATE SIM_QVFR_NGX)
 endif()
+if(SIM_QVFR_FFX)  # the layer has AMD FSR in it: the FSR card asks AMD's runtime which FSR, the About pane credits AMD
+  target_compile_definitions(sim_qvfr_launcher PRIVATE SIM_QVFR_FFX)
+  set_property(SOURCE src/engine/fsr_probe.cpp TARGET_DIRECTORY sim_qvfr_launcher APPEND PROPERTY INCLUDE_DIRECTORIES
+    "${FFX_SDK_DIR}/Kits/FidelityFX/api/include" "${FFX_SDK_DIR}/Kits/FidelityFX/upscalers/include")
+endif()
 target_compile_options(sim_qvfr_launcher PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(sim_qvfr_launcher PRIVATE sim_qvfr_launcher_shared shell32 d2d1 dwrite dwmapi comdlg32 bcrypt dinput8 dxguid winhttp version ole32
+target_link_libraries(sim_qvfr_launcher PRIVATE sim_qvfr_launcher_shared shell32 d2d1 dwrite dwmapi comdlg32 bcrypt dinput8 dxguid winhttp version ole32 d3d12 dxgi
                       oleaut32 uiautomationcore)
 target_precompile_headers(sim_qvfr_launcher PRIVATE ${SIM_QVFR_PCH})
 set_target_properties(sim_qvfr_launcher PROPERTIES OUTPUT_NAME sim-qvfr-launcher)
@@ -550,12 +694,55 @@ foreach(piece top bottom visor)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/copy_if_missing.cmake)
 endforeach()
 
+# The launcher's languages (lang/*.ini, src/lang.h) beside it, as package.ps1 ships them: ours, so always the repository's.
+file(GLOB SIM_QVFR_LANG_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lang/*.ini)
+add_custom_command(TARGET sim_qvfr_launcher POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:sim_qvfr_launcher>/lang
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SIM_QVFR_LANG_FILES} $<TARGET_FILE_DIR:sim_qvfr_launcher>/lang)
+
+# Offline check of the language files and their lookup (tests/lang_test.cpp): every shipped lang/*.ini reads clean.
+sim_qvfr_test(lang_test tests/lang_test.cpp)
+target_include_directories(lang_test PRIVATE src)
+target_compile_definitions(lang_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+                          SIM_QVFR_LANG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/lang")
+target_compile_options(lang_test PRIVATE /W4 /permissive- /utf-8)
+
 # Offline check of the launcher's launch plan (tests/launcher_test.cpp).
 sim_qvfr_test(launcher_test tests/launcher_test.cpp)
 target_include_directories(launcher_test PRIVATE src)
 target_compile_definitions(launcher_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(launcher_test PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(launcher_test PRIVATE sim_qvfr_launcher_shared)
+sim_qvfr_test(launcher_state_test tests/launcher_state_test.cpp)
+target_include_directories(launcher_state_test PRIVATE src)
+target_compile_definitions(launcher_state_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(launcher_state_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(launcher_state_test PRIVATE sim_qvfr_launcher_shared)
+sim_qvfr_test(launcher_settings_test tests/launcher_settings_test.cpp)
+target_include_directories(launcher_settings_test PRIVATE src)
+target_compile_definitions(launcher_settings_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(launcher_settings_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(launcher_settings_test PRIVATE sim_qvfr_launcher_shared)
+sim_qvfr_test(launcher_report_test tests/launcher_report_test.cpp)
+target_include_directories(launcher_report_test PRIVATE src)
+target_compile_definitions(launcher_report_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(launcher_report_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(launcher_report_test PRIVATE sim_qvfr_launcher_shared)
+sim_qvfr_test(launcher_preflight_test tests/launcher_preflight_test.cpp)
+target_include_directories(launcher_preflight_test PRIVATE src)
+target_compile_definitions(launcher_preflight_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(launcher_preflight_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(launcher_preflight_test PRIVATE sim_qvfr_launcher_shared)
+sim_qvfr_test(launcher_profiles_test tests/launcher_profiles_test.cpp)
+target_include_directories(launcher_profiles_test PRIVATE src)
+target_compile_definitions(launcher_profiles_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(launcher_profiles_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(launcher_profiles_test PRIVATE sim_qvfr_launcher_shared)
+sim_qvfr_test(launcher_install_test tests/launcher_install_test.cpp)
+target_include_directories(launcher_install_test PRIVATE src)
+target_compile_definitions(launcher_install_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(launcher_install_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(launcher_install_test PRIVATE sim_qvfr_launcher_shared)
 
 # Offline check of the VRAM census on a WARP device: textures recorded, sorted and taken off when freed
 # (tests/vram_census_test.cpp).
@@ -563,6 +750,14 @@ sim_qvfr_test(vram_census_test tests/vram_census_test.cpp)
 target_include_directories(vram_census_test PRIVATE src ${THIRD_PARTY}/openxr/include)
 target_compile_definitions(vram_census_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(vram_census_test PRIVATE sim_qvfr_core)
+
+# Offline check of the CPU placement probe: kinds of cores per layout, busy shares, this machine's readings
+# (tests/cpu_placement_test.cpp).
+sim_qvfr_test(cpu_placement_test tests/cpu_placement_test.cpp)
+target_include_directories(cpu_placement_test PRIVATE src ${THIRD_PARTY}/openxr/include)
+target_compile_definitions(cpu_placement_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(cpu_placement_test PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(cpu_placement_test PRIVATE sim_qvfr_core)
 
 # Offline check of the CPU sampling profiler: a spinning thread's function on top (tests/cpu_profile_test.cpp).
 sim_qvfr_test(cpu_profile_test tests/cpu_profile_test.cpp)
@@ -577,7 +772,8 @@ target_include_directories(xplane_focus_test PRIVATE src)
 target_compile_options(xplane_focus_test PRIVATE /W4 /permissive- /utf-8)
 
 # Offline check of the SPIR-V edit for X-Plane's final resolve shader (tests/xplane_spirv_test.cpp).
-sim_qvfr_test(xplane_spirv_test tests/xplane_spirv_test.cpp src/games/xplane/spirv_patch.cpp)
+sim_qvfr_test(xplane_spirv_test tests/xplane_spirv_test.cpp src/games/xplane/spirv_patch.cpp
+  src/games/xplane/spirv_module.cpp src/games/xplane/spirv_patch_eyes.cpp src/games/xplane/spirv_patch_focus.cpp src/games/xplane/spirv_patch_rays.cpp src/games/xplane/spirv_patch_view_rects.cpp src/games/xplane/spirv_patch_diag.cpp)
 target_include_directories(xplane_spirv_test PRIVATE src)
 target_compile_definitions(xplane_spirv_test PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(xplane_spirv_test PRIVATE /W4 /permissive- /utf-8)

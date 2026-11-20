@@ -1,8 +1,10 @@
 // The quad-view compose shader, shared by the D3D12 compositor (compositor.h) and the D3D11 one
 // (d3d11_compositor.h): a full-screen triangle per eye, the outer view upscaled over the eye's tangents
-// with the focus view blended into the focus box (both resampled by CAS with sharpening on: view_sample),
+// with the focus view blended into the focus box (it resampled by CAS with sharpening on: focus_sample),
 // and the helmet overlay. Its constants, cbuffer b0:
-// kComposeConstants floats, compose_constants filling all but the helmet's (40-59), helmet_constants those.
+// kComposeConstants floats, compose_constants filling all but the helmet's (40-59), helmet_constants those; 60-62 the
+// colour correction (color_grade.h), 63 padding (the D3D11 buffer's 16-byte size; the D3D12 root takes 63 constants, its
+// limit with the descriptor table).
 // Sources: t0 the outer view's texture, t1 the focus view's (the same texture when one image holds both),
 // t2 the helmet's light, t3-t5 its pieces (helmet_pieces.h); s0 a linear clamp sampler.
 #pragma once
@@ -16,7 +18,8 @@
 
 namespace simqvfr {
 
-inline constexpr unsigned kComposeConstants = 60;
+inline constexpr unsigned kComposeConstants = 64;
+inline constexpr unsigned kComposeRootConstants = 63;  // the shader's cbuffer: 63 floats (the D3D12 root's 64 DWORDs)
 
 // EyeComposition `c` for eye `eye` as the shader's cbuffer, but for the helmet's constants (40-59: 0).
 inline void compose_constants(const EyeComposition& c, int eye, float (&constants)[kComposeConstants]) {
@@ -46,6 +49,8 @@ inline void compose_constants(const EyeComposition& c, int eye, float (&constant
         constants[32 + i] = c.borderColor[i];
         constants[36 + i] = c.viewTan[i];
     }
+    for (int i = 0; i < 3; ++i)
+        constants[60 + i] = c.color[i];
 }
 
 // The helmet's constants (40-59) for eye `c`, with the compositor's loaded pieces (`pieceMask`, 1 << HelmetPiece)
@@ -121,7 +126,7 @@ cbuffer Eye : register(b0) {
     // Rows, A eye frame -> B eye frame. rot0.w, rot1.w (as uints): the focus area's corners pulled in, a byte
     // each in percent of the box: top left across and down, top right across and down; bottom right across
     // and up, bottom left across and up (EyeComposition::cornerInset). All 0: the box. rot2.w: the sharpening
-    // (EyeComposition::sharpness; 0 off, view_sample).
+    // (EyeComposition::sharpness; 0 off, cas_peak).
     float4 rot0, rot1, rot2;
     float4 outerSrc, focusSrc;
     float4 params;  // feather, border, corner radius
@@ -134,6 +139,10 @@ cbuffer Eye : register(b0) {
     // Look 2: rows taking a direction in the eye's frame into the images'; w: tangent half extents across and
     // up/down, the visor's slide in image heights.
     float4 helmetRot0, helmetRot1, helmetRot2;
+    // Colour correction (color_grade.h color_grade_constants): x the exposure's scale (0: off), y the brightness's
+    // power, z the contrast's curve exponent in thousandths + 2048 x the saturation's scale in thousandths (a whole
+    // number, exact in a float).
+    float3 grade;
 };
 Texture2D outerTex : register(t0);
 Texture2D focusTex : register(t1);
@@ -155,20 +164,46 @@ float2 inside(float2 uv, float4 src, float2 size) {
     const float2 h = 0.5 / size;
     return clamp(uv, src.xy + h, src.xy + src.zw - h);
 }
+// Colour correction of a linear colour (`grade`; off: as it was), in OpenXR Toolkit's manner but exposure first, as a
+// camera's: the exposure scales the light; brightness is a power curve in display terms (gamma 2.2), so black stays
+// black and white white (an offset would grey an OLED's blacks); contrast is an S-curve of the luminance about mid grey
+// with its ends fixed, the colour following it (no hue shift, no clipping); then the saturation moves the colour from
+// or towards its luminance (Rec. 709). The same for every view, so the focus area matches.
+float3 color_grade(float3 c) {
+    if (grade.x <= 0)
+        return c;
+    const float saturation1000 = floor(grade.z / 2048);
+    const float contrast = (grade.z - saturation1000 * 2048) / 1000.0, saturation = saturation1000 / 1000.0;
+    c = max(c, 0) * grade.x;
+    float3 d = pow(pow(c, 1 / 2.2), grade.y);
+    const float l = saturate(dot(d, float3(0.2126, 0.7152, 0.0722)));
+    const float s = l < 0.5 ? 0.5 * pow(2 * l, contrast) : 1 - 0.5 * pow(2 - 2 * l, contrast);
+    c = pow(max(d + (s - l), 0), 2.2);
+    const float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+    return max(lerp(luma.xxx, c, saturation), 0);
+}
 )"
     R"(// Sharpening: AMD FidelityFX CAS (Contrast Adaptive Sharpening, ffx_cas.h 1.20190610; Copyright (c) 2017-2019 Advanced
-// Micro Devices, Inc., MIT: third_party/fidelityfx-cas/LICENSE.txt) in its scaling form, as the views' resampling filter
-// in place of bilinear, so it costs no pass of its own. Each of the four texels around the point is sharpened against
-// its cross of neighbours by the room its contrast leaves (little at an edge already near full contrast, so no halos),
-// then the four are blended as bilinear blends them, thin edges favoured (by green, as CAS). Each channel is weighted on
-// its own (CAS_SLOW's form; CAS's default reuses green's weights). One to one (the layers' copies) it is CAS's plain
-// sharpening filter. CAS wants linear values in 0..1: the views' sRGB formats read linear. The taps stay inside `src`,
-// as inside() keeps bilinear's. `sharpness` 0..1: CAS's lobe from 0 to its strongest (-1/5; CAS's own sharpness 0 is
-// -1/8, here 0.625).
+// Micro Devices, Inc., MIT: third_party/fidelityfx-cas/LICENSE.txt) in its scaling form, as the focus view's resampling
+// filter in place of bilinear, so it costs no pass of its own. Each of the four texels around the point is sharpened
+// against its cross of neighbours by the room its contrast leaves (little at an edge already near full contrast, so no
+// halos), then the four are blended as bilinear blends them, thin edges favoured (by green, as CAS). Each channel is
+// weighted on its own (CAS_SLOW's form; CAS's default reuses green's weights). One to one (the focus layer) it is CAS's
+// plain sharpening filter. CAS wants linear values in 0..1: the views' sRGB formats read linear. The taps stay inside
+// `src`, as inside() keeps bilinear's.
+// Only the focus view is sharpened: the periphery is upscaled past CAS's scaling limit (4x area) and seen by peripheral
+// vision, where sharpening adds shimmer more than detail; it is one bilinear tap. The focus view's sharpening fades out
+// across the feather with the blend (`fade`, its weight), so its edge blends in sharpness as in colour.
+// rot2.w (`sharpness`) is CAS's own sharpness, as other CAS sharpeners take it: above 0, its lobe from -1/8 to -1/5
+// (ffx_cas.h's -1/lerp(8, 5, sharpness)); 0 off.
+float cas_peak(float sharpness, float fade) {
+    return sharpness > 0 ? -fade / lerp(8.0, 5.0, saturate(sharpness)) : 0;
+}
 float4 cas_load(Texture2D t, int2 p, int4 box) {
     return saturate(t.Load(int3(clamp(p, box.xy, box.zw), 0)));
 }
-float4 cas_sample(Texture2D t, float2 uv, float4 src, float2 size, float sharpness) {
+// CAS's scaling filter at `uv`, its lobe `peak` (cas_peak).
+float4 cas_sample(Texture2D t, float2 uv, float4 src, float2 size, float peak) {
     const int4 box = int4(int2(floor(src.xy * size + 0.5)), int2(floor((src.xy + src.zw) * size + 0.5)) - 1);
     float2 pp = uv * size - 0.5;
     const float2 fp = floor(pp);
@@ -191,7 +226,6 @@ float4 cas_sample(Texture2D t, float2 uv, float4 src, float2 size, float sharpne
     const float3 mnj = min(min(min(f, i), min(j, k)), n), mxj = max(max(max(f, i), max(j, k)), n);
     const float3 mnk = min(min(min(g, j), min(k, l)), o), mxk = max(max(max(g, j), max(k, l)), o);
     // The room to the signal's limits over the largest, shaped: each texel's neighbours' (negative) weight.
-    const float peak = -0.2 * sharpness;
     const float3 wf = peak * sqrt(saturate(min(mnf, 1 - mxf) / max(mxf, 1e-5)));
     const float3 wg = peak * sqrt(saturate(min(mng, 1 - mxg) / max(mxg, 1e-5)));
     const float3 wj = peak * sqrt(saturate(min(mnj, 1 - mxj) / max(mxj, 1e-5)));
@@ -208,12 +242,16 @@ float4 cas_sample(Texture2D t, float2 uv, float4 src, float2 size, float sharpne
     const float alpha = lerp(lerp(f4.a, g4.a, pp.x), lerp(j4.a, k4.a, pp.x), pp.y);
     return float4(saturate(sum / weight), alpha);
 }
-// A view's colour at `uv` (inside its region `src` of a texture `size` texels): CAS with sharpening on (rot2.w), else
-// one bilinear tap.
-float4 view_sample(Texture2D t, float2 uv, float4 src, float2 size) {
-    if (rot2.w > 0)
-        return cas_sample(t, uv, src, size, rot2.w);
+// A view's colour at `uv` (inside its region `src` of a texture `size` texels): one bilinear tap (the periphery).
+float4 bilinear(Texture2D t, float2 uv, float4 src, float2 size) {
     return t.SampleLevel(linearClamp, inside(uv, src, size), 0);
+}
+// The focus view's colour at `uv`: CAS with sharpening on (rot2.w) and `fade` (its feather weight) above 0, else one
+// bilinear tap.
+float4 focus_sample(Texture2D t, float2 uv, float4 src, float2 size, float fade) {
+    if (rot2.w > 0 && fade > 0)
+        return cas_sample(t, uv, src, size, cas_peak(rot2.w, fade));
+    return bilinear(t, uv, src, size);
 }
 // A supersampled view (several texels per display pixel) averaged over one display pixel's footprint at `uv`: four
 // bilinear taps a quarter of the footprint's axes `dx`, `dy` (texture coordinates) in from its centre.
@@ -223,27 +261,30 @@ float4 footprint(Texture2D t, float2 uv, float2 dx, float2 dy, float4 src, float
                    t.SampleLevel(linearClamp, inside(uv - 0.25 * (dx - dy), src, size), 0) +
                    t.SampleLevel(linearClamp, inside(uv - 0.25 * (dx + dy), src, size), 0));
 }
-// CAS's plain filter (no scaling) on a centre `e` and its cross b (up), d (left), f (right), h (down), linear 0..1.
-float3 cas_cross(float3 e, float3 b, float3 d, float3 f, float3 h, float sharpness) {
+// CAS's plain filter (no scaling) on a centre `e` and its cross b (up), d (left), f (right), h (down), linear 0..1, its
+// lobe `peak` (cas_peak).
+float3 cas_cross(float3 e, float3 b, float3 d, float3 f, float3 h, float peak) {
     e = saturate(e);
     b = saturate(b);
     d = saturate(d);
     f = saturate(f);
     h = saturate(h);
     const float3 mn = min(min(min(b, d), min(e, f)), h), mx = max(max(max(b, d), max(e, f)), h);
-    const float3 w = -0.2 * sharpness * sqrt(saturate(min(mn, 1 - mx) / max(mx, 1e-5)));
+    const float3 w = peak * sqrt(saturate(min(mn, 1 - mx) / max(mx, 1e-5)));
     return saturate((e + w * (b + d + f + h)) / (1 + 4 * w));
 }
-// A supersampled view sharpened at the display's pixel scale: the footprint's average at `uv`, sharpened (rot2.w)
-// against the averages one display pixel up, left, right and down. CAS on the view's own texels would act on detail
-// finer than a display pixel, which the average then takes out again (at 200% density, 40% of the change was left).
-float4 footprint_sharpened(Texture2D t, float2 uv, float2 dx, float2 dy, float4 src, float2 size, out float4 e) {
+// A supersampled focus view sharpened at the display's pixel scale: the footprint's average at `uv`, sharpened (rot2.w,
+// faded by `fade` as focus_sample) against the averages one display pixel up, left, right and down. CAS on the view's
+// own texels would act on detail finer than a display pixel, which the average then takes out again (at 200% density,
+// 40% of the change was left).
+float4 footprint_sharpened(Texture2D t, float2 uv, float2 dx, float2 dy, float4 src, float2 size, float fade,
+                           out float4 e) {
     e = footprint(t, uv, dx, dy, src, size);
-    if (rot2.w <= 0)
+    if (rot2.w <= 0 || fade <= 0)
         return e;
     const float3 b = footprint(t, uv - dy, dx, dy, src, size).rgb, h = footprint(t, uv + dy, dx, dy, src, size).rgb;
     const float3 d = footprint(t, uv - dx, dx, dy, src, size).rgb, f = footprint(t, uv + dx, dx, dy, src, size).rgb;
-    return float4(cas_cross(e.rgb, b, d, f, h, rot2.w), e.a);
+    return float4(cas_cross(e.rgb, b, d, f, h, cas_peak(rot2.w, fade)), e.a);
 }
 // How far inside the quadrilateral of the pulled-in corners a point is, measured as the square box is
 // (in shares of each axis, so the corners all left in place give the box). Its edges never cross (each
@@ -356,9 +397,6 @@ float3 helmet_apply(float3 scene, float2 a, float2 p) {
                          ? float2((a.x - outerTan.x) / (outerTan.y - outerTan.x), (outerTan.z - a.y) / (outerTan.z - outerTan.w))
                          : v.uv;
     const bool rendered = all(o >= 0) && all(o <= 1);
-    float4 color = float4(0, 0, 0, 1);
-    if (rendered)
-        color = view_sample(outerTex, outerSrc.xy + o * outerSrc.zw, outerSrc, outerSize);
     const float3 b = float3(dot(rot0.xyz, a), dot(rot1.xyz, a), dot(rot2.xyz, a));
     const float2 t = b.xy / max(-b.z, 1e-6);
     const float2 f = float2((t.x - focusTan.x) / (focusTan.y - focusTan.x), (focusTan.z - t.y) / (focusTan.z - focusTan.w));
@@ -366,9 +404,18 @@ float3 helmet_apply(float3 scene, float2 a, float2 p) {
     const float2 uv = focusSrc.xy + f * focusSrc.zw;
     const float2 dx = ddx(uv), dy = ddy(uv);
     const float e = b.z < 0 && all(f >= 0) && all(f <= 1) ? inside_box(f) : -1;
+    float w = 0;  // the focus view's blend weight
     if (e >= 0) {
-        float w = saturate(e / max(params.x, 1e-4));
+        w = saturate(e / max(params.x, 1e-4));
         w = w * w * (3 - 2 * w);
+    }
+    // The outer view (not where the focus view covers it whole).
+    float4 color = float4(0, 0, 0, 1);
+    if (rendered && w < 1) {
+        color = bilinear(outerTex, outerSrc.xy + o * outerSrc.zw, outerSrc, outerSize);
+        color.rgb = color_grade(color.rgb);  // colour correction: each view where it was rendered, then blended
+    }
+    if (e >= 0) {
         // A supersampled focus view has several texels per output pixel: average four taps spread over the
         // pixel's footprint instead of sampling it once (which would alias), sharpened at the output's pixel scale.
         float2 size;
@@ -376,14 +423,15 @@ float3 helmet_apply(float3 scene, float2 a, float2 p) {
         float4 focus;
         if (max(length(dx * size), length(dy * size)) > 1.25) {
             float4 average;
-            focus = footprint_sharpened(focusTex, uv, dx, dy, focusSrc, size, average);
+            focus = footprint_sharpened(focusTex, uv, dx, dy, focusSrc, size, w, average);
         } else {
-            focus = view_sample(focusTex, uv, focusSrc, size);
+            focus = focus_sample(focusTex, uv, focusSrc, size, w);
         }
+        focus.rgb = color_grade(focus.rgb);
         color = lerp(color, focus, w);
-        if (e < params.y)
-            color = borderColor;
     }
+    if (e >= 0 && e < params.y)
+        color = borderColor;
     if (helmet.w > 0)
         color.rgb = helmet_apply(color.rgb, a.xy, v.uv);
     return color;
@@ -427,21 +475,24 @@ float4 FocusLayerPS(V v) : SV_Target {
     if (rot2.w > 0 && viewTan.z > 1.25) {
         float4 average;
         const float4 sharpened = footprint_sharpened(focusTex, uv, float2(viewTan.z / size.x, 0),
-                                                     float2(0, viewTan.z / size.y), focusSrc, size, average);
-        color = focusTex.SampleLevel(linearClamp, inside(uv, focusSrc, size), 0);
+                                                     float2(0, viewTan.z / size.y), focusSrc, size, w, average);
+        color = bilinear(focusTex, uv, focusSrc, size);
         color.rgb = saturate(color.rgb + sharpened.rgb - average.rgb);
     } else {
-        color = view_sample(focusTex, uv, focusSrc, size);
+        color = focus_sample(focusTex, uv, focusSrc, size, w);
     }
+    color.rgb = color_grade(color.rgb);  // only with the periphery graded too (the layer zeroes it otherwise)
     if (viewTan.x > 0.5) {
         // Where this texel lies in the outer view.
         const float2 t = a.xy / max(-a.z, 1e-6);
         const float2 o = float2((t.x - outerTan.x) / (outerTan.y - outerTan.x), (outerTan.z - t.y) / (outerTan.z - outerTan.w));
         float2 outerSize;
         outerTex.GetDimensions(outerSize.x, outerSize.y);
-        float4 outer = view_sample(outerTex, outerSrc.xy + saturate(o) * outerSrc.zw, outerSrc, outerSize);
+        float4 outer = bilinear(outerTex, outerSrc.xy + saturate(o) * outerSrc.zw, outerSrc, outerSize);
         if (region && (any(o < 0) || any(o > 1)))
-            outer = float4(0, 0, 0, 1);
+            outer = float4(0, 0, 0, 1);  // black past what the eye rendered, as the pad's clear: never graded
+        else
+            outer.rgb = color_grade(outer.rgb);  // as GradePS grades the periphery's copy
         color = lerp(outer, color, w);
         if (e >= viewTan.y && e < viewTan.y + params.y)
             color = borderColor;
@@ -453,13 +504,13 @@ float4 FocusLayerPS(V v) : SV_Target {
     }
     return float4(color.rgb * w, w);
 }
-// A view copied texel for texel into an image of its own, sharpened (view_sample): with sharpening on, the periphery of
-// focus_layer and native quad views, which otherwise goes to the runtime as the game rendered it. focusSrc is the view's
-// region of t1, the target's viewport its size.
-float4 ViewCopyPS(V v) : SV_Target {
-    float2 size;
-    focusTex.GetDimensions(size.x, size.y);
-    return view_sample(focusTex, focusSrc.xy + v.uv * focusSrc.zw, focusSrc, size);
+// The periphery's copy graded (native quad views with colour correction: the runtime shows the game's eyes as they are
+// otherwise): texel for texel from outerTex, outerSrc.xy the source's texel at the viewport's origin outerSrc.zw.
+float4 GradePS(V v) : SV_Target {
+    const int2 p = int2(v.position.xy - outerSrc.zw) + int2(outerSrc.xy);
+    float4 c = outerTex.Load(int3(p, 0));
+    c.rgb = color_grade(c.rgb);
+    return c;
 }
 )"
     R"(// The helmet as its own layer: the quad spans tangents +-outerTan.xy of the images' plane, the images

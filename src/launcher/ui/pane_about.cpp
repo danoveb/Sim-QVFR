@@ -1,4 +1,5 @@
-// The About pane: the version, Ko-fi, the update check and the disclaimer.
+// The About pane: the version, Ko-fi, the language, the update check and the disclaimer. NVIDIA's and AMD's
+// attributions stay in English: their licences' wording.
 #include <string>
 #include <vector>
 
@@ -18,21 +19,23 @@ float about_pane(float x, float y, float w, bool draw) {
     const float lh = t::kBody.lineHeight;
     if (draw) {
         app.canvas.text(L"Sim-QVFR Launcher", t::kTitle1, {x, y, w, t::kTitle1.lineHeight}, col(app.c->label));
-        app.canvas.text(L"Starts " + game_name() + L" with foveated rendering enabled.", t::kBody,
+        const std::wstring starts = trf(L"Starts {game} with foveated rendering enabled.", {{L"game", game_name()}});
+        app.canvas.text(starts, t::kBody,
                         {x, y + t::kTitle1.lineHeight + 8, w, lh}, col(app.c->label_secondary));
         // A packaged build has its release's version; a development build ("dev") names the release it is headed for.
         const std::wstring version = known_version(widen(SIM_QVFR_VERSION))
                                          ? widen(SIM_QVFR_VERSION)
-                                         : widen(SIM_QVFR_RELEASE) + L" · development build";
-        app.canvas.text(L"Version " + version, t::kBody, {x, y + t::kTitle1.lineHeight + 8 + lh + 4, w, lh},
+                                         : trf(L"{version} · development build", {{L"version", widen(SIM_QVFR_RELEASE)}});
+        const std::wstring versionLine = trf(L"Version {version}", {{L"version", version}});
+        app.canvas.text(versionLine, t::kBody, {x, y + t::kTitle1.lineHeight + 8 + lh + 4, w, lh},
                         col(app.c->label_secondary));
         reader_text({x, y, w, t::kTitle1.lineHeight}, L"Sim-QVFR Launcher", 2);
         reader_text({x, y + t::kTitle1.lineHeight + 8, w, 2 * lh + 4},
-                    L"Starts " + game_name() + L" with foveated rendering enabled. Version " + version + L".");
+                    starts + L" " + versionLine);
     }
     h += t::kTitle1.lineHeight + 8 + lh + 4 + lh;
     // Support, before Updates so a short window still shows it: a line and a button that opens the Ko-fi page.
-    const std::wstring support = L"If Sim-QVFR improves your races, you can support its development on Ko-fi.";
+    const std::wstring support = tr(L"If Sim-QVFR improves your races, you can support its development on Ko-fi.");
     const float sh = app.canvas.measure_height(support, t::kCallout, w);
     if (draw) {
         reader_text({x, y + h + t::kSpace6, w, sh}, support);
@@ -40,52 +43,78 @@ float about_pane(float x, float y, float w, bool draw) {
                         Align::Leading, false, true);
     }
     h += t::kSpace6 + sh + t::kSpace2;
-    const float bw = button_width(L"Support on Ko-fi") + 24;
+    const std::wstring supportLabel = tr(L"Support on Ko-fi");
+    const float bw = button_width(supportLabel) + 24;
     if (draw)
-        button(kSupport, {x, y + h, bw, t::kControlHeight}, L"Support on Ko-fi", Btn::Support, kIconHeart);
+        button(kSupport, {x, y + h, bw, t::kControlHeight}, supportLabel, Btn::Support, kIconHeart);
     h += t::kControlHeight + t::kSpace6;
+    // Language (lang.h): Windows' language, English, or a lang\ file; it applies at once.
+    {
+        std::vector<std::wstring> names;
+        const int selected = language_items(names);
+        Row language;
+        language.label = tr(L"Launcher language");
+        language.desc = tr(L"The launcher’s and the headset menu’s text; it changes in a running game too. "
+                           L"Translations are files in the lang folder; a line not translated yet shows in English.");
+        language.controlW = popup_width(names.data(), static_cast<int>(names.size()), 160);
+        language.controlH = t::kControlHeight;
+        const std::wstring value = names[static_cast<size_t>(selected)];
+        language.control = [value](const Rect& r) { popup_button(kLanguage, r, value, false); };
+        h += section(x, y + h, w, tr(L"Language"), {language}, L"", draw) + t::kSpace6;
+    }
     // Updates (update_check.h): the start-up switch, then where the last check stands with Check now and Download.
     Row autoCheck;
-    const std::wstring autoDesc = L"Asks GitHub for the newest Sim-QVFR release when the launcher starts. Nothing else "
-                                  L"is sent, and nothing downloads by itself.";
+    const std::wstring autoDesc = tr(L"Asks GitHub for the newest Sim-QVFR release when the launcher starts. Nothing else "
+                                     L"is sent, and nothing downloads by itself.");
     autoCheck.fullHeight = [autoDesc](float width) { return checkbox_height(autoDesc, width); };
     autoCheck.full = [autoDesc](const Rect& r) {
-        checkbox(kUpdateCheck, r, app.s.updateCheck, L"Check for updates when the launcher starts", autoDesc);
+        checkbox(kUpdateCheck, r, app.s.updateCheck, tr(L"Check for updates when the launcher starts"), autoDesc);
     };
     Row status;
     const std::wstring mine = widen(SIM_QVFR_VERSION);
     switch (app.update) {
-    case Update::Off: status.label = L"Not checked"; break;
-    case Update::Checking: status.label = L"Checking…"; break;
-    case Update::UpToDate: status.label = L"Up to date"; status.desc = L"The newest release is " + app.release.tag + L"."; break;
+    case Update::Off: status.label = tr(L"Not checked"); break;
+    case Update::Checking: status.label = tr(L"Checking…"); break;
+    case Update::UpToDate:
+        status.label = tr(L"Up to date");
+        status.desc = trf(L"The newest release is {version}.", {{L"version", app.release.tag}});
+        break;
     case Update::Available:
-        status.label = app.release.tag + L" is available";
-        status.desc = L"You have " + mine + L".";
+        status.label = trf(L"{version} is available", {{L"version", app.release.tag}});
+        status.desc = trf(L"You have {version}.", {{L"version", mine}});
         if (app.installing)
             status.desc = app.installProgress.step + L"… " + std::to_wstring(static_cast<int>(app.installProgress.share * 100)) + L"%";
         else if (!app.installError.empty())
-            status.desc = L"The install stopped: " + app.installError + L". Nothing was changed.";
+            status.desc = trf(L"The install stopped: {error}. Nothing was changed.", {{L"error", app.installError}});
         else if (!installable())
-            status.desc += L" Download it by hand: this copy can’t install it itself (a development build, or the release "
-                           L"has no checked zip).";
+            status.desc += L" " + std::wstring(tr(L"Download it by hand: this copy can’t install it itself (a development "
+                                                  L"build, or the release has no checked zip)."));
+        break;
+    case Update::Skipped:
+        status.label = trf(L"{version} skipped", {{L"version", app.release.tag}});
+        status.desc = trf(L"You have {version}. You chose not to install this one; a newer release is offered again.",
+                          {{L"version", mine}});
         break;
     case Update::Dev:
-        status.label = L"Newest release: " + app.release.tag;
-        status.desc = L"This is a development build (" + mine + L").";
+        status.label = trf(L"Newest release: {version}", {{L"version", app.release.tag}});
+        status.desc = trf(L"This is a development build ({version}).", {{L"version", mine}});
         break;
-    case Update::Failed: status.label = L"Couldn’t check"; status.desc = app.updateError + L"."; break;
+    case Update::Failed: status.label = tr(L"Couldn’t check"); status.desc = app.updateError + L"."; break;
     }
     // The buttons in a row of their own under it (the status's text keeps the row's width): Install (primary) where
-    // this copy can install the release, Download (its page; the primary without Install), Check now. None while
-    // installing.
+    // this copy can install the release, Download (its page; the primary without Install), Skip this version or Don't
+    // skip ([launcher] update_skip), Check now. None while installing.
     std::vector<Row> updateRows = {autoCheck, status};
     if (!app.installing) {
         const bool install = installable();
-        const bool download = (app.update == Update::Available || app.update == Update::Dev) && !app.release.url.empty();
-        const std::wstring installLabel = app.installError.empty() ? L"Install " + app.release.tag : L"Try again";
+        const bool download = (app.update == Update::Available || app.update == Update::Skipped || app.update == Update::Dev) &&
+                              trusted_release_page(app.release.url);
+        const Update update = app.update;
+        const std::wstring installLabel = app.installError.empty() ? trf(L"Install {version}", {{L"version", app.release.tag}})
+                                                                   : std::wstring(tr(L"Try again"));
         Row actions;
         actions.fullHeight = [](float) { return t::kControlHeight; };
-        actions.full = [install, download, installLabel](const Rect& r) {
+        actions.full = [install, download, installLabel, update](const Rect& r) {
             float bx = r.x;
             const auto add = [&bx, &r](Ctl id, const std::wstring& label, bool primary) {
                 const float bw = button_width(label);
@@ -95,25 +124,55 @@ float about_pane(float x, float y, float w, bool draw) {
             if (install)
                 add(kUpdateInstall, installLabel, true);
             if (download)
-                add(kUpdateDownload, L"Download", !install);
-            add(kUpdateNow, L"Check now", false);
+                add(kUpdateDownload, tr(L"Download"), !install);
+            if (update == Update::Available)
+                add(kUpdateSkip, tr(L"Skip this version"), false);
+            else if (update == Update::Skipped)
+                add(kUpdateUnskip, tr(L"Don’t skip"), false);
+            add(kUpdateNow, tr(L"Check now"), false);
         };
         updateRows.push_back(actions);
     }
-    h += section(x, y + h, w, L"Updates", updateRows,
-                 L"Install keeps your settings, profiles and changed files; Download opens the release’s page.",
-                 draw);
+    // Go back (install.h's restore_backup): the version the last install replaced, while its backup is there. After
+    // going back the newer one is the backup, so the same row returns to it.
+    if (app.backup) {
+        const std::wstring other = app.backup->version;
+        const bool newer = compare_versions(other, mine) > 0;
+        Row previous;
+        previous.label = newer ? trf(L"You went back from {version}", {{L"version", other}})
+                               : trf(L"Previous version: {version}", {{L"version", other}});
+        previous.desc = newer ? tr(L"It is kept in the update folder, if you want it again.")
+                              : tr(L"Kept from the last update. If this version doesn’t work well for you, go back to it.");
+        if (app.restoring)
+            previous.desc = app.installProgress.step + L"… " + std::to_wstring(static_cast<int>(app.installProgress.share * 100)) + L"%";
+        else if (!app.restoreError.empty())
+            previous.desc = trf(L"Going back stopped: {error}. Nothing was changed.", {{L"error", app.restoreError}});
+        updateRows.push_back(previous);
+        if (!app.installing) {
+            const std::wstring label = newer ? trf(L"Return to {version}", {{L"version", other}})
+                                             : trf(L"Go back to {version}", {{L"version", other}});
+            Row action;
+            action.fullHeight = [](float) { return t::kControlHeight; };
+            action.full = [label](const Rect& r) {
+                button(kUpdateRollback, {r.x, r.y, button_width(label), t::kControlHeight}, label, false);
+            };
+            updateRows.push_back(action);
+        }
+    }
+    h += section(x, y + h, w, tr(L"Updates"), updateRows,
+                 tr(L"Install keeps your settings, profiles and changed files; Download opens the release’s page."), draw);
     // The same notice as the README's: unofficial, at the user's own risk.
     const std::wstring notice =
-        L"Sim-QVFR is not made, approved or sanctioned by Kunos Simulazioni or the developers of the games it "
-        L"supports. It hooks the game's code and changes how it renders, so a game update can break it, and "
-        L"it can crash the game. Use it in offline sessions only, and please don't report problems you see "
-        L"while using it to the game's developers.";
+        tr(L"Sim-QVFR is not made, approved or sanctioned by Kunos Simulazioni or the developers of the games it "
+           L"supports. It hooks the game's code and changes how it renders, so a game update can break it, and "
+           L"it can crash the game. Use it in offline sessions only, and please don't report problems you see "
+           L"while using it to the game's developers.");
+    const std::wstring warning = tr(L"Experimental and unofficial. Use at your own risk.");
     const float nh = app.canvas.measure_height(notice, t::kCallout, w);
     if (draw) {
-        app.canvas.text(L"Experimental and unofficial. Use at your own risk.", t::kHeadline,
+        app.canvas.text(warning, t::kHeadline,
                         {x, y + h + t::kSpace6, w, 16}, col(app.c->label));
-        reader_text({x, y + h + t::kSpace6, w, 16 + t::kSpace2 + nh}, L"Experimental and unofficial. Use at your own risk. " + notice);
+        reader_text({x, y + h + t::kSpace6, w, 16 + t::kSpace2 + nh}, warning + L" " + notice);
         app.canvas.text(notice, t::kCallout, {x, y + h + t::kSpace6 + 16 + t::kSpace2, w, nh + 2},
                         col(app.c->label_secondary), Align::Leading, false, true);
     }
@@ -135,6 +194,23 @@ float about_pane(float x, float y, float w, bool draw) {
                         col(app.c->label_secondary), Align::Leading, false, true);
     }
     h += t::kSpace6 + 16 + t::kSpace2 + vh;
+#endif
+#ifdef SIM_QVFR_FFX
+    // AMD's FSR SDK licence: redistributions reproduce AMD's notices (licenses\AMD-FidelityFX-SDK-LICENSE.md, beside
+    // AMD's signed DLLs in layer\). AMD's names stand on their own, as NVIDIA's do.
+    const std::wstring amd =
+        L"In Le Mans Ultimate on a PC without an NVIDIA RTX graphics card, Sim-QVFR uses AMD FSR (experimental) through "
+        L"the AMD FSR SDK and includes AMD’s amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll, under "
+        L"AMD’s licence (licenses\\AMD-FidelityFX-SDK-LICENSE.md). AMD, FSR and FidelityFX are trademarks of Advanced Micro "
+        L"Devices, Inc. Sim-QVFR is not sponsored or endorsed by AMD.";
+    const float ah = app.canvas.measure_height(amd, t::kCallout, w);
+    if (draw) {
+        app.canvas.text(L"AMD FSR", t::kHeadline, {x, y + h + t::kSpace6, w, 16}, col(app.c->label));
+        reader_text({x, y + h + t::kSpace6, w, 16 + t::kSpace2 + ah}, L"AMD FSR. " + amd);
+        app.canvas.text(amd, t::kCallout, {x, y + h + t::kSpace6 + 16 + t::kSpace2, w, ah + 2},
+                        col(app.c->label_secondary), Align::Leading, false, true);
+    }
+    h += t::kSpace6 + 16 + t::kSpace2 + ah;
 #endif
     return h;
 }

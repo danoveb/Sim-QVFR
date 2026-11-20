@@ -14,11 +14,13 @@
 #include "cheeky/cheeky_settings.h"
 #include "engine/dlss_views.h"
 #include "input/hotkeys.h"
+#include "lang.h"
 #include "log.h"
 #include "probe/cpu_load.h"
 #include "probe/d3d11_compose_timer.h"
 #include "probe/gpu_frame_timer.h"
 #include "probe/gpu_load.h"
+#include "probe/hang_watch.h"
 #include "quad/helmet.h"
 #include "quad/menu_panel.h"
 #include "quad/osd.h"
@@ -59,6 +61,30 @@ void osd_waited(XrDuration period) { osd.periodNs.store(period, std::memory_orde
 
 bool frame_generation_on() { return cheeky_running() && osd.cheeky.processing && osd.cheeky.fg; }
 
+int64_t menu_hide_ms() { return osd.placement.enabled ? kMenuHideOverlayMs : kMenuHideMs; }
+
+void menu_frame_line() {
+    bool bad = false;
+    OsdSummary s;
+    std::wstring line;
+    if (osd_shown(s)) {
+        line = osd_menu_line(s, bad);
+    } else if (!osd.placement.enabled) {  // on, its first numbers not in yet: nothing
+        const Hotkey& h = hotkeys[static_cast<int>(HotkeyAction::Overlay)];
+        const std::wstring pad = h.pad.set() ? lang::trf(L"wheel {button}", {{L"button", control_text(h.pad.control)}})
+                                             : std::wstring();
+        const std::wstring key = h.key.set() ? key_text(h.key) : pad;
+        // The headset menu's line beside its title, in the player's language (lang.h).
+        line = key.empty() ? std::wstring(lang::tr(L"Turn the overlay on for frame times"))
+                           : lang::trf(L"Overlay off: {key} for frame times", {{L"key", key}});
+    }
+    if (line != menu.model.frameLine || bad != menu.model.frameBad) {
+        menu.model.frameLine = line;
+        menu.model.frameBad = bad;
+        menu.dirty = true;
+    }
+}
+
 bool osd_shown(OsdSummary& out) {
     if (!osd.placement.enabled || !osd.shownValid)
         return false;
@@ -77,9 +103,15 @@ void osd_wait_returned(double waitMs) {
     osd.waitMs = waitMs;
 }
 
-void osd_measure() {
+void osd_measure(XrTime displayTime) {
     if (!osd.placement.enabled && !optimize.optimizer.running())
         return;
+    // The refreshes since the previous frame, from the display times the runtime gave (the period: the steady one,
+    // pacing_waited). Not with two loops: their two frames share a display time, at half the period.
+    const XrTime lastDisplay = std::exchange(osd.lastDisplay, displayTime);
+    const int refreshes = experiment.twoLoops ? 0
+                                              : osd_refreshes_between(lastDisplay, displayTime,
+                                                                      osd.periodNs.load(std::memory_order_relaxed));
     const int64_t now = qpc_now();
     const DWORD thread = GetCurrentThreadId();
     ULONG64 cycles = 0;
@@ -94,6 +126,12 @@ void osd_measure() {
     if (osd.lastEnd) {
         OsdFrame frame;
         frame.intervalMs = static_cast<double>(now - osd.lastEnd) * 1000.0 / static_cast<double>(qpc_ms(1000));
+        frame.refreshes = refreshes;
+        // A setting changed since the last frame (the session record's stints count them, live_ini.cpp): marked.
+        static uint32_t seenGeneration = stintGeneration.load(std::memory_order_relaxed);
+        const uint32_t generation = stintGeneration.load(std::memory_order_relaxed);
+        frame.changed = generation != seenGeneration;
+        seenGeneration = generation;
         if (thread == osd.waitThread && osd.waitReturnQpc > osd.lastEnd && osd.cyclesPerMs > 0) {
             // The render thread's work for the frame: from xrWaitFrame's return, its wall time and what of it ran.
             frame.workMs = static_cast<double>(now - osd.waitReturnQpc) * 1000.0 / static_cast<double>(qpc_ms(1000));
@@ -104,7 +142,7 @@ void osd_measure() {
         }
         if (osd.placement.enabled) {
             osd.frames.push_back(frame);
-            osd.history.push_back(frame.intervalMs);
+            osd.history.push_back(frame);
             if (osd.history.size() > kOsdHistory)
                 osd.history.pop_front();
         }
@@ -143,6 +181,7 @@ void osd_placement_changed(const OsdPlacement& placement, const CheekySettings& 
         osd.frames.clear();
         osd.history.clear();
         osd.lastEnd = 0;
+        osd.lastDisplay = 0;
         osd.nextDraw = 0;
     }
     osd.placement = placement;
@@ -196,7 +235,7 @@ void osd_hotkey() {
 }
 
 bool osd_resources(XrSession session) {
-    if (!game->has_qvfr())  // log only: nothing of ours in the headset
+    if (!game->has_qvfr() && !game->shows_overlay())  // log only: nothing of ours in the headset
         return false;
     if (osd.chain)
         return true;
@@ -230,7 +269,7 @@ bool osd_resources(XrSession session) {
         return false;
     }
     XrCompositionLayerQuad& l = osd.layer;
-    l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied pixels (panel_rgba)
     l.space = osd.view;
     l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     l.subImage.swapchain = osd.chain;
@@ -366,6 +405,7 @@ OsdInput osd_input(int64_t now) {
         const unsigned long long total = dlss_evaluations_total();
         in.dlss = total != seen;
         seen = total;
+        in.upscaler = dlss_upscaler_badge();  // DLSS, or AMD FSR's version where it runs instead
     }
     return in;
 }
@@ -389,11 +429,9 @@ const XrCompositionLayerBaseHeader* notice_frame(XrSession session, int64_t now)
         osd_place();
         const std::vector<uint32_t> pixels = draw_notice_panel(notice.title, notice.lines);  // once: a few ms
         uint32_t index = 0;
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wait.timeout = 100'000'000;
-        if (XR_SUCCEEDED(next.AcquireSwapchainImage(osd.chain, nullptr, &index))) {
-            notice.uploaded = XR_SUCCEEDED(next.WaitSwapchainImage(osd.chain, &wait)) && index < osd.images.size() &&
-                              osd.upload && osd.upload->upload(osd.images[index], pixels);
+        // A timed-out wait: the image stays acquired (not released), waited on again at the next frame.
+        if (acquire_wait(osd.chain, osd.pending, kImageWaitNs, 1, index) == XR_SUCCESS) {
+            notice.uploaded = index < osd.images.size() && osd.upload && osd.upload->upload(osd.images[index], pixels);
             next.ReleaseSwapchainImage(osd.chain, nullptr);
         }
         if (notice.uploaded)
@@ -418,10 +456,12 @@ const XrCompositionLayerBaseHeader* osd_frame(XrSession session, int64_t now) {
         OsdInput in = osd_input(now);
         osd.shown = osd_summary(in);  // also for the log
         osd.shownValid = true;
+        if (menu.visible)
+            menu_frame_line();
         SYSTEMTIME local{};
         GetLocalTime(&local);  // the card's clock (redrawn every kOsdDrawMs: the minute turns over in time)
         osd.drawing = std::async(std::launch::async, [in = std::move(in), summary = osd.shown,
-                                                      history = std::vector<double>(osd.history.begin(), osd.history.end()),
+                                                      history = std::vector<OsdFrame>(osd.history.begin(), osd.history.end()),
                                                       clock = osd_clock(local.wHour, local.wMinute)] {
             return draw_osd_panel(summary, history, osd_tiles(in, summary), osd_rows(in, summary), osd_badge(in), clock);
         });
@@ -429,14 +469,19 @@ const XrCompositionLayerBaseHeader* osd_frame(XrSession session, int64_t now) {
     if (osd.drawing.valid() && osd.drawing.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         const std::vector<uint32_t> pixels = osd.drawing.get();
         uint32_t index = 0;
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wait.timeout = 100'000'000;
-        if (XR_SUCCEEDED(next.AcquireSwapchainImage(osd.chain, nullptr, &index))) {
-            const bool ok = XR_SUCCEEDED(next.WaitSwapchainImage(osd.chain, &wait)) && index < osd.images.size() &&
-                            osd.upload && osd.upload->upload(osd.images[index], pixels);
+        hang_watch_stage("overlay card: xrAcquireSwapchainImage");
+        // A timed-out wait: the image stays acquired (not released), waited on again at the card's next upload; this
+        // drawing is dropped (the next one comes kOsdDrawMs later).
+        if (acquire_wait(osd.chain, osd.pending, kImageWaitNs, 1, index, "overlay card: xrWaitSwapchainImage") ==
+            XR_SUCCESS) {
+            bool ok = index < osd.images.size() && osd.upload;
+            hang_watch_stage("overlay card: the upload");
+            ok = ok && osd.upload->upload(osd.images[index], pixels);
+            hang_watch_stage("overlay card: xrReleaseSwapchainImage");
             next.ReleaseSwapchainImage(osd.chain, nullptr);
             osd.uploaded = osd.uploaded || ok;
         }
+        hang_watch_stage("overlay card: done");
     }
     return osd.uploaded ? reinterpret_cast<const XrCompositionLayerBaseHeader*>(&osd.layer) : nullptr;
 }
@@ -456,10 +501,136 @@ void osd_shutdown() {
     osd.view = XR_NULL_HANDLE;
     osd.adapter = nullptr;
     osd.images.clear();
+    osd.pending = {};
     osd.uploaded = osd.failed = false;
     osd.frames.clear();
     osd.history.clear();
     osd.lastEnd = 0;
+    osd.lastDisplay = 0;
+}
+
+// ---- Clock ---------------------------------------------------------------------------------------
+
+namespace {
+
+void clock_place() {
+    const ClockPlacement& p = clockCard.placement;
+    const MenuPose pose = menu_pose({p.yaw, p.pitch, p.width}, static_cast<float>(kClockHeight) / kClockWidth);
+    clockCard.layer.pose.position = {pose.position[0], pose.position[1], pose.position[2]};
+    clockCard.layer.pose.orientation = {pose.orientation[0], pose.orientation[1], pose.orientation[2], pose.orientation[3]};
+    clockCard.layer.size = {pose.width, pose.height};
+}
+
+bool clock_resources(XrSession session) {
+    if (!game->has_qvfr() && !game->shows_overlay())  // as the overlay's card: nothing of ours in the headset
+        return false;
+    if (clockCard.chain)
+        return true;
+    if (clockCard.failed)
+        return false;
+    const SessionGraphics graphics = session_graphics_now();
+    if (!graphics.valid())
+        return false;
+    XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    spaceInfo.poseInReferenceSpace.orientation.w = 1;
+    XrSwapchainCreateInfo chainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    chainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    chainInfo.format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    chainInfo.sampleCount = 1;
+    chainInfo.width = kClockWidth;
+    chainInfo.height = kClockHeight;
+    chainInfo.faceCount = 1;
+    chainInfo.arraySize = 1;
+    chainInfo.mipCount = 1;
+    XrResult r = next.CreateReferenceSpace(session, &spaceInfo, &clockCard.view);
+    if (XR_SUCCEEDED(r))
+        r = next.CreateSwapchain(session, &chainInfo, &clockCard.chain);
+    if (XR_SUCCEEDED(r))
+        r = swapchain_textures(graphics, next.EnumerateSwapchainImages, clockCard.chain, clockCard.images);
+    if (XR_SUCCEEDED(r) && !clockCard.images.empty())
+        clockCard.upload = make_panel_upload(graphics, kClockWidth, kClockHeight);
+    if (XR_FAILED(r) || clockCard.images.empty() || !clockCard.upload) {
+        logf("clock: card setup failed (%d, %s)", r, graphics.name());
+        clockCard.failed = true;
+        return false;
+    }
+    XrCompositionLayerQuad& l = clockCard.layer;
+    l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied pixels (panel_rgba)
+    l.space = clockCard.view;
+    l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    l.subImage.swapchain = clockCard.chain;
+    l.subImage.imageRect = {{0, 0}, {kClockWidth, kClockHeight}};
+    clock_place();
+    log_line("clock: card ready");
+    return true;
+}
+
+}  // namespace
+
+void clock_placement_changed(const ClockPlacement& placement) {
+    if (clockCard.read && placement == clockCard.placement)
+        return;
+    if (clockCard.read || placement.enabled)
+        logf("clock: %s, %d deg right, %d deg up, %d deg wide", placement.enabled ? "on" : "off", placement.yaw,
+             placement.pitch, placement.width);
+    clockCard.placement = placement;
+    clockCard.read = true;
+    clock_place();
+}
+
+const XrCompositionLayerBaseHeader* clock_frame(XrSession session) {
+    if (!clockCard.read)
+        clock_placement_changed(read_clock_placement(live.ini.c_str()));
+    if (!clockCard.placement.enabled || !clock_resources(session))
+        return nullptr;
+    // Redrawn when the minute turns over: GetLocalTime is cheap, the drawing (GDI) goes to a worker.
+    SYSTEMTIME local{};
+    GetLocalTime(&local);
+    std::wstring time = osd_clock(local.wHour, local.wMinute);
+    if (time != clockCard.shown && !clockCard.drawing.valid()) {
+        clockCard.shown = time;
+        clockCard.drawing = std::async(std::launch::async, [time = std::move(time)] { return draw_clock_panel(time); });
+    }
+    if (clockCard.drawing.valid() && clockCard.drawing.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        const std::vector<uint32_t> pixels = clockCard.drawing.get();
+        uint32_t index = 0;
+        hang_watch_stage("clock card: xrAcquireSwapchainImage");
+        // A timed-out wait: the image stays acquired, waited on again at the next upload; this drawing is dropped and
+        // drawn again at the next frame.
+        if (acquire_wait(clockCard.chain, clockCard.pending, kImageWaitNs, 1, index, "clock card: xrWaitSwapchainImage") ==
+            XR_SUCCESS) {
+            bool ok = index < clockCard.images.size() && clockCard.upload;
+            hang_watch_stage("clock card: the upload");
+            ok = ok && clockCard.upload->upload(clockCard.images[index], pixels);
+            hang_watch_stage("clock card: xrReleaseSwapchainImage");
+            next.ReleaseSwapchainImage(clockCard.chain, nullptr);
+            clockCard.uploaded = clockCard.uploaded || ok;
+            if (!ok)
+                clockCard.shown.clear();
+        } else {
+            clockCard.shown.clear();
+        }
+        hang_watch_stage("clock card: done");
+    }
+    return clockCard.uploaded ? reinterpret_cast<const XrCompositionLayerBaseHeader*>(&clockCard.layer) : nullptr;
+}
+
+void clock_shutdown() {
+    if (clockCard.drawing.valid())
+        clockCard.drawing.wait();
+    clockCard.drawing = {};
+    clockCard.upload.reset();
+    if (clockCard.chain)
+        next.DestroySwapchain(clockCard.chain);
+    if (clockCard.view)
+        next.DestroySpace(clockCard.view);
+    clockCard.chain = XR_NULL_HANDLE;
+    clockCard.view = XR_NULL_HANDLE;
+    clockCard.images.clear();
+    clockCard.pending = {};
+    clockCard.uploaded = clockCard.failed = false;
+    clockCard.shown.clear();
 }
 
 }  // namespace simqvfr::layer

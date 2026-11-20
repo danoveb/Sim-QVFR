@@ -109,7 +109,7 @@ Profiles live in the profiles folder next to the ini (`profile/profiles.h`). The
 | Resolution | Footer "Percent of the headset's recommended resolution (W × H px per eye)…" | info | runtime.ini `recommended_width/height` | — | — | — | Picture › Resolution ⓘ |
 | Resolution | Object detail (0–100 %) | slider | `[experiment] object_detail` | Live | X-Plane only (`objectDetail`); greyed in Two-loop | Yes | Picture › Resolution |
 | Resolution | Sharpening (0–100 %, 0 = Off) | slider | `[quad] sharpen_percent` | Live | All four games (`sharpening`); greyed in Two-loop | Yes | Picture › Resolution |
-| Resolution | Let the runtime compose (Pimax, Varjo) | toggle | `[experiment] native_quad_views` (1 auto, 0 off; a hand-set 2 toggles to 0) | Next launch | LMU only (`nativeQuadViews`); greyed in Two-loop | Yes | Picture › Rendering |
+| Color | Color correction (On/Off); Exposure (−3.0…+3.0 EV), Brightness and Contrast (−50…+50 %), Saturation (−100…+100 %) revealed while on | toggle + sliders | `[quad] color_correction`, `color_exposure`, `color_brightness`, `color_contrast`, `color_saturation` | Live | Games with `sharpening` (every compositor); QVFR only | Yes | Picture › Color; headset menu Color page |
 | Resolution | Runtime composition: last-launch line ("composed the views, its focus region W % × H %", "offers it but it wasn't used", "doesn't offer it", "another layer sits between") | info | runtime.ini `quad_views`, `quad_views_used`, `quad_runtime_focus` | — | Runtime composition on | — | Picture › Rendering |
 | Resolution | Runtime composition footer (focus area inside the runtime's focus region; off with frame generation) | info | — | — | — | — | Picture › Rendering ⓘ; the frame generation note only when frame generation is on |
 | Resolution | Crop the view | toggle | `[crop] enabled` | Live | ACE, ACC, LMU (`fovCrop`); QVFR only | Yes | Picture › View & helmet |
@@ -332,6 +332,7 @@ The overlay's content has no options in the launcher (the brief mentions "conten
 | About | Sim-QVFR Launcher, "Starts <game> with foveated rendering enabled.", Version (or "· development build") | info | — | — | — | — | Rail bottom (version) and About sheet |
 | About | Ko-fi line and "Support on Ko-fi" button | button | — (opens ko-fi.com/williem3) | — | — | — | Rail bottom (red heart), Overview › Ko-fi tile, About sheet |
 | About | Check for updates when the launcher starts | toggle | `[launcher] update_check` (+ `update_asked`) | Launcher | — | No | About sheet |
+| About | Skip this version / Don't skip (also set by Go back) | button | `[launcher] update_skip` | Launcher | — | No | Kept |
 | About | Update status: Not checked, Checking…, Up to date, X is available, Newest release (dev), Couldn't check; install progress and errors | info | — | — | — | — | About sheet; "available" also as a dot on the rail version and in the top bar status |
 | About | Install <tag> / Try again · Download · Check now | button | — | — | Install when `installable()`; Download when available/dev with a URL; none while installing | — | About sheet |
 | About | Disclaimer "Experimental and unofficial. Use at your own risk." | info | — | — | — | — | About sheet |

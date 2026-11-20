@@ -18,6 +18,7 @@
 #include "../settings.h"
 #include "../session_history.h"
 #include "../../games/game.h"
+#include "../../engine/fsr_probe.h"
 #include "../../ini_put.h"
 #include "../../sha256_file.h"
 #include "window_state.h"
@@ -26,6 +27,15 @@
 #pragma comment(lib, "dwmapi.lib")
 
 namespace simqvfr::launcher::ui::win {
+
+void start_fsr_probe() {
+    if (app.fsrProbing || app.fsrOffer.checked)
+        return;
+    app.fsrProbing = true;
+    std::thread([hwnd = app.hwnd, folder = layer_folder()] {  // a D3D12 device and AMD's 28 MB DLL: under a second
+        PostMessageW(hwnd, kFsrProbedMessage, 0, reinterpret_cast<LPARAM>(new fsr::Offer(fsr::probe_offer(folder))));
+    }).detach();
+}
 
 namespace {
 
@@ -70,6 +80,62 @@ void cycle_theme() {
     InvalidateRect(app.hwnd, nullptr, FALSE);
 }
 
+namespace {
+
+// lang\ beside the launcher (sim-qvfr.ini's folder): a release's and a development build's alike.
+std::filesystem::path language_folder() { return lang::folder_near(std::filesystem::path(settings_path()).parent_path()); }
+
+// The language a choice shows in: the file's own name, or English.
+std::wstring language_name(const std::wstring& code) {
+    for (const lang::Info& l : app.languages)
+        if (_wcsicmp(l.code.c_str(), code.c_str()) == 0)
+            return l.name;
+    return L"English";
+}
+
+}  // namespace
+
+// [launcher] language: auto (the default: Windows' display language when a file has it, else English), en, or a
+// lang\ file's code. One for every game, as ui_theme.
+void read_language() {
+    app.languages = lang::available(language_folder());
+    if (app.iniFound) {
+        app.languageChoice = ini_get(app.ini.c_str(), L"launcher", L"language", L"auto");
+        if (app.languageChoice.empty())
+            app.languageChoice = L"auto";
+    }
+    app.languageInUse = lang::select(language_folder(), app.languageChoice);
+}
+
+// The pop-up: Windows' language (and what it shows in), English, then each file. Returns the one chosen.
+int language_items(std::vector<std::wstring>& items) {
+    items.clear();
+    const bool automatic = _wcsicmp(app.languageChoice.c_str(), L"auto") == 0;
+    items.push_back(trf(L"Windows language ({language})",
+                        {{L"language", language_name(lang::resolve(L"auto", app.languages))}}));
+    items.push_back(L"English");
+    int selected = automatic ? 0 : 1;
+    for (size_t i = 0; i < app.languages.size(); ++i) {
+        items.push_back(app.languages[i].name);
+        if (!automatic && _wcsicmp(app.languages[i].code.c_str(), app.languageChoice.c_str()) == 0)
+            selected = static_cast<int>(i) + 2;
+    }
+    return selected;
+}
+
+// A choice from the pop-up: saved, the file loaded, the window redrawn in it (every text is looked up as it draws).
+void choose_language(int option) {
+    if (option < 0 || option >= static_cast<int>(app.languages.size()) + 2)
+        return;
+    app.languageChoice = option == 0 ? L"auto" : option == 1 ? L"en" : app.languages[static_cast<size_t>(option) - 2].code;
+    if (app.iniFound) {
+        ini_put(app.ini.c_str(), L"launcher", L"language", app.languageChoice.c_str());
+        app.iniText = ini_text();  // not a change follow_ini needs to read back
+    }
+    app.languageInUse = lang::select(language_folder(), app.languageChoice);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
 COLORREF colorref(uint32_t rgb) { return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff); }
 
 // A game tab's palette (tokens.json "games"), for the theme in use; the kit's default accent for a game without one.
@@ -81,11 +147,9 @@ t::Accent builtin_accent(const games::GameInfo& game) {
     return {base.accent, base.accent_fill, base.on_accent, base.focus_ring};
 }
 
-std::wstring game_id(const games::GameInfo& game) { return widen(std::string(game.id)); }
-
 // A game's accent: the colour picked for it in the Games pane (game_tabs.h accent_from), else its palette.
 t::Accent game_accent(const games::GameInfo& game) {
-    const auto custom = app.s.gameColors.find(game_id(game));
+    const auto custom = app.s.gameColors.find(games::wide_id(game));
     if (custom == app.s.gameColors.end())
         return builtin_accent(game);
     const AccentColors a = accent_from(custom->second, app.dark);
@@ -148,7 +212,7 @@ void changed(bool save) {
         const std::vector<std::wstring> diff = setting_changes(app.lastSaved, app.s);
         if (app.undoing) {
             app.undoChange.reset();
-            app.undoText = diff.empty() ? L"" : L"Undone: " + changes_text(diff, 2);
+            app.undoText = diff.empty() ? L"" : trf(L"Undone: {changes}", {{L"changes", changes_text(diff, 2)}});
         } else if (!diff.empty()) {
             app.undoChange = app.lastSaved;
             app.undoText = changes_text(diff, 2);
@@ -183,7 +247,7 @@ void record_session() {
     const SessionInfo& s = app.runtime.session;
     if (!app.iniFound || !s.known())
         return;
-    const std::wstring id = session_id(s.log);
+    const std::wstring id = session_record_id(s);
     if (id.empty())
         return;
     for (const SessionRecord& r : app.sessions)
@@ -191,16 +255,13 @@ void record_session() {
             return;
     // Its game: the run folder's copy of the ini names it ([launcher] game, ACE when unset); without one, the game shown.
     const std::wstring runIni = session_run_ini(s.log);
-    std::wstring game = game_id(games::launcher_game());
-    if (GetFileAttributesW(runIni.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        wchar_t named[32] = {};
-        GetPrivateProfileStringW(L"launcher", L"game", L"ace", named, static_cast<DWORD>(std::size(named)), runIni.c_str());
-        game = named;
-    }
+    std::wstring game = games::wide_id(games::launcher_game());
+    if (GetFileAttributesW(runIni.c_str()) != INVALID_FILE_ATTRIBUTES)
+        game = launcher_game_id(runIni.c_str());
     // Every ~10 s while the game runs, so the history is kept up to date here rather than read again (12 files of ~100
     // keys): the shown game's settings are the window's own, kept in step with the ini (follow_ini).
     const std::wstring source = game_settings_target(app.ini, game);
-    SessionRecord record = session_record(s, game, game == game_id(games::launcher_game()) ? app.s : load_settings(source));
+    SessionRecord record = session_record(s, game, game == games::wide_id(games::launcher_game()) ? app.s : load_settings(source));
     if (!store_session(sessions_folder(app.ini), record, source))
         return;
     std::vector<SessionRecord>& list = app.sessions;
@@ -276,6 +337,10 @@ int* slider_value(Ctl id) {
     case kInner: return &app.s.inner;
     case kObjectDetail: return &app.s.objectDetail;
     case kSharpen: return &app.s.sharpen;
+    case kGradeExposure: return &app.s.grade.exposure;
+    case kGradeBrightness: return &app.s.grade.brightness;
+    case kGradeContrast: return &app.s.grade.contrast;
+    case kGradeSaturation: return &app.s.grade.saturation;
     case kColorValue: return &app.colorValue;
     case kWidth: return &app.s.width;
     case kHeight: return &app.s.height;
@@ -315,6 +380,9 @@ int* slider_value(Ctl id) {
     case kOsdYaw: return &app.s.osd.yaw;
     case kOsdPitch: return &app.s.osd.pitch;
     case kOsdSize: return &app.s.osd.width;
+    case kClockYaw: return &app.s.clock.yaw;
+    case kClockPitch: return &app.s.clock.pitch;
+    case kClockSize: return &app.s.clock.width;
     case kCropTop: return &app.s.cropTop;
     case kCropBottom: return &app.s.cropBottom;
     case kCropOuter: return &app.s.cropOuter;
@@ -335,6 +403,10 @@ Range slider_range(Ctl id) {
     case kInner: return kInnerRange;
     case kObjectDetail: return kObjectDetailRange;
     case kSharpen: return kSharpenRange;
+    case kGradeExposure: return kColorExposureRange;
+    case kGradeBrightness: return kColorBrightnessRange;
+    case kGradeContrast: return kColorContrastRange;
+    case kGradeSaturation: return kColorSaturationRange;
     case kColorValue: return {0, 100};
     case kFeather: return kFeatherRange;
     case kCorner: return kCornerRange;
@@ -369,6 +441,9 @@ Range slider_range(Ctl id) {
     case kOsdYaw: return {-kOsdYawMax, kOsdYawMax};
     case kOsdPitch: return {-kOsdPitchMax, kOsdPitchMax};
     case kOsdSize: return {kOsdWidthMin, kOsdWidthMax};
+    case kClockYaw: return {-kClockYawMax, kClockYawMax};
+    case kClockPitch: return {-kClockPitchMax, kClockPitchMax};
+    case kClockSize: return {kClockWidthMin, kClockWidthMax};
     case kCropTop:
     case kCropBottom:
     case kCropOuter:
@@ -449,7 +524,7 @@ void start_launch();
 void launch() {
     if (!app.iniFound) {
         app.status = Status::Error;
-        app.error = L"sim-qvfr.ini not found next to the launcher.";
+        app.error = tr(L"sim-qvfr.ini not found next to the launcher.");
         InvalidateRect(app.hwnd, nullptr, FALSE);
         return;
     }
@@ -462,15 +537,15 @@ void launch() {
     refresh_checks();
     // Running already (from here or not): Launch checks says how, and Launch starts nothing.
     if (game_running()) {
-        jump_to({L"Launch checks", L"Launch checks", Pane::Game});
+        jump_to({tr(L"Launch checks"), tr(L"Launch checks"), Pane::Game});
         InvalidateRect(app.hwnd, nullptr, FALSE);
         return;
     }
     for (const Check& c : app.checks)
         if (c.id == "game" && c.tone == CheckTone::Bad) {  // its fix, Choose folder…, is in Launch checks
             app.status = Status::Error;
-            app.error = game_name() + L" not found: choose its folder in Launch checks.";
-            jump_to({L"Launch checks", L"Launch checks", Pane::Game});
+            app.error = trf(L"{game} not found: choose its folder in Launch checks.", {{L"game", game_name()}});
+            jump_to({tr(L"Launch checks"), tr(L"Launch checks"), Pane::Game});
             InvalidateRect(app.hwnd, nullptr, FALSE);
             return;
         }
@@ -484,9 +559,9 @@ void launch() {
         return;
     }
     Sheet s;
-    s.title = L"Launch " + game_name() + L" anyway?";
-    s.text = L"The launch checks found:\n" + problems;
-    s.buttons = {L"Show Checks", L"Launch Anyway"};
+    s.title = trf(L"Launch {game} anyway?", {{L"game", game_name()}});
+    s.text = trf(L"The launch checks found:\n{problems}", {{L"problems", problems}});
+    s.buttons = {tr(L"Show Checks"), tr(L"Launch Anyway")};
     s.focus = 0;
     s.danger = true;
     s.done = [](int button, const std::wstring&) {
@@ -494,7 +569,7 @@ void launch() {
             start_launch();
             return;
         }
-        jump_to({L"Launch checks", L"Launch checks", Pane::Game});
+        jump_to({tr(L"Launch checks"), tr(L"Launch checks"), Pane::Game});
         InvalidateRect(app.hwnd, nullptr, FALSE);
     };
     open_sheet(std::move(s));
@@ -511,10 +586,16 @@ void start_launch() {
     if (launch_game(false, report, &launched) != 0) {
         app.status = Status::Error;
         const size_t at = report.find(L"ERROR: ");
-        app.error = at == std::wstring::npos ? L"Launch failed." : report.substr(at + 7, report.find(L'\n', at) - at - 7);
+        app.error = at == std::wstring::npos ? std::wstring(tr(L"Launch failed."))
+                                             : report.substr(at + 7, report.find(L'\n', at) - at - 7);
     } else {
         // From here the watch says what became of it: running with Sim-QVFR, without it, closed or crashed.
         app.status = Status::Idle;
+        // The launch took the one-launch settings it ran with (Next launch without QVFR, a Detailed logs launch) in the
+        // ini: the window's copy follows, so the next save doesn't put them back.
+        const Settings now = load_settings(app.ini);
+        app.s.baselineNext = now.baselineNext;
+        app.s.debugLogs = now.debugLogs;
         app.watch.start(launched, games::launcher_game(), runtime_info_path(),
                         game_crashes_folder(games::launcher_game().crashReports));
         refresh_checks();

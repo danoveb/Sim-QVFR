@@ -41,6 +41,7 @@ struct MvrProbeStats {
     uint64_t yebisCopies = 0, yebisComposites = 0;  // YEBIS's copy and composite pixel shaders marked (yebis_shaders.h)
     uint64_t finalBlits = 0;  // the game's final blit pixel shaders marked (yebis_shaders.h)
     uint64_t lensMasks = 0, vruiPanels = 0;  // the lens mask's and VR UI panel's vertex shaders marked (VsRole)
+    uint64_t positionTwins = 0;  // full-screen shaders given a position twin (mvr_probe_position_twins)
     // Pixel shaders (lmu_mvr): created, given a mip bias twin (dxbc::add_focus_mip_bias; texture sharpening), and why not.
     uint64_t pixelCreated = 0, pixelTwinned = 0, pixelRepeats = 0, pixelFailed = 0;
     std::map<std::string, uint64_t> pixelRefused;
@@ -62,13 +63,32 @@ inline constexpr GUID kMvrMipBiasTwinGuid = {0x5a8e2c71, 0x0d4f, 0x4b96, {0xb1, 
 // Other cars' motion vectors (lmu_car_track, car_motion.h): where a game vertex shader reads its `worldMatrix`, as two
 // UINTs: the constant buffer slot and the byte offset in it (from the shader's reflection; none when it reads none).
 inline constexpr GUID kVsWorldMatrixGuid = {0x3e9b7a14, 0x6c25, 0x4f81, {0x8d, 0x47, 0xa2, 0x19, 0xe5, 0x6b, 0x0c, 0x73}};
+// With it, where the shader reads `viewMatrix` and `viewProjMatrix` in that same buffer, as two UINT byte offsets: the
+// pass's camera for DLSS on any game build (view_pair.h). None when it reads them elsewhere or not at all.
+inline constexpr GUID kVsViewMatricesGuid = {0x9b1e4c27, 0x3d58, 0x4a06, {0xa7, 0x92, 0x5c, 0xe1, 0x08, 0x3f, 0xb6, 0x4d}};
 // Other cars' motion vectors, stage 3 (lmu_car_vectors; engine/dxbc_patch.h add_slot_output): a game pixel shader's twin
 // that also writes the draw's car part slot to render target 1, and the same made of its mip bias twin (ID3D11PixelShader
 // each; texture sharpening with the slots).
 inline constexpr GUID kMvrSlotTwinGuid = {0x7c41d2e9, 0x1b5a, 0x4e0f, {0x9d, 0x33, 0x58, 0xa6, 0x2e, 0xc1, 0x07, 0x94}};
 inline constexpr GUID kMvrSlotBiasTwinGuid = {0x2a96f0c3, 0x84d7, 0x4b21, {0xae, 0x15, 0x6f, 0x0b, 0xd2, 0x39, 0x7e, 0x58}};
 // An input layout with per-instance data: its twin with every per-instance step rate doubled (an ID3D11InputLayout).
+// A game shader's (vertex or pixel) declared size of the constant buffer in slot 0, in vectors (a UINT).
+inline constexpr GUID kCb0VectorsGuid = {0x64b0e3a9, 0x2f17, 0x4c58, {0xb4, 0x0a, 0x91, 0x7e, 0x3d, 0x52, 0xc6, 0x1f}};
+// A pixel shader's id (a uint64): its DXBC checksum's first two words, as the shader dump names its file (PS_<id>.dxbc).
+inline constexpr GUID kPixelIdGuid = {0x3c8d1f52, 0x6a94, 0x4e07, {0x9b, 0x21, 0x5d, 0xe3, 0x70, 0x8a, 0x44, 0xc6}};
+// A pixel shader's rows of constant buffer 0 read by a fixed index (512 bytes: dxbc::constant_buffer_static_rows).
+inline constexpr GUID kCb0StaticRowsGuid = {0x5e2a7b14, 0xc39d, 0x4f61, {0x8e, 0x05, 0xa7, 0x3b, 0x91, 0xd2, 0x6c, 0x48}};
+// The SCS games' focus replays (mvr_probe_position_twins): a full-screen pass's vertex shader that turns its vertex into
+// screen pixels carries its dxbc::add_position_remap twin (an interface) and the twin's rectangle and size rows (two ints).
+inline constexpr GUID kFocusPositionTwinGuid = {0x8b3e51c7, 0x2d64, 0x4a19, {0x9f, 0x0e, 0x73, 0xc2, 0x58, 0xa1, 0x4d, 0x36}};
+inline constexpr GUID kShaderIdGuid = {0x2b9e64d1, 0x8f30, 0x4c57, {0xb2, 0x1a, 0x6e, 0x95, 0x03, 0xd8, 0x47, 0xc2}};
+inline constexpr GUID kCbRows4Guid = {0x7a15c3e8, 0x46b2, 0x4e9d, {0x81, 0x6c, 0x2f, 0xa0, 0x5b, 0x93, 0xd4, 0x17}};
+inline constexpr GUID kFocusPositionRowsGuid = {0x1f6a9c38, 0x7e05, 0x4b72, {0xa4, 0xd9, 0x0c, 0x83, 0x6e, 0x27, 0xb5, 0x91}};
 inline constexpr GUID kMvrInstancedLayoutGuid = {0x91e3b6d0, 0x7c42, 0x4e85, {0xa3, 0x5f, 0x0d, 0x28, 0xe6, 0x19, 0xbc, 0x47}};
+// Every input layout the probe sees made, twinned or not: its kind (a UINT). Unmarked: not seen (made before the
+// probe hooked the device), not known.
+inline constexpr GUID kMvrLayoutKindGuid = {0x4c27a9e1, 0xd36b, 0x4f05, {0x8a, 0x71, 0x2e, 0xb4, 0x90, 0x5d, 0x13, 0xc8}};
+inline constexpr UINT kMvrLayoutPerVertex = 1, kMvrLayoutPerInstance = 2;
 
 // How the eye passes draw their focus views: none (four passes), NVIDIA's single-pass stereo, or instancing.
 enum class MvrBackend { none, nvapi, instanced };
@@ -81,9 +101,18 @@ bool mvr_probe_install(const wchar_t* ini, bool attachTwins = false, bool nameSh
 // xrCreateSession with the game's device: device creation unhooked; NVAPI's flags on the device; its shader creation
 // hooked if device creation wasn't.
 void mvr_probe_device(ID3D11Device* device);
+// The SCS games: full-screen shaders get their position twins (kFocusPositionTwinGuid) from now on.
+void mvr_probe_position_twins(bool on);
+// The SCS mirror diagnostic (dev builds): every shader tagged with its id (kShaderIdGuid, DXBC checksum words 0-1)
+// and the rows of constant buffer slots 0-3 it reads by a fixed index (kCbRows4Guid: 4 x 64 uint64).
+void mvr_probe_cb_rows(bool on);
 // Every xrEndFrame: a summary when the counts changed (at most every 5 s).
 void mvr_probe_frame_end();
 MvrProbeStats mvr_probe_stats();
+// YEBIS's copy pixel shaders and the game's final blits marked so far: two counters, no copy of the stats (the passes ask
+// at every pass's start and frame's end).
+uint64_t mvr_probe_yebis_copies();
+uint64_t mvr_probe_final_blits();
 // The game's device can draw two views (NVAPI's single-pass stereo with XYZW, or a vertex shader picking the viewport,
 // seen at its first vertex shader or at xrCreateSession) and the probe attaches the converted shaders: MVR can run.
 // False before either, or with the probe off.
@@ -93,8 +122,13 @@ bool mvr_probe_usable();
 MvrBackend mvr_probe_backend();
 // Instanced twins are attached (the device can and the probe attaches): the fallback when NVIDIA's is refused.
 bool mvr_probe_instanced();
-// Input layouts with per-instance data seen (each with its twin): a doubled draw then looks at the bound layout.
+// Input layouts with per-instance data seen with their twin.
 uint64_t mvr_probe_instanced_layouts();
+// A doubled draw must look at the bound layout (kMvrLayoutKindGuid): a layout with per-instance data was seen (twinned
+// or not), or layouts may have been made before the device was hooked (not known).
+bool mvr_probe_layouts_to_check();
+// Counts the input layouts the probe saw made (a layout looked up by its address before may be a new one since).
+uint64_t mvr_probe_layout_generation();
 // Counts the vertex shaders created on the hooked device (any thread): a shader looked up by its address before may be
 // a new one since (mvr_pass.cpp's twin cache).
 uint64_t mvr_shader_generation();

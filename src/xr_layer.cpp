@@ -4,25 +4,58 @@
 // GetInstanceProcAddr, the layer order and gaze extension checks, CreateApiLayerInstance and the exported
 // negotiation; the rest is in src/layer/ (layer.h).
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
 #include "cheeky/cheeky_host.h"
 #include "games/adapter.h"
 #include "games/game.h"
+#include "lang.h"
 #include "layer_chain.h"
 #include "log.h"
 #include "probe/dred.h"
 #include "probe/pix_capture.h"
+#include "games/ace/replay_probe.h"
+#include "games/ace/stereo_flag.h"
+#include "probe/focus_ngx.h"
 #include "xr.h"
 #include "layer/layer.h"
 
 namespace simqvfr::layer {
 
-#define SIMQVFR_INTERCEPT(fn)                                              \
-    if (std::strcmp(name, "xr" #fn) == 0) {                              \
-        *function = reinterpret_cast<PFN_xrVoidFunction>(&layer##fn);    \
-        return XR_SUCCESS;                                               \
+namespace {
+
+// A C++ exception must not cross the C ABI into the loader or the game (std::terminate there): each entry point the
+// loader or game gets is this wrapper around ours, which logs and fails the call instead. SEH is not caught.
+template <auto F>
+struct Guarded;
+template <typename... A, XrResult(XRAPI_CALL* F)(A...)>
+struct Guarded<F> {
+    static XrResult XRAPI_CALL call(A... a) noexcept {
+        try {
+            return F(a...);
+        } catch (const std::exception& e) {
+            failed(e.what());
+        } catch (...) {
+            failed("unknown");
+        }
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
+    static void failed(const char* what) noexcept {
+        try {
+            logf("an exception (%s) inside a layer entry point: the call fails with XR_ERROR_RUNTIME_FAILURE", what);
+        } catch (...) {
+        }
+    }
+};
+
+}  // namespace
+
+#define SIMQVFR_INTERCEPT(fn)                                                         \
+    if (std::strcmp(name, "xr" #fn) == 0) {                                           \
+        *function = reinterpret_cast<PFN_xrVoidFunction>(&Guarded<&layer##fn>::call); \
+        return XR_SUCCESS;                                                            \
     }
 
 XrResult XRAPI_CALL layerGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function) {
@@ -38,6 +71,7 @@ XrResult XRAPI_CALL layerGetInstanceProcAddr(XrInstance instance, const char* na
         SIMQVFR_INTERCEPT(BeginFrame)
         SIMQVFR_INTERCEPT(CreateSwapchain)
         SIMQVFR_INTERCEPT(EnumerateSwapchainImages)
+        SIMQVFR_INTERCEPT(DestroySwapchain)  // the per-swapchain state goes first (layerDestroySwapchain)
         SIMQVFR_INTERCEPT(LocateViews)
         SIMQVFR_INTERCEPT(CreateReferenceSpace)
         SIMQVFR_INTERCEPT(DestroySpace)
@@ -148,6 +182,18 @@ const XrApiLayerNextInfo* chain_layers_below(const XrApiLayerNextInfo* self) {
     return chain::link(layers, self, storage);
 }
 
+// OpenXR layers known to pass a quad view session through as it is: they add layers of their own to a frame and touch
+// neither the game's views nor its session's view configuration (OpenKneeboard: its kneeboards as quad layers). With
+// only these between this layer and the runtime, native quad views ask the runtime itself for its offer, past them
+// (issue 29: OpenKneeboard on turned the runtime composition off).
+bool passes_quad_views(const char* layerName) {
+    static const char* const kKnown[] = {"XR_APILAYER_FREDEMMOTT_OpenKneeboard"};
+    for (const char* known : kKnown)
+        if (layerName && _stricmp(layerName, known) == 0)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info,
@@ -182,9 +228,22 @@ XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info
     // Auto (native_quad_views=1, the default) asks only when the runtime is known to offer them: with a layer between,
     // an unknown offer would mean a refused instance and a second try on every launch on any runtime; 2 tries then too.
     // Not with VectorXR below (its frame generation works on one composed image).
+    // Only layers that pass a quad view session through between (passes_quad_views): the runtime's own list, from the
+    // chain's last node (its next is the runtime), which answers before any instance exists as it does directly below.
     const bool runtimeBelow = own->next == nullptr;
-    const QuadOffer quadOffer = extension_offered(gipa, runtimeBelow, XR_VARJO_QUAD_VIEWS_EXTENSION_NAME);
-    const QuadOffer foveatedOffer = extension_offered(gipa, runtimeBelow, XR_VARJO_FOVEATED_RENDERING_EXTENSION_NAME);
+    const XrApiLayerNextInfo* last = own;
+    bool onlyPassThrough = true;
+    std::string passedThrough;
+    for (const XrApiLayerNextInfo* n = own->next; n; n = n->next) {
+        last = n;
+        onlyPassThrough &= passes_quad_views(n->layerName);
+        passedThrough += (passedThrough.empty() ? "" : ", ") + std::string(n->layerName);
+    }
+    const bool runtimeAsked = runtimeBelow || onlyPassThrough;
+    PFN_xrGetInstanceProcAddr runtimeGipa = last->nextGetInstanceProcAddr;
+    const QuadOffer quadOffer = extension_offered(runtimeGipa, runtimeAsked, XR_VARJO_QUAD_VIEWS_EXTENSION_NAME);
+    const QuadOffer foveatedOffer =
+        extension_offered(runtimeGipa, runtimeAsked, XR_VARJO_FOVEATED_RENDERING_EXTENSION_NAME);
     std::string quadWhy;
     bool quadWanted = native_quad_wanted(&quadWhy) && thisGame->features.nativeQuadViews &&
                       games::adapter_for(thisGame).qvfr_separate_views();
@@ -233,6 +292,17 @@ XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info
     nativeQuad.foveated = foveatedAdded;
     game = &games::adapter_for(thisGame);
     load_experiment();
+    // ACE's API path draws its focus views from ACE's single-pass stereo lists: on before ACE makes its renderer.
+    if (experiment.replayCompose && std::strcmp(thisGame->id, "ace") == 0)
+        ace_single_pass_stereo_on();
+    if (experiment.replayProbe == 3 && ((experiment.replaySky && experiment.replayTiles) || experiment.replayTyres))
+        replay_probe_early_sky();  // before the game makes its device and loads its pipelines
+    if (experiment.replayProbe == 3 && experiment.replayDlss)
+        focus_ngx::set_presets(experiment.replayDlssEyePreset, experiment.replayDlssFocusPreset);
+    if (experiment.replayProbe == 3 && experiment.replayDlss)
+        focus_ngx::set_options(static_cast<float>(experiment.replayDlssJitterX), experiment.replayDlssPeripheryDlaa);
+    if (experiment.replayProbe == 3 && experiment.replayDlss)
+        focus_ngx::preload();  // NGX's exports detoured before the game makes its DLSS features
     // Where the launcher writes live settings while this ACE runs (live_reload).
     runtime_info(L"live_ini", live.ini);
     runtime_info(L"live_pid", std::to_wstring(GetCurrentProcessId()));
@@ -254,6 +324,9 @@ XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info
     {
         static const char* const kOffer[] = {"offers them", "doesn't offer them", "offer unknown (a layer between)"};
         const bool hasFeature = thisGame->features.nativeQuadViews;
+        if (!runtimeBelow && onlyPassThrough)
+            logf("native quad views: only layers that pass quad views through between (%s): the runtime asked past them",
+                 passedThrough.c_str());
         logf("native quad views: the runtime %s (XR_VARJO_quad_views); %s%s", kOffer[static_cast<int>(quadOffer)],
              !hasFeature ? "not for this game yet"
              : quadWanted ? (forceQuad ? "native_quad_views=2 (tried even with the offer unknown)" : "auto")
@@ -297,7 +370,7 @@ XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info
         dred_enable();
     if (experiment.d3d12Debug)
         d3d12_debug_enable(experiment.gpuValidation);
-    if (experiment.pixCaptureFrame)  // before ACE creates its D3D12 device
+    if (experiment.pixCaptureFrame || experiment.pixCaptureHotkey)  // before ACE creates its D3D12 device
         pix_capture_load(experiment.pixCaptureFrame);
     game->instance_created(live.ini.c_str(), experiment.mode);
     if (!experiment.views4 && game->measure_only()) {  // renders QVFR itself (RF2): its focus box and sizes, at once
@@ -324,12 +397,12 @@ XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info
         start.ini = live.ini.c_str();
         if (!game->qvfr_start(start)) {
             experiment.views4 = false;  // no doubled eye width or rect rewrite without the engine side
-            notice_set(L"Sim-QVFR is off",
-                       {L"This " + std::wstring(thisGame->name) +
-                            L" build isn’t one Sim-QVFR supports, so the game runs as normal, "
-                            L"without foveated rendering. The game has probably been updated.",
-                        L"Look for an Sim-QVFR release for the new build. The launcher’s Launch checks say the same "
-                        L"before a launch."});
+            notice_set(lang::tr(L"Sim-QVFR is off"),
+                       {lang::trf(L"This {game} build isn’t one Sim-QVFR supports, so the game runs as normal, "
+                                  L"without foveated rendering. The game has probably been updated.",
+                                  {{L"game", thisGame->name}}),
+                        lang::tr(L"Look for a Sim-QVFR release for the new build. The launcher’s Launch checks say the "
+                                 L"same before a launch.")});
         }
     }
     Dispatch d;
@@ -383,7 +456,9 @@ XrResult XRAPI_CALL layerCreateApiLayerInstance(const XrInstanceCreateInfo* info
     else
         gaze_init(*instance);
     if (ok)
-        native_quad_install(*instance, gipa);  // its wrappers below everything else of this layer's
+        eye_off_install();  // right above the runtime: it sees the frame as the runtime will
+    if (ok)
+        native_quad_install(*instance, gipa);  // its wrappers below everything else of this layer's but eye off's
     else
         nativeQuad.extension = false;
     return r;
@@ -402,9 +477,14 @@ xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo* loaderInfo, cons
         return XR_ERROR_INITIALIZATION_FAILED;
     request->layerInterfaceVersion = XR_CURRENT_LOADER_API_LAYER_VERSION;
     request->layerApiVersion = XR_API_VERSION_1_0;
-    request->getInstanceProcAddr = simqvfr::layer::layerGetInstanceProcAddr;
-    request->createApiLayerInstance = simqvfr::layer::layerCreateApiLayerInstance;
+    request->getInstanceProcAddr = &simqvfr::layer::Guarded<&simqvfr::layer::layerGetInstanceProcAddr>::call;
+    request->createApiLayerInstance = &simqvfr::layer::Guarded<&simqvfr::layer::layerCreateApiLayerInstance>::call;
     if (simqvfr::layer::is_game_process()) {
+        // The game's code is patched to point into this module and our threads run in it: pinned, the loader's
+        // FreeLibrary (instance destroyed, a failed create) can't unload it under them.
+        HMODULE pinned = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&xrNegotiateLoaderApiLayerInterface), &pinned);
         simqvfr::log_line("Loader negotiated API layer interface v1 (Sim-QVFR probe build)");
         simqvfr::layer::note_loader_negotiation();
     }

@@ -7,17 +7,9 @@
 #include "games/lmu/focus_math.h"
 #include "games/lmu/tag_viewport.h"
 #include "quad/views4_layout.h"
+#include "test_util.h"
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
-}
-
-bool near(double a, double b, double eps = 1e-4) { return std::fabs(a - b) <= eps; }
 
 // LMU's projection: VR_GetEyeProjection's right-handed matrix, then VR_GetEyeProjectionLH negates row 2.
 void lmu_projection(double l, double r, double d, double u, double n, double f, float (&m)[16]) {
@@ -51,32 +43,32 @@ int SIM_QVFR_TEST_MAIN() {
 
     double x = 0, y = 0;
     project(eye, l, d, x, y);
-    check(near(x, -1) && near(y, -1), "the eye's left-bottom tangents land at NDC (-1, -1)");
+    check(close_to(x, -1, 1e-4) && close_to(y, -1, 1e-4), "the eye's left-bottom tangents land at NDC (-1, -1)");
     project(eye, r, u, x, y);
-    check(near(x, 1) && near(y, 1), "the eye's right-top tangents land at NDC (1, 1)");
+    check(close_to(x, 1, 1e-4) && close_to(y, 1, 1e-4), "the eye's right-top tangents land at NDC (1, 1)");
 
     lmu::FocusBox box;
     float focus[16];
     check(lmu::focus_projection(eye, 0.3, 0.3, 0, 0, box, focus), "a 30% centred box is made");
-    check(near(box.eyeTan[0], l) && near(box.eyeTan[1], r) && near(box.eyeTan[2], d) && near(box.eyeTan[3], u),
+    check(close_to(box.eyeTan[0], l, 1e-4) && close_to(box.eyeTan[1], r, 1e-4) && close_to(box.eyeTan[2], d, 1e-4) && close_to(box.eyeTan[3], u, 1e-4),
           "the eye's tangents are read back from its matrix");
     const double hw = (r - l) * 0.3 / 2, hh = (u - d) * 0.3 / 2;
-    check(near(box.focusTan[0], -hw) && near(box.focusTan[1], hw) && near(box.focusTan[2], -hh) && near(box.focusTan[3], hh),
+    check(close_to(box.focusTan[0], -hw, 1e-4) && close_to(box.focusTan[1], hw, 1e-4) && close_to(box.focusTan[2], -hh, 1e-4) && close_to(box.focusTan[3], hh, 1e-4),
           "the box is 30% of the span, centred on the forward axis");
     project(focus, -hw, -hh, x, y);
-    const bool corner0 = near(x, -1) && near(y, -1);
+    const bool corner0 = close_to(x, -1, 1e-4) && close_to(y, -1, 1e-4);
     project(focus, hw, hh, x, y);
-    check(corner0 && near(x, 1) && near(y, 1), "the box's corners land at the focus view's NDC corners");
+    check(corner0 && close_to(x, 1, 1e-4) && close_to(y, 1, 1e-4), "the box's corners land at the focus view's NDC corners");
     project(focus, 0, 0, x, y);
-    check(near(x, 0) && near(y, 0), "the forward axis is the focus view's centre");
+    check(close_to(x, 0, 1e-4) && close_to(y, 0, 1e-4), "the forward axis is the focus view's centre");
     check(focus[10] == eye[10] && focus[11] == eye[11] && focus[14] == eye[14], "depth and w are the eye's");
 
     // Where the box sits in the eye's image: the forward axis is right of centre on this headset (l is wider than r).
     project(eye, 0, 0, x, y);
     const double axisX = (x + 1) / 2, axisY = (1 - y) / 2;
-    check(near((box.rect[0] + box.rect[2]) / 2, axisX) && near((box.rect[1] + box.rect[3]) / 2, axisY),
+    check(close_to((box.rect[0] + box.rect[2]) / 2, axisX, 1e-4) && close_to((box.rect[1] + box.rect[3]) / 2, axisY, 1e-4),
           "the box's rect in the eye image is centred on the forward axis");
-    check(near(box.rect[2] - box.rect[0], 0.3) && near(box.rect[3] - box.rect[1], 0.3),
+    check(close_to(box.rect[2] - box.rect[0], 0.3, 1e-4) && close_to(box.rect[3] - box.rect[1], 0.3, 1e-4),
           "the box covers 30% of the eye image's width and height");
     check(box.rect[1] < box.rect[3] && box.rect[0] < box.rect[2], "the rect runs left to right and top to bottom");
     std::printf("eye image rect x %.4f-%.4f y %.4f-%.4f\n", box.rect[0], box.rect[2], box.rect[1], box.rect[3]);
@@ -84,26 +76,26 @@ int SIM_QVFR_TEST_MAIN() {
     // An off-centre box (gaze later): centred on tangents (0.2, -0.1).
     check(lmu::focus_projection(eye, 0.3, 0.2, 0.2, -0.1, box, focus), "an off-centre box is made");
     project(focus, 0.2, -0.1, x, y);
-    check(near(x, 0) && near(y, 0), "its centre is the focus view's centre");
+    check(close_to(x, 0, 1e-4) && close_to(y, 0, 1e-4), "its centre is the focus view's centre");
 
     // The gaze centre kept so the box stays inside the eye (QVFR).
     double cx = 0.2, cy = -0.1;
-    check(lmu::clamp_focus_centre(eye, 0.3, 0.3, cx, cy) && near(cx, 0.2) && near(cy, -0.1),
+    check(lmu::clamp_focus_centre(eye, 0.3, 0.3, cx, cy) && close_to(cx, 0.2, 1e-4) && close_to(cy, -0.1, 1e-4),
           "a gaze well inside the eye moves nothing");
     cx = 5;
     cy = -5;
-    check(lmu::clamp_focus_centre(eye, 0.3, 0.3, cx, cy) && near(cx, r - hw) && near(cy, d + hh),
+    check(lmu::clamp_focus_centre(eye, 0.3, 0.3, cx, cy) && close_to(cx, r - hw, 1e-4) && close_to(cy, d + hh, 1e-4),
           "a gaze past the right-bottom edge puts the box against it");
     lmu::focus_projection(eye, 0.3, 0.3, cx, cy, box, focus);
-    check(near(box.focusTan[1], r) && near(box.focusTan[2], d) && near(box.rect[2], 1) && near(box.rect[3], 1),
+    check(close_to(box.focusTan[1], r, 1e-4) && close_to(box.focusTan[2], d, 1e-4) && close_to(box.rect[2], 1, 1e-4) && close_to(box.rect[3], 1, 1e-4),
           "that box ends at the eye's own edges");
     cx = -5;
     cy = 5;
-    check(lmu::clamp_focus_centre(eye, 0.3, 0.3, cx, cy) && near(cx, l + hw) && near(cy, u - hh),
+    check(lmu::clamp_focus_centre(eye, 0.3, 0.3, cx, cy) && close_to(cx, l + hw, 1e-4) && close_to(cy, u - hh, 1e-4),
           "a gaze past the left-top edge puts the box against it");
     cx = 0.7;
     cy = 0.4;
-    check(lmu::clamp_focus_centre(eye, 1.0, 1.0, cx, cy) && near(cx, (l + r) / 2) && near(cy, (u + d) / 2),
+    check(lmu::clamp_focus_centre(eye, 1.0, 1.0, cx, cy) && close_to(cx, (l + r) / 2, 1e-4) && close_to(cy, (u + d) / 2, 1e-4),
           "a box as large as the eye is centred on it");
 
     // The VR UI's matrix: a world-to-view (turned and moved) times the eye's right-handed projection, row vectors. Its
@@ -164,13 +156,13 @@ int SIM_QVFR_TEST_MAIN() {
         double nx = 0, ny = 0, mx = 0, my = 0;
         ndc(fpv, false, ubox.focusTan[0], ubox.focusTan[2], nx, ny);
         ndc(fpvT, true, ubox.focusTan[0], ubox.focusTan[2], mx, my);
-        const bool lowCorner = near(nx, -1) && near(ny, -1) && near(mx, -1) && near(my, -1);
+        const bool lowCorner = close_to(nx, -1, 1e-4) && close_to(ny, -1, 1e-4) && close_to(mx, -1, 1e-4) && close_to(my, -1, 1e-4);
         ndc(fpv, false, ubox.focusTan[1], ubox.focusTan[3], nx, ny);
         ndc(fpvT, true, ubox.focusTan[1], ubox.focusTan[3], mx, my);
-        check(lowCorner && near(nx, 1) && near(ny, 1) && near(mx, 1) && near(my, 1),
+        check(lowCorner && close_to(nx, 1, 1e-4) && close_to(ny, 1, 1e-4) && close_to(mx, 1, 1e-4) && close_to(my, 1, 1e-4),
               "the focus UI matrix puts the box's corners at the focus view's NDC corners");
         ndc(pv, false, ubox.focusTan[0], ubox.focusTan[3], nx, ny);
-        check(near((nx + 1) / 2, ubox.rect[0]) && near((1 - ny) / 2, ubox.rect[1]),
+        check(close_to((nx + 1) / 2, ubox.rect[0], 1e-4) && close_to((1 - ny) / 2, ubox.rect[1], 1e-4),
               "and the eye's UI matrix puts that corner where the box sits in the eye image");
         float flat[16] = {};
         check(lmu::clip_layout(flat) == 0, "a matrix of no such shape is refused");
@@ -192,7 +184,7 @@ int SIM_QVFR_TEST_MAIN() {
     const double slack = 1 + simqvfr::Views4Layout::kRoomSlack;
     // The pass sizes the game renders in a layer made for a native eye of nativeW x nativeH (session.cpp truncates the
     // offered size, the game rounds each pass up), and whether the eye and its focus view fit side by side
-    // (four_passes.cpp's MVR check).
+    // (qvfr_frame.cpp's MVR check).
     const auto fits = [](const simqvfr::Views4Layout& launch, const simqvfr::Views4Layout& live, unsigned nativeW,
                          unsigned nativeH, unsigned (&eye)[2], unsigned (&focus)[2]) {
         const auto viewW = static_cast<unsigned>(nativeW * launch.layer_width());
@@ -208,14 +200,14 @@ int SIM_QVFR_TEST_MAIN() {
         simqvfr::Views4Layout l = simqvfr::views4_layout(0.40, 0.38, 0.38, 1.0, 0.4);  // outer 0.40 x 0.16 (cropped)
         l.secondViewRoom = l.secondViewBeside = true;
         // The focus view is the taller: the image 0.38 / 0.16 = 2.375 times the outer view each way.
-        check(near(l.beside_scale(), 2.375 * slack) && near(l.layer_width(), 0.95 * slack) &&
-                  near(l.layer_height(), 0.38 * slack) && near(l.outer_room_width(), 0.40) &&
-                  near(l.outer_room_height(), 0.16) && near(l.view_room_width(), 0.95 * slack - 0.40) &&
-                  near(l.view_room_height(), 0.38 * slack),
+        check(close_to(l.beside_scale(), 2.375 * slack, 1e-4) && close_to(l.layer_width(), 0.95 * slack, 1e-4) &&
+                  close_to(l.layer_height(), 0.38 * slack, 1e-4) && close_to(l.outer_room_width(), 0.40, 1e-4) &&
+                  close_to(l.outer_room_height(), 0.16, 1e-4) && close_to(l.view_room_width(), 0.95 * slack - 0.40, 1e-4) &&
+                  close_to(l.view_room_height(), 0.38 * slack, 1e-4),
               "beside, cropped: the image the outer view's shape, as tall as the focus view; the eye's room the outer view");
         const simqvfr::Views4Layout live = simqvfr::views4_live_one_size(l, 0.40, 0.38, 0.38);
-        check(near(2 * live.width[0], 2 * live.height[0]) && near(2 * live.width[0], 1 / (2.375 * slack)) &&
-                  near(2 * live.width[2], 0.38 / (0.95 * slack)) && near(2 * live.height[2], 1 / slack) &&
+        check(close_to(2 * live.width[0], 2 * live.height[0], 1e-4) && close_to(2 * live.width[0], 1 / (2.375 * slack), 1e-4) &&
+                  close_to(2 * live.width[2], 0.38 / (0.95 * slack), 1e-4) && close_to(2 * live.height[2], 1 / slack, 1e-4) &&
                   2 * live.width[0] + 2 * live.width[2] <= 1.0 / slack + 1e-9,
               "beside, cropped: the eye's shares equal (one scale renders it exactly), the focus beside within the width");
         const simqvfr::Views4Layout bigger = simqvfr::views4_live_one_size(l, 0.60, 0.60, 0.60);
@@ -227,34 +219,51 @@ int SIM_QVFR_TEST_MAIN() {
         // 1 / beside_scale() and the focus view still fits beside it.
         const simqvfr::Views4Layout uncropped = simqvfr::views4_live_one_size(l, 0.40, 0.38, 0.38, 1.0, 1.0);
         const double eyeScale = std::max(2 * uncropped.width[0], 2 * uncropped.height[0]);
-        check(near(eyeScale, 1 / (2.375 * slack)) && eyeScale + 2 * uncropped.width[2] <= 1.0 + 1e-9,
+        check(close_to(eyeScale, 1 / (2.375 * slack), 1e-4) && eyeScale + 2 * uncropped.width[2] <= 1.0 + 1e-9,
               "beside: the crop removed live: the eye's one scale unchanged, the focus beside");
         l.secondViewBeside = false;
-        check(near(l.layer_width(), 0.80 * slack) && near(l.layer_height(), 0.76 * slack) &&
-                  near(l.view_room_height(), 0.38 * slack),
+        check(close_to(l.layer_width(), 0.80 * slack, 1e-4) && close_to(l.layer_height(), 0.76 * slack, 1e-4) &&
+                  close_to(l.view_room_height(), 0.38 * slack, 1e-4),
               "twice each way: the layer twice as high too, one view at most half of each");
     }
     {  // Beside without a crop, the focus view narrower: the image twice the outer view each way, as before.
         simqvfr::Views4Layout l = simqvfr::views4_layout(0.40, 0.38, 0.38);
         l.secondViewRoom = l.secondViewBeside = true;
-        check(near(l.layer_width(), 0.80 * slack) && near(l.layer_height(), 0.80 * slack) &&
-                  near(l.outer_room_height(), 0.40),
+        check(close_to(l.layer_width(), 0.80 * slack, 1e-4) && close_to(l.layer_height(), 0.80 * slack, 1e-4) &&
+                  close_to(l.outer_room_height(), 0.40, 1e-4),
               "beside, no crop: the layer 0.80 x 0.80 (twice the eye each way), the eye's room the outer view");
         const simqvfr::Views4Layout live = simqvfr::views4_live_one_size(l, 0.40, 0.38, 0.38);
         const double eyeScale = std::max(2 * live.width[0], 2 * live.height[0]);
-        check(near(2 * live.width[0], 2 * live.height[0]) && near(eyeScale, 0.5 / slack) &&
-                  eyeScale + 2 * live.width[2] <= 1.0 + 1e-9 && near(2 * live.height[2], 0.475 / slack),
+        check(close_to(2 * live.width[0], 2 * live.height[0], 1e-4) && close_to(eyeScale, 0.5 / slack, 1e-4) &&
+                  eyeScale + 2 * live.width[2] <= 1.0 + 1e-9 && close_to(2 * live.height[2], 0.475 / slack, 1e-4),
               "beside, no crop: the eye half each way (its one scale wastes nothing), the focus 0.475 x 0.475 beside it");
         unsigned eye[2], focus[2];
         check(fits(l, live, 6812, 6502, eye, focus), "beside, no crop: the rounded passes fit side by side");
+    }
+    {  // 2026-11-16: focus density asked above the launch's (161% of a 25% box, launch 40% x 40% beside a 40% periphery, a
+       // 5190 x 4168 eye): capped at the room with its slack, the focus came out 2085 beside a 2076 eye in a 4160 target
+       // and multi-view rendering stopped. Capped, it stays the launch's focus size, and fits.
+        simqvfr::Views4Layout l = simqvfr::views4_layout(0.40, 0.40, 0.40);
+        l.secondViewRoom = l.secondViewBeside = true;
+        const simqvfr::Views4Fit fit = simqvfr::views4_fit_one_size(l, 0.40, 0.4025, 0.4025);
+        check(fit.focusCapped && fit.focus <= 0.40 + 1e-9 && fit.focusHeight <= 0.40 + 1e-9,
+              "above the launch: the focus capped at the launch's size, the layer's slack left free");
+        const simqvfr::Views4Layout live = simqvfr::views4_live_one_size(l, 0.40, 0.4025, 0.4025);
+        unsigned eye[2], focus[2];
+        const bool ok = fits(l, live, 5190, 4168, eye, focus);
+        check(ok, "above the launch: the rounded eye and focus passes still fit side by side");
+        if (!ok)
+            std::printf("  eye %ux%u focus %ux%u\n", eye[0], eye[1], focus[0], focus[1]);
+        const simqvfr::Views4Fit at = simqvfr::views4_fit_one_size(l, 0.40, 0.40, 0.40);
+        check(!at.focusCapped && std::fabs(at.focus - 0.40) < 1e-9, "at the launch size: not capped, unchanged");
     }
     {  // The 2026-11-09 Pimax report (issue 11): periphery 30%, focus 200% of a 20% x 20% box: focus 0.40 x 0.40 of a
        // 6812 x 6502 eye. The image was 0.80 x 0.60 (5449 x 3901): the eye rendered 2725 x 1951 (0.40 x 0.30, a third
        // wider than asked), and 2725 + 2725 overran 5449, so the eye's pass never drew its focus view.
         simqvfr::Views4Layout l = simqvfr::views4_layout(0.30, 0.40, 0.40);
         l.secondViewRoom = l.secondViewBeside = true;
-        check(near(l.beside_scale(), (0.70 / 0.30) * slack) && near(l.layer_width(), 0.70 * slack) &&
-                  near(l.layer_height(), 0.70 * slack),
+        check(close_to(l.beside_scale(), (0.70 / 0.30) * slack, 1e-4) && close_to(l.layer_width(), 0.70 * slack, 1e-4) &&
+                  close_to(l.layer_height(), 0.70 * slack, 1e-4),
               "issue 11: the image 0.70 x 0.70 of the eye (the eye and the focus view side by side, the outer view's shape)");
         const simqvfr::Views4Layout live = simqvfr::views4_live_one_size(l, 0.30, 0.40, 0.40);
         unsigned eye[2], focus[2];
@@ -296,20 +305,59 @@ int SIM_QVFR_TEST_MAIN() {
         const unsigned mainW = lmu::scaled_size(1562, 0.77f), mainH = lmu::scaled_size(1407, 0.77f);
         check(mainW == 1203 && mainH == 1084, "render scale 0.77: main targets 1203 x 1084, as the tester's log");
         const double ow = lmu::final_extent(860, mainW, 1562), oh = lmu::final_extent(774, mainH, 1407);
-        check(near(ow, 860.0 * 1562 / 1203) && near(oh, 774.0 * 1407 / 1084) && ow > 1116 && ow < 1117,
+        check(close_to(ow, 860.0 * 1562 / 1203, 1e-4) && close_to(oh, 774.0 * 1407 / 1084, 1e-4) && ow > 1116 && ow < 1117,
               "render scale 0.77: an outer view's 860 x 774 covers 1116.6 x 1004.6 of the eye target");
         check(lmu::final_texels(ow, 1562) == 1117 && lmu::final_texels(oh, 1407) == 1005,
               "render scale 0.77: its eye target's texels round up (1117 x 1005)");
         check(lmu::final_texels(lmu::final_extent(1203, mainW, 1562), 1562) == 1562 &&
                   lmu::final_texels(lmu::final_extent(1084, mainH, 1407), 1407) == 1407,
               "render scale 0.77: a focus view that rendered its whole main target covers the whole eye target");
-        check(near(860.0 / mainW, ow / 1562) && near(774.0 / mainH, oh / 1407),
+        check(close_to(860.0 / mainW, ow / 1562, 1e-4) && close_to(774.0 / mainH, oh / 1407, 1e-4),
               "render scale 0.77: a view's share of the eye target is its share of the main target");
         check(lmu::final_extent(860, 1562, 1562) == 860 && lmu::final_texels(860, 1562) == 860,
               "render scale 1: a view covers what it rendered (no change)");
         check(lmu::final_extent(860, 0, 1562) == 860, "main size not known yet: what it rendered");
         check(lmu::final_texels(3000, 1562) == 1562 && lmu::final_texels(0.2, 1562) == 1,
               "final texels: at most the target, at least one");
+    }
+
+    // Any game build (qvfr_frame.cpp "any build"): the eye projection from the FOV the game was handed, and the render
+    // scale from the main targets' size, agree with what the game's own would give.
+    {
+        const float t[4] = {static_cast<float>(l), static_cast<float>(r), static_cast<float>(d), static_cast<float>(u)};
+        float fromFov[16];
+        check(lmu::projection_from_tangents(t, fromFov) && lmu::projection_shape(fromFov),
+              "build-free: the projection from the FOV has the slots' shape");
+        const int at[4] = {0, 5, 8, 9};
+        bool same = true;
+        for (int i : at)
+            same = same && close_to(fromFov[i], eye[i], 1e-5);
+        check(same, "build-free: its m0, m5, m8, m9 are the game's projection's");
+        lmu::FocusBox a, b;
+        float fa[16], fb[16];
+        check(lmu::focus_projection(eye, 0.3, 0.25, 0.1, -0.05, a, fa) &&
+                  lmu::focus_projection(fromFov, 0.3, 0.25, 0.1, -0.05, b, fb),
+              "build-free: a focus box from either");
+        const lmu::ClipRemap ra = lmu::clip_remap(eye, fa), rb = lmu::clip_remap(fromFov, fb);
+        check(close_to(ra.a, rb.a, 1e-5) && close_to(ra.b, rb.b, 1e-5) && close_to(ra.c, rb.c, 1e-5) &&
+                  close_to(ra.d, rb.d, 1e-5) && close_to(a.rect[0], b.rect[0], 1e-6) && close_to(a.rect[3], b.rect[3], 1e-6),
+              "build-free: the same clip remap and box in the eye's image");
+        const float flat[4] = {0.5f, 0.5f, -1, 1};
+        float untouched[16] = {7};
+        check(!lmu::projection_from_tangents(flat, untouched) && untouched[0] == 7, "build-free: an empty FOV refused");
+
+        check(lmu::render_scale_from_sizes(1203, 1084, 1562, 1407) == 0.77f, "build-free: 1203 x 1084 of 1562 x 1407 is 0.77");
+        check(lmu::render_scale_from_sizes(1562, 1407, 1562, 1407) == 1.0f, "build-free: the recommended size is 1");
+        for (int p = 50; p <= 200; ++p) {
+            const float s = static_cast<float>(p) * 0.01f;
+            const unsigned w = lmu::scaled_size(2016, s), h = lmu::scaled_size(2224, s);
+            const float back = lmu::render_scale_from_sizes(w, h, 2016, 2224);
+            if (lmu::scaled_size(2016, back) != w || lmu::scaled_size(2224, back) != h) {
+                check(false, "build-free: every whole percent's sizes give a scale that makes them again");
+                break;
+            }
+        }
+        check(lmu::render_scale_from_sizes(0, 1084, 1562, 1407) == 0, "build-free: no sizes yet: 0");
     }
 
     std::printf(failures ? "lmu_focus_test: %d failure(s)\n" : "lmu_focus_test: ok\n", failures);

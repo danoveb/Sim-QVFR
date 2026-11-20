@@ -57,8 +57,11 @@ struct EyeComposition {
     // The visor: 0 auto (a tint when its image has no transparency, else blended as drawn), 1 always a tint
     // (the scene filtered by its colour, like glass), 2 always blended as drawn.
     int visorBlend;
-    // Sharpening (compose_shader.h's cas_sample, AMD's CAS): 0 off (the views resampled bilinear, as before), 1 the most.
+    // Sharpening of the focus view (compose_shader.h's cas_peak, AMD's CAS): CAS's own sharpness 0..1 (lobe -1/8..-1/5)
+    // above 0; 0 off (bilinear). The periphery is never sharpened.
     float sharpness = 0;
+    // Colour correction of the whole eye, periphery and focus alike (color_grade.h color_grade_constants): all 0 off.
+    float color[3] = {};
 };
 
 // The helmet as its own layer (helmet.h): the pieces, lit by the frame, drawn into a head-locked quad that
@@ -88,7 +91,10 @@ public:
     bool capture_outer(ID3D12Resource* appImage);
     bool has_outer() const { return outerValid_; }
     // Draws both eyes into `output` (a double-wide swapchain image), side by side.
-    bool compose(ID3D12Resource* focusImage, ID3D12Resource* output, const EyeComposition (&eyes)[2]);
+    // focusState: the focus image's state before and after (RENDER_TARGET for a swapchain image; the replay probe's focus
+    // image rests as a shader resource).
+    bool compose(ID3D12Resource* focusImage, ID3D12Resource* output, const EyeComposition (&eyes)[2],
+                 D3D12_RESOURCE_STATES focusState = D3D12_RESOURCE_STATE_RENDER_TARGET);
     // Draws the helmet layer into `target` (a kHelmetLayerFormat swapchain image in RENDER_TARGET state):
     // the frame's light (from the outer copy capture_outer made), then the pieces, premultiplied, with alpha
     // = how much of the scene they hide. False without pieces.
@@ -118,6 +124,7 @@ private:
         Com<ID3D12CommandAllocator> allocator;
         Com<ID3D12GraphicsCommandList> list;
         UINT64 fenceValue = 0;
+        Com<ID3D12Resource> keep[2];  // a timed-out copy's buffers, held until the GPU is past fenceValue
     };
     Slot* next_slot();
     bool submit(Slot& slot);
@@ -139,6 +146,7 @@ private:
     Com<ID3D12Fence> fence_;
     HANDLE fenceEvent_ = nullptr;
     UINT64 fenceCounter_ = 0;
+    bool gpuWaitLogged_ = false;  // next_slot's skipped frame, logged once
     UINT srvIncrement_ = 0, rtvIncrement_ = 0;
     Slot slots_[kSlots];
     UINT slotIndex_ = 0;

@@ -9,6 +9,9 @@
 #include "acc/adapter.h"
 #include "acc/game.h"
 #include "lmu/adapter.h"
+#include "scssoftware/adapter.h"
+#include "scssoftware/ats/game.h"
+#include "scssoftware/ets2/game.h"
 #include "lmu/game.h"
 
 #include "xplane/adapter.h"
@@ -60,10 +63,11 @@ GameAdapter& adapter_for(const GameInfo* game) {
         return ::xplane::adapter();
     if (game == &::lmu::kGame)
         return ::lmu::adapter();
-    // First rFactor 2 test: identify it and load the layer, but do not patch or hook rendering yet.
+    // rFactor 2: the layer measures and steers; the game renders QVFR itself in its own D3D11 pass.
     if (game == &::rf2::kGame)
         return ::rf2::adapter();
-    
+    if (game == &::ats::kGame || game == &::ets2::kGame)  // SCS Software's: QVFR at the D3D11 level
+        return ::scs::adapter(game);
     return none;
 }
 void early_load() {

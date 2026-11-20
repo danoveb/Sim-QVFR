@@ -11,7 +11,10 @@
 #include <dxgi.h>
 #include <shlobj.h>
 
-#include "json.h"
+#include "../json.h"
+#include "../lang.h"
+#include "../log_prefix.h"
+#include "../text.h"
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "shell32.lib")
@@ -22,15 +25,6 @@ namespace simqvfr::launcher {
 namespace fs = std::filesystem;
 
 namespace {
-
-std::wstring widen(const std::string& text) {
-    if (text.empty())
-        return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    std::wstring out(static_cast<size_t>(std::max(n, 0)), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), n);
-    return out;
-}
 
 // `format` with one number, at whatever length it comes to.
 std::wstring formatted(const wchar_t* format, double v) {
@@ -43,11 +37,6 @@ std::wstring formatted(const wchar_t* format, double v) {
 }
 
 std::wstring number(int v) { return std::to_wstring(v); }
-
-bool starts_with(const std::wstring& s, const wchar_t* prefix) { return s.rfind(prefix, 0) == 0; }
-bool ends_with(const std::wstring& s, const std::wstring& suffix) {
-    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
 
 struct Found {
     fs::path path;
@@ -178,10 +167,7 @@ std::wstring local_stamp(uint64_t ticks) {
     SYSTEMTIME utc{}, local{};
     if (!FileTimeToSystemTime(&ft, &utc) || !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local))
         return L"unknown";
-    wchar_t text[32];
-    swprintf_s(text, L"%04u%02u%02u-%02u%02u%02u", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute,
-               local.wSecond);
-    return text;
+    return file_stamp(local);
 }
 
 // The game's crash folders (any folder in `folder` holding a minidump or a CrashContext), newest first by their
@@ -232,7 +218,174 @@ std::string trimmed(std::string s) {
     return s;
 }
 
+// ---- The user's and computer's names out of the zip (redact_identity) ----
+
+// ASCII A-Z folded, byte by byte: the same on the data and on every pattern, so UTF-8 and UTF-16 match in any case
+// at the same offsets.
+std::string folded_copy(std::string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c + ('a' - 'A'));
+    return s;
+}
+
+// `text` as UTF-8, or as UTF-16LE bytes.
+std::string encoded(const std::wstring& text, bool wide) {
+    if (!wide)
+        return utf8(text);
+    std::string out;
+    for (const wchar_t ch : text) {
+        out += static_cast<char>(ch & 0xff);
+        out += static_cast<char>((ch >> 8) & 0xff);
+    }
+    return out;
+}
+
+// A letter, digit or '_' (or anything not ASCII) at `at`, one unit (1 byte, or 2 for UTF-16) long.
+bool word_unit(const std::string& d, size_t at, size_t unit) {
+    const auto c = static_cast<unsigned char>(d[at]);
+    if (unit == 2 && d[at + 1] != '\0')
+        return true;
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 0x80;
+}
+
+// `name` where `before` and `after` surround it (all folded and encoded alike); `bounded`: not inside a longer word
+// at an end with no context.
+struct NameForm {
+    std::string before, name, after;
+    bool bounded = true;
+};
+
+// Every match of `f` in `data` (`folded` its folded copy, kept in step): the name replaced by `as` (text), or with
+// `keepSize` (a minidump, whose offsets must hold) overwritten by '0's of its length.
+void redact_form(std::string& data, std::string& folded, const NameForm& f, size_t unit, const std::string& as,
+                 bool keepSize) {
+    if (f.name.empty())
+        return;
+    const std::string pattern = f.before + f.name + f.after;
+    const auto ok = [&](size_t at) {
+        if (f.before.empty() && at >= unit) {
+            if (f.bounded && word_unit(folded, at - unit, unit))
+                return false;
+            if (folded[at - unit] == '<' && (unit == 1 || folded[at - 1] == '\0'))
+                return false;  // a placeholder already ("<user>")
+        }
+        const size_t end = at + pattern.size();
+        return !(f.bounded && f.after.empty() && end + unit <= folded.size() && word_unit(folded, end, unit));
+    };
+    if (keepSize) {
+        for (size_t at = 0; (at = folded.find(pattern, at)) != std::string::npos;) {
+            if (!ok(at)) {
+                ++at;
+                continue;
+            }
+            const size_t begin = at + f.before.size(), end = begin + f.name.size();
+            for (size_t i = begin; i + unit <= end; i += unit) {
+                data[i] = folded[i] = '0';
+                if (unit == 2)
+                    data[i + 1] = folded[i + 1] = '\0';
+            }
+            at = end;
+        }
+        return;
+    }
+    // Text: built anew in one pass (a replace per match would move the rest of a large log each time).
+    std::string out, outFolded;
+    const std::string asFolded = folded_copy(as);
+    size_t copied = 0;
+    bool found = false;
+    for (size_t at = 0; (at = folded.find(pattern, at)) != std::string::npos;) {
+        if (!ok(at)) {
+            ++at;
+            continue;
+        }
+        found = true;
+        const size_t begin = at + f.before.size(), end = begin + f.name.size();
+        out.append(data, copied, begin - copied);
+        out += as;
+        outFolded.append(folded, copied, begin - copied);
+        outFolded += asFolded;
+        copied = at = end;
+    }
+    if (!found)
+        return;
+    out.append(data, copied, std::string::npos);
+    outFolded.append(folded, copied, std::string::npos);
+    data.swap(out);
+    folded.swap(outFolded);
+}
+
+// `folder` with `separator` between its parts and after the last: "C:\Users" -> "C:/Users/".
+std::wstring with_separators(const std::wstring& folder, const std::wstring& separator) {
+    std::wstring out;
+    for (const wchar_t ch : folder)
+        out += ch == L'\\' || ch == L'/' ? separator : std::wstring(1, ch);
+    return out + separator;
+}
+
+std::wstring environment_value(const wchar_t* name) {
+    const DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
+    if (n == 0)
+        return {};
+    std::wstring value(n, L'\0');
+    const DWORD got = GetEnvironmentVariableW(name, value.data(), n);
+    value.resize(got < n ? got : 0);
+    return value;
+}
+
 }  // namespace
+
+Identity current_identity() {
+    Identity who{environment_value(L"USERPROFILE"), environment_value(L"USERNAME"), environment_value(L"COMPUTERNAME")};
+    if (who.user.empty()) {
+        wchar_t name[257] = {};
+        DWORD size = static_cast<DWORD>(std::size(name));
+        if (GetUserNameW(name, &size))
+            who.user = name;
+    }
+    if (who.computer.empty()) {
+        wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        DWORD size = static_cast<DWORD>(std::size(name));
+        if (GetComputerNameW(name, &size))
+            who.computer = name;
+    }
+    return who;
+}
+
+std::string redact_identity(std::string data, const Identity& who, bool keepSize) {
+    if (data.empty() || (who.profile.empty() && who.user.empty() && who.computer.empty()))
+        return data;
+    std::string folded = folded_copy(data);
+    const fs::path profile(who.profile);
+    const std::wstring profileName = profile.filename().wstring(), profileParent = profile.parent_path().wstring();
+    // Paths as Windows, URLs and JSON write them.
+    const std::wstring separators[] = {L"\\", L"/", L"\\\\"};
+    for (const bool wide : {false, true}) {
+        const size_t unit = wide ? 2 : 1;
+        const auto enc = [&](const std::wstring& t) { return folded_copy(encoded(t, wide)); };
+        const std::string user = encoded(L"<user>", wide), computer = encoded(L"<computer>", wide);
+        // The profile folder first: its name can differ from the user name (a renamed account).
+        if (!profileName.empty() && !profileParent.empty())
+            for (const std::wstring& sep : separators)
+                redact_form(data, folded, {enc(with_separators(profileParent, sep)), enc(profileName), {}, true}, unit, user,
+                            keepSize);
+        if (!who.user.empty()) {
+            // A short name would match ordinary words: in paths and the environment only.
+            for (const std::wstring& sep : separators)
+                redact_form(data, folded, {enc(L"users" + sep), enc(who.user), enc(sep), false}, unit, user, keepSize);
+            redact_form(data, folded, {enc(L"username="), enc(who.user), {}, true}, unit, user, keepSize);
+            if (who.user.size() >= 4)
+                redact_form(data, folded, {{}, enc(who.user), {}, true}, unit, user, keepSize);
+        }
+        if (!who.computer.empty()) {
+            for (const wchar_t* key : {L"computername=", L"userdomain=", L"\\\\"})
+                redact_form(data, folded, {enc(key), enc(who.computer), {}, true}, unit, computer, keepSize);
+            if (who.computer.size() >= 4)
+                redact_form(data, folded, {{}, enc(who.computer), {}, true}, unit, computer, keepSize);
+        }
+    }
+    return data;
+}
 
 std::vector<ReportFile> report_files(const ReportSources& sources, uint64_t now) {
     constexpr uint64_t kDay = 24ull * 3600 * 10'000'000;
@@ -515,7 +668,7 @@ uint32_t crc32(const void* data, size_t size, uint32_t crc) {
     return ~crc;
 }
 
-std::wstring write_zip(const std::wstring& zip, const std::vector<ReportFile>& files) {
+std::wstring write_zip(const std::wstring& zip, const std::vector<ReportFile>& files, const Identity& who) {
     // Stored entries (method 0), names in UTF-8 (flag bit 11), all stamped with the time now (DOS time).
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -529,6 +682,9 @@ std::wstring write_zip(const std::wstring& zip, const std::vector<ReportFile>& f
             data = f.data;
         else if (!read_file(f.path, data))
             continue;  // gone or locked meanwhile: the rest still helps
+        // Every entry, whatever made it: the hang dumps too (MiniDumpWithHandleData names files under the profile).
+        const bool dump = f.name.size() >= 4 && _wcsicmp(f.name.c_str() + f.name.size() - 4, L".dmp") == 0;
+        data = redact_identity(std::move(data), who, dump);
         if (out.size() + data.size() > 0xffffffffull - (1u << 20))
             return L"too large for a zip";
         const std::string name = utf8(f.name);
@@ -658,70 +814,71 @@ SystemInfo system_info() {
     return info;
 }
 
-std::string utf8(const std::wstring& text) {
-    if (text.empty())
-        return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(std::max(n, 0)), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), n, nullptr, nullptr);
-    return out;
-}
-
 std::vector<Cause> likely_causes(const Settings& s, const RuntimeInfo& rt) {
     std::vector<Cause> out;
+    // Each cause in English (the report) and in the player's language (the launcher), from one template.
+    using Args = std::initializer_list<std::pair<const wchar_t*, std::wstring>>;
+    const auto add = [&out](const wchar_t* title, Args args, const wchar_t* fix) {
+        out.push_back({lang::fill(title, args), fix, lang::trf(title, args), lang::tr(fix)});
+    };
+    const auto percent = [](double v) { return formatted(L"%.0f", v); };
     const SessionInfo& session = rt.session;
     if (s.eyeTracking && rt.eyeTracker == EyeTracker::Missing)
-        out.push_back({L"Eye tracking is on, but the tracker sent nothing last session",
-                       L"The focus area stayed in the centre. Start the headset's eye tracking (and calibrate it) "
-                       L"before the game, or choose Fixed in Foveation."});
+        add(I18N(L"Eye tracking is on, but the tracker sent nothing last session"), {},
+            I18N(L"The focus area stayed in the centre. Start the headset's eye tracking (and calibrate it) "
+                 L"before the game, or choose Fixed in Foveation."));
     if (s.cheeky.load && (rt.cheekyStatus == L"missing" || rt.cheekyStatus == L"refused"))
-        out.push_back({L"Foveated DLSS did not start at the last launch (Cheeky " + rt.cheekyStatus + L")",
-                       rt.cheekyStatus == L"missing"
-                           ? L"Choose Cheeky's runtime (CheekyFoveatedDLSSRuntime.dll) in Foveated DLSS."
-                           : L"Cheeky's runtime refused to load: use the build the README lists, and check the session log."});
+        add(I18N(L"Foveated DLSS did not start at the last launch (Cheeky {status})"), {{L"status", rt.cheekyStatus}},
+            rt.cheekyStatus == L"missing"
+                ? I18N(L"Choose Cheeky's runtime (CheekyFoveatedDLSSRuntime.dll) in Foveated DLSS.")
+                : I18N(L"Cheeky's runtime refused to load: use the build the README lists, and check the session log."));
     if (rt.known() && readouts(s, rt).overRuntimeLimit)
-        out.push_back({L"The view is larger than the headset runtime allows",
-                       L"Lower the outer resolution or the focus density in Resolution."});
+        add(I18N(L"The view is larger than the headset runtime allows"), {},
+            I18N(L"Lower the outer resolution or the focus density in Resolution."));
     // The runtime composing (Pimax, Varjo): Sim-QVFR's focus area shows only inside the runtime's own focus views.
     if (s.mode == RenderMode::Qvfr && rt.quadViewsUsed && rt.quadFocusWidth > 0 && rt.quadFocusHeight > 0 &&
         (s.width > rt.quadFocusWidth + 1 || s.height > rt.quadFocusHeight + 1))
-        out.push_back({L"The focus area (" + std::to_wstring(s.width) + L"% × " + std::to_wstring(s.height) +
-                           L"%) is larger than the runtime's own focus region (" + std::to_wstring(rt.quadFocusWidth) +
-                           L"% × " + std::to_wstring(rt.quadFocusHeight) + L"%)",
-                       L"With the runtime composing the views (Pimax, Varjo), the focus area shows only inside its own "
-                       L"focus region; past it, the outer resolution shows. Make the runtime's focus area larger (Pimax "
-                       L"Play, Varjo Base), or Sim-QVFR's no larger than it, in Resolution."});
+        add(I18N(L"The focus area ({width}% × {height}%) is larger than the runtime's own focus region "
+                 L"({runtime_width}% × {runtime_height}%)"),
+            {{L"width", std::to_wstring(s.width)}, {L"height", std::to_wstring(s.height)},
+             {L"runtime_width", std::to_wstring(rt.quadFocusWidth)}, {L"runtime_height", std::to_wstring(rt.quadFocusHeight)}},
+            I18N(L"With the runtime composing the views (Pimax, Varjo), the focus area shows only inside its own "
+                 L"focus region; past it, the outer resolution shows. Make the runtime's focus area larger (Pimax "
+                 L"Play, Varjo Base), or Sim-QVFR's no larger than it, in Resolution."));
     if (rt.vramUsedMb > 0 && rt.vramBudgetMb > 0 && rt.vramUsedMb >= 0.9 * rt.vramBudgetMb)
-        out.push_back({formatted(L"VRAM was nearly full (%.0f%% of what Windows allows the game)", 100 * rt.vramUsedMb / rt.vramBudgetMb),
-                       L"Stutter and hitches follow when it runs out. Lower the outer resolution or the focus density, "
-                       L"or the game's texture quality."});
+        add(I18N(L"VRAM was nearly full ({percent}% of what Windows allows the game)"),
+            {{L"percent", percent(100 * rt.vramUsedMb / rt.vramBudgetMb)}},
+            I18N(L"Stutter and hitches follow when it runs out. Lower the outer resolution or the focus density, "
+                 L"or the game's texture quality."));
     if (!session.known())
         return out;
     if (session.layersBelow.find(L"MBUCCHIA_toolkit") != std::wstring::npos)
-        out.push_back({L"OpenXR Toolkit is loaded under Sim-QVFR",
-                       L"It adds about 0.8 ms to every frame's submission. If you don't use it for this game, switch it off in "
-                       L"OpenXR layers."});
+        add(I18N(L"OpenXR Toolkit is loaded under Sim-QVFR"), {},
+            I18N(L"It adds about 0.8 ms to every frame's submission. If you don't use it for this game, switch it off in "
+                 L"OpenXR layers."));
     if (session.limited == L"GPU")
-        out.push_back({formatted(L"The GPU was busy all the time (%.0f%%)", session.gpuBusy),
-                       L"This is the GPU's limit. Lower the outer resolution or the focus density, or the game's "
-                       L"graphics settings."});
+        add(I18N(L"The GPU was busy all the time ({percent}%)"), {{L"percent", percent(session.gpuBusy)}},
+            I18N(L"This is the GPU's limit. Lower the outer resolution or the focus density, or the game's "
+                 L"graphics settings."));
     double gameThread = 0;
-    for (const auto& [name, percent] : session.threads)
+    for (const auto& [name, busy] : session.threads)
         if (name == L"GameThread")
-            gameThread = percent;
+            gameThread = busy;
     if (session.limited.starts_with(L"CPU") || gameThread >= 90)
-        out.push_back({L"The game's CPU work limited the frame rate",
-                       L"QVFR lowers the GPU's work, not the CPU's. Lower the game's CPU-heavy settings (opponents, "
-                       L"mirrors, shadows)."});
+        add(I18N(L"The game's CPU work limited the frame rate"), {},
+            I18N(L"QVFR lowers the GPU's work, not the CPU's. Lower the game's CPU-heavy settings (opponents, "
+                 L"mirrors, shadows)."));
     if (session.halfRatePercent >= 1)
-        out.push_back({formatted(L"The headset runtime ran the game at half rate for %.0f%% of the session", session.halfRatePercent),
-                       L"When frames come close to the budget, the runtime's motion smoothing halves the frame rate for a "
-                       L"few seconds (Varjo does this). Turn motion smoothing off in the runtime's software (Varjo Base) to "
-                       L"compare, and give the CPU room: lower the game's CPU-heavy settings (opponents, mirrors, shadows)."});
+        add(I18N(L"The headset runtime ran the game at half rate for {percent}% of the session"),
+            {{L"percent", percent(session.halfRatePercent)}},
+            I18N(L"When frames come close to the budget, the runtime's motion smoothing halves the frame rate for a "
+                 L"few seconds (Varjo does this). Turn motion smoothing off in the runtime's software (Varjo Base) to "
+                 L"compare, and give the CPU room: lower the game's CPU-heavy settings (opponents, mirrors, shadows)."));
     else if (session.limited.starts_with(L"Pacing"))
-        out.push_back({formatted(L"%.0f%% of frames were late with neither the CPU nor the GPU full", session.latePercent),
-                       L"Often something else in the chain: another OpenXR layer, an overlay, or the runtime's motion "
-                       L"smoothing. Try with them off."});
+        add(I18N(L"{percent}% of frames were late with neither the CPU nor the GPU full"),
+            {{L"percent", percent(session.latePercent)}},
+            I18N(L"Often something else in the chain: another OpenXR layer, an overlay, or the runtime's motion "
+                 L"smoothing. Try with them off."));
     return out;
 }
 

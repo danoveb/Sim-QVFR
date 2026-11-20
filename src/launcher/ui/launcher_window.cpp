@@ -54,6 +54,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         // The window opens on Overview (docs/ui/OVERHAUL_PLAN.md §6.4); the top bar's status names what the launch checks
         // found (often a new day: a game update, Steam closed) and opens them. A tuning session keeps its page.
         show_tab(Tab::Overview);
+        if (fsr_pc())  // which AMD FSR this PC gets, for the FSR card
+            start_fsr_probe();
         if (app.s.updateCheck)
             start_update_check();
         else if (app.iniFound && !app.s.updateAsked)
@@ -73,6 +75,18 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         install_done(reinterpret_cast<InstallResult*>(lParam));
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+    case kRestoreDoneMessage:
+        restore_done(reinterpret_cast<InstallResult*>(lParam));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case kFsrProbedMessage: {
+        const std::unique_ptr<fsr::Offer> offer(reinterpret_cast<fsr::Offer*>(lParam));
+        app.fsrOffer = *offer;
+        app.fsrOffer.checked = app.fsrOffer.checked || !app.fsrOffer.why.empty();  // asked: not again
+        app.fsrProbing = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
     case kHashedMessage: {
         const std::unique_ptr<std::string> sha(reinterpret_cast<std::string*>(lParam));
         app.exeSha = *sha;
@@ -228,7 +242,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             app.dragging = kColorWheel;
             SetCapture(hwnd);
             set_color_from(x, y);
-        } else if (h->id == kMenuPanel || h->id == kOsdPanel) {
+        } else if (h->id == kMenuPanel || h->id == kOsdPanel || h->id == kClockPanel) {
             app.dragging = h->id;
             const float k = app.placeFrame.w / kRefFovX;
             const auto [yawOf, pitchOf] = placement_of(h->id);
@@ -253,7 +267,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         const float x = dip(lParam, false), y = dip(lParam, true);
         app.mouseX = x;
         app.mouseY = y;
-        if (app.dragging == kMenuPanel || app.dragging == kOsdPanel)
+        if (app.dragging == kMenuPanel || app.dragging == kOsdPanel || app.dragging == kClockPanel)
             set_panel_from(x, y);
         else if (app.dragging == kColorWheel)
             set_color_from(x, y);
@@ -392,7 +406,9 @@ int run_window(HINSTANCE instance, int show) {
     app.ini = settings_path();
     app.iniFound = GetFileAttributesW(app.ini.c_str()) != INVALID_FILE_ATTRIBUTES;
     app.themeChoice = read_theme_choice();  // before the window's first apply_theme
+    read_language();  // before anything is drawn or measured
     clean_update_folder(std::filesystem::path(app.ini).parent_path().wstring());  // what an install left but its backup
+    refresh_backup();                                                               // About's Go back
     if (app.iniFound) {
         // Per-game settings: a game without its own copy yet (the first start after the update, or a new game)
         // starts from the settings in use, so updating changes nothing until a game's settings are changed.

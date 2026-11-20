@@ -1,13 +1,17 @@
 #include "update_check.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
+#include <iterator>
 #include <cwctype>
 #include <vector>
 
 #include <windows.h>
 #include <winhttp.h>
 
-#include "json.h"
+#include "../json.h"
+#include "../lang.h"
 #include "launch_plan.h"
 
 namespace simqvfr::launcher {
@@ -35,6 +39,10 @@ std::vector<int> numbers(const std::wstring& version) {
 }  // namespace
 
 bool known_version(const std::wstring& version) { return !numbers(version).empty(); }
+
+bool skipped_release(const std::wstring& tag, const std::wstring& skip) {
+    return known_version(tag) && known_version(skip) && compare_versions(tag, skip) == 0;
+}
 
 int compare_versions(const std::wstring& a, const std::wstring& b) {
     const std::vector<int> x = numbers(a), y = numbers(b);
@@ -66,6 +74,18 @@ const json::Value* package_zip(const json::Value& release) {
 }
 
 }  // namespace
+
+bool trusted_release_page(const std::wstring& url) {
+    const size_t prefix = std::size(kReleasePagePrefix) - 1;
+    if (url.size() <= prefix || url.size() > 512 || url.compare(0, prefix, kReleasePagePrefix) != 0 ||
+        url.find(L"..") != std::wstring::npos)
+        return false;
+    // The path after the prefix: tag pages ("tag/v1.1.1-beta") and "latest"; no '%', '?', '#', '\\' or quotes.
+    return std::all_of(url.begin() + static_cast<std::ptrdiff_t>(prefix), url.end(), [](wchar_t c) {
+        return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'-' ||
+               c == L'_' || c == L'.' || c == L'/' || c == L'+';
+    });
+}
 
 bool newest_release(const std::string& text, Release& release) {
     json::Value root;
@@ -122,12 +142,13 @@ bool fetch_releases(std::string& body, std::wstring& error) {
             }
             ok = status == 200;
             if (!ok)
-                error = L"GitHub answered " + std::to_wstring(status);
+                error = lang::trf(L"GitHub answered {status}", {{L"status", std::to_wstring(status)}});
         } else {
-            error = L"GitHub could not be reached (error " + std::to_wstring(GetLastError()) + L")";
+            error = lang::trf(L"GitHub could not be reached (error {code})",
+                              {{L"code", std::to_wstring(GetLastError())}});
         }
     } else {
-        error = L"GitHub could not be reached";
+        error = lang::tr(L"GitHub could not be reached");
     }
     if (request)
         WinHttpCloseHandle(request);

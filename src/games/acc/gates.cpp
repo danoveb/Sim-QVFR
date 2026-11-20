@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "../../dev_build.h"
 #include "../../log.h"
 #include "../../probe/d3d11_capture.h"
 #include "../../probe/run_exit.h"
@@ -69,13 +70,6 @@ const char* state_label() {
 
 const char* tag() { return cfg.copies ? "acc copies" : "acc focus"; }
 
-std::wstring captures_folder() {
-    const std::filesystem::path dir = std::filesystem::path(simqvfr::log_directory()) / L"captures";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir.wstring();
-}
-
 // A rect of the image as its own picture.
 std::vector<std::uint8_t> crop(const GateImage& img, const GateRect& r) {
     std::vector<std::uint8_t> out(static_cast<std::size_t>(r.w) * r.h * 4);
@@ -87,7 +81,7 @@ std::vector<std::uint8_t> crop(const GateImage& img, const GateRect& r) {
 void save(const GateImage& img, const GateRect& r, const wchar_t* what, int eye) {
     wchar_t name[96];
     swprintf_s(name, L"\\%ls-frame%llu-%ls%d.png", cfg.copies ? L"acc-copies" : L"acc-focus", endFrames, what, eye);
-    const std::wstring path = captures_folder() + name;
+    const std::wstring path = simqvfr::captures_directory() + name;
     simqvfr::write_png_bgra(path, crop(img, r), static_cast<unsigned>(r.w), static_cast<unsigned>(r.h));
 }
 
@@ -188,7 +182,7 @@ void sample_focus(const GateImage& img, const GateRect (&views)[4], Sample& s) {
             save(img, views[eye], L"eye", eye);
             save(img, views[eye + 2], L"focus", eye);
             simqvfr::logf("acc focus: images in %ls: python tools/focus_compare.py <eye png> <focus png> %.5f %.5f %.5f %.5f",
-                          captures_folder().c_str(), box[0], box[1], box[2], box[3]);
+                          simqvfr::captures_directory().c_str(), box[0], box[1], box[2], box[3]);
         }
     }
 }
@@ -288,7 +282,7 @@ void gates_image(ID3D11Texture2D* image, const int (&rects)[4][4]) {
     const unsigned long long rendered = views_rendered_frames();
     if (!armed) {
         bool start = false;
-        if (cfg.hotkey) {
+        if (cfg.hotkey && simqvfr::kDevBuild) {  // the hotkey: development builds only (dev_build.h)
             const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
             const bool key = down(VK_CONTROL) && down(VK_MENU) && down('G');
             start = key && !keyHeld;
@@ -301,7 +295,7 @@ void gates_image(ID3D11Texture2D* image, const int (&rects)[4][4]) {
         armed = true;
         armedAt = rendered;
         simqvfr::logf("%s: frame %llu: samples counted from here (%s)", tag(), endFrames,
-                      cfg.hotkey ? "Ctrl+Alt+G" : "the first four-view frame");
+                      cfg.hotkey && simqvfr::kDevBuild ? "Ctrl+Alt+G" : "the first four-view frame");
     }
     const unsigned long long due = armedAt + static_cast<unsigned long long>(cfg.first) +
                                    static_cast<unsigned long long>(taken) * static_cast<unsigned long long>(cfg.every);

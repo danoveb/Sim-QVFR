@@ -15,17 +15,11 @@
 #include "engine/dxbc_patch.h"
 #include "games/lmu/mvr_pass.h"
 #include "games/lmu/mvr_probe.h"
+#include "test_util.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
-}
 
 int fake_two_views(ID3D11DeviceContext*, bool) { return 0; }
 
@@ -90,7 +84,7 @@ int SIM_QVFR_TEST_MAIN(int argc, char** argv) {
     char what[260];
     std::snprintf(what, sizeof(what), "%llu entries hooked (twenty with car slots, ExecuteCommandList among them)",
                   static_cast<unsigned long long>(lmu::mvr_pass_stats().contextEntries));
-    check(lmu::mvr_pass_stats().contextEntries == 20, what);
+    check(lmu::mvr_pass_stats().contextEntries == 21, what);
 
     // The game's resources: the scene's target and depth, another target, the per-draw buffer, two meshes, an index buffer.
     constexpr UINT W = 64, H = 32;
@@ -383,6 +377,5 @@ int SIM_QVFR_TEST_MAIN(int argc, char** argv) {
         check(ok && part[0] == 1 && part[1] == 1 && world[0] == 0 && world[1] == 0, what);
     }
     context->Flush();
-    std::printf("RESULT: %s\n", failures ? "FAIL" : "pass");
-    return failures ? 1 : 0;
+    return test_result();
 }

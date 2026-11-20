@@ -66,18 +66,49 @@ int text(HDC dc, HFONT font, const std::wstring& s, int left, int top, int right
     return size.cx;
 }
 
-// The card's alpha at a pixel: kCardAlpha inside the rounded rectangle, antialiased at its corners.
-uint8_t card_alpha(int x, int y) {
-    const double cx = std::clamp(x + 0.5, static_cast<double>(kRadius), static_cast<double>(kOsdWidth - kRadius));
-    const double cy = std::clamp(y + 0.5, static_cast<double>(kRadius), static_cast<double>(kOsdHeight - kRadius));
-    const double d = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
-    const double coverage = std::clamp(kRadius + 0.5 - d, 0.0, 1.0);
-    return static_cast<uint8_t>(std::lround(kCardAlpha * coverage));
+// The card's alpha at a pixel: kCardAlpha inside the rounded rectangle (width x height, corners of `radius`),
+// antialiased at its corners.
+uint8_t card_alpha(int x, int y, int width = kOsdWidth, int height = kOsdHeight, int radius = kRadius) {
+    return static_cast<uint8_t>(std::lround(kCardAlpha * panel_corner_coverage(x, y, width, height, radius)));
 }
+
+// sRGB byte -> linear, and linear -> sRGB byte.
+double srgb_to_linear(int v) {
+    const double c = v / 255.0;
+    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+}
+uint8_t linear_to_srgb(double l) {
+    const double c = l <= 0.0031308 ? l * 12.92 : 1.055 * std::pow(l, 1 / 2.4) - 0.055;
+    return static_cast<uint8_t>(std::lround(std::clamp(c, 0.0, 1.0) * 255));
+}
+
+// premultiplied[alpha][value]: an sRGB channel value times alpha in linear light, encoded sRGB again.
+struct PremultiplyTable {
+    uint8_t v[256][256];
+    PremultiplyTable() {
+        for (int a = 0; a < 256; ++a)
+            for (int c = 0; c < 256; ++c)
+                v[a][c] = a == 255 ? static_cast<uint8_t>(c) : linear_to_srgb(srgb_to_linear(c) * a / 255.0);
+    }
+};
 
 }  // namespace
 
-std::vector<uint32_t> draw_osd_panel(const OsdSummary& summary, const std::vector<double>& history,
+double panel_corner_coverage(int x, int y, int width, int height, int radius) {
+    const double cx = std::clamp(x + 0.5, static_cast<double>(radius), static_cast<double>(width - radius));
+    const double cy = std::clamp(y + 0.5, static_cast<double>(radius), static_cast<double>(height - radius));
+    const double d = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+    return std::clamp(radius + 0.5 - d, 0.0, 1.0);
+}
+
+uint32_t panel_rgba(uint32_t gdi, uint8_t alpha) {
+    static const PremultiplyTable table;  // built once (thread-safe), 64 KB
+    const uint8_t* t = table.v[alpha];
+    return t[(gdi >> 16) & 0xff] | (static_cast<uint32_t>(t[(gdi >> 8) & 0xff]) << 8) |
+           (static_cast<uint32_t>(t[gdi & 0xff]) << 16) | (static_cast<uint32_t>(alpha) << 24);
+}
+
+std::vector<uint32_t> draw_osd_panel(const OsdSummary& summary, const std::vector<OsdFrame>& history,
                                      const std::vector<OsdTile>& tiles, const std::vector<OsdRow>& rows,
                                      const OsdRow& badge, const std::wstring& clock) {
     std::vector<uint32_t> out(static_cast<size_t>(kOsdWidth) * kOsdHeight, 0);
@@ -130,7 +161,10 @@ std::vector<uint32_t> draw_osd_panel(const OsdSummary& summary, const std::vecto
         SIZE size{};
         GetTextExtentPoint32W(dc, badge.value.c_str(), static_cast<int>(badge.value.size()), &size);
         const int tile = (std::min)(2, static_cast<int>(tiles.size()) - 1);
-        const int right = kMargin + (tile + 1) * tileWidth - 20, left = right - static_cast<int>(size.cx) - 24;
+        // Inside its tile: a longer language's badge is cut with an ellipsis rather than run into the tile before.
+        const int tileLeft = kMargin + tile * tileWidth + (tile ? 24 : 0);
+        const int right = kMargin + (tile + 1) * tileWidth - 20,
+                  left = std::max(tileLeft, right - static_cast<int>(size.cx) - 24);
         const int top = tileTop - 4, bottom = tileTop + 28;
         const uint32_t colour = tone_colour(badge.tone, true);
         rounded(dc, left, top, right, bottom, bottom - top, badge.tone == OsdTone::Neutral ? kTrack : mix(kCard, colour, 0.22));
@@ -138,8 +172,9 @@ std::vector<uint32_t> draw_osd_panel(const OsdSummary& summary, const std::vecto
              DT_CENTER);
     }
 
-    // Frame times, newest on the right: one bar per frame, coloured by how it met the budget, and the
-    // budget as a line. The scale is two budgets (or the slowest frame).
+    // Frame times, newest on the right: one bar per frame, its height the frame time, its colour what the headset
+    // showed (green on its refresh, yellow one refresh missed, red more: osd_refreshes), and the budget as a line.
+    // The scale is two budgets (or the slowest frame).
     // The clock, if any, at its right end in the cells' value font, grey; the graph stops short of it.
     const int graphTop = tileTop + 142, graphBottom = graphTop + 60, graphLeft = kMargin;
     int graphRight = kOsdWidth - kMargin;
@@ -153,17 +188,21 @@ std::vector<uint32_t> draw_osd_panel(const OsdSummary& summary, const std::vecto
     }
     rounded(dc, graphLeft, graphTop, graphRight, graphBottom, 14, kTrack);
     if (!history.empty()) {
-        const double slowest = *std::max_element(history.begin(), history.end());
+        double slowest = 0;
+        for (const OsdFrame& f : history)
+            slowest = std::max(slowest, f.intervalMs);
         const double scale = std::max(summary.budgetMs > 0 ? 2 * summary.budgetMs : 0.0, slowest);
         const int inner = graphRight - graphLeft - 16, height = graphBottom - graphTop - 12;
         const size_t n = history.size();
         for (size_t i = 0; i < n && scale > 0; ++i) {
             const int left = graphLeft + 8 + static_cast<int>(inner * i / n);
             const int right = std::max(left + 1, graphLeft + 8 + static_cast<int>(inner * (i + 1) / n) - 1);
-            const int h = std::max(2, static_cast<int>(height * std::min(1.0, history[i] / scale)));
-            const double ratio = summary.budgetMs > 0 ? history[i] / summary.budgetMs : 1;
-            const uint32_t colour = ratio <= 1.05 ? kGreen : ratio <= 1.5 ? kYellow : kRed;
+            const int h = std::max(2, static_cast<int>(height * std::min(1.0, history[i].intervalMs / scale)));
+            const int refreshes = osd_refreshes(history[i], summary.budgetMs);
+            const uint32_t colour = refreshes <= 1 ? kGreen : refreshes == 2 ? kYellow : kRed;
             fill(dc, left, graphBottom - 6 - h, right, graphBottom - 6, mix(kTrack, colour, 0.8));
+            if (history[i].changed)  // a settings change: a full-height tick, to line a step up with what followed
+                fill(dc, left, graphTop + 4, left + 3, graphBottom - 4, kPrimary);
         }
         if (summary.budgetMs > 0 && scale > 0) {
             const int line = graphBottom - 6 - static_cast<int>(height * summary.budgetMs / scale);
@@ -205,17 +244,54 @@ std::vector<uint32_t> draw_osd_panel(const OsdSummary& summary, const std::vecto
         }
     }
     GdiFlush();
-    // GDI writes BGRx; the swapchain wants RGBA with the card's alpha.
+    // GDI writes BGRx; the swapchain wants RGBA with the card's alpha, premultiplied.
     const auto* src = static_cast<const uint32_t*>(bits);
     for (int py = 0; py < kOsdHeight; ++py)
         for (int px = 0; px < kOsdWidth; ++px) {
             const size_t i = static_cast<size_t>(py) * kOsdWidth + px;
-            const uint32_t p = src[i];
-            out[i] = ((p >> 16) & 0xff) | (p & 0xff00) | ((p & 0xff) << 16) | (static_cast<uint32_t>(card_alpha(px, py)) << 24);
+            out[i] = panel_rgba(src[i], card_alpha(px, py));
         }
     SelectObject(dc, previous);
     for (HFONT f : {labelFont, bigFont, unitFont, detailFont, valueFont, badgeFont})
         DeleteObject(f);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    return out;
+}
+
+std::vector<uint32_t> draw_clock_panel(const std::wstring& time) {
+    constexpr int kClockRadius = 28;
+    std::vector<uint32_t> out(static_cast<size_t>(kClockWidth) * kClockHeight, 0);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = kClockWidth;
+    bi.bmiHeader.biHeight = -kClockHeight;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!bitmap || !bits) {
+        if (dc)
+            DeleteDC(dc);
+        return out;
+    }
+    HGDIOBJ previous = SelectObject(dc, bitmap);
+    HFONT timeFont = CreateFontW(-64, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                 CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    SetBkMode(dc, TRANSPARENT);
+    fill(dc, 0, 0, kClockWidth, kClockHeight, kCard);
+    text(dc, timeFont, time, 16, 0, kClockWidth - 16, kClockHeight, kPrimary, DT_CENTER);
+    GdiFlush();
+    const auto* src = static_cast<const uint32_t*>(bits);
+    for (int py = 0; py < kClockHeight; ++py)
+        for (int px = 0; px < kClockWidth; ++px) {
+            const size_t i = static_cast<size_t>(py) * kClockWidth + px;
+            out[i] = panel_rgba(src[i], card_alpha(px, py, kClockWidth, kClockHeight, kClockRadius));
+        }
+    SelectObject(dc, previous);
+    DeleteObject(timeFont);
     DeleteObject(bitmap);
     DeleteDC(dc);
     return out;
@@ -261,8 +337,7 @@ std::vector<uint32_t> draw_notice_panel(const std::wstring& title, const std::ve
     for (int py = 0; py < kOsdHeight; ++py)
         for (int px = 0; px < kOsdWidth; ++px) {
             const size_t i = static_cast<size_t>(py) * kOsdWidth + px;
-            const uint32_t p = src[i];
-            out[i] = ((p >> 16) & 0xff) | (p & 0xff00) | ((p & 0xff) << 16) | (static_cast<uint32_t>(card_alpha(px, py)) << 24);
+            out[i] = panel_rgba(src[i], card_alpha(px, py));
         }
     SelectObject(dc, previous);
     DeleteObject(titleFont);

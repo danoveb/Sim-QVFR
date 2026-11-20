@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include "../ini_put.h"
+#include "../i18n.h"
 #include "dlss_settings.h"
 
 namespace simqvfr {
@@ -67,13 +68,14 @@ struct NrSettings {
     int maxGain = 300;
     // Diagnostics, [experiment] dlss_nr_save=N (not written back): N sets of pictures into the log folder, the first
     // half a second after it starts and then every ten: what the model got, what it gave back and the composed result,
-    // as PNG (each read back from the GPU: a hitch a set).
+    // as PNG (each read back from the GPU: a hitch a set). Only in a Detailed logs launch (nr_start).
     int saveFrames = 0;
     bool operator==(const NrSettings&) const = default;
 };
 
-inline constexpr DlssChoice kNrPresets[] = {{0, L"Default"}, {1, L"A (original)"}, {2, L"B (faster)"}};
-inline constexpr DlssChoice kNrStyles[] = {{0, L"Standard"}, {1, L"Natural"}, {2, L"Cinematic"}};
+inline constexpr DlssChoice kNrPresets[] = {
+    {0, I18N(L"Default")}, {1, I18N(L"A (original)")}, {2, I18N(L"B (faster)")}};
+inline constexpr DlssChoice kNrStyles[] = {{0, I18N(L"Standard")}, {1, I18N(L"Natural")}, {2, I18N(L"Cinematic")}};
 inline constexpr int kNrScaleMin = 25, kNrCoverageMin = 20, kNrEdgeMax = 30, kNrExposureMin = 25, kNrExposureMax = 400;
 inline constexpr int kNrLimitMin = 3, kNrLimitMax = 40;  // tenths of a megapixel a view
 inline constexpr int kNrGainMin = 110, kNrGainMax = 1000;

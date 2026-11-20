@@ -2,14 +2,17 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cwchar>
 #include <iterator>
 
 #include "../../log.h"
+#include "../../quad/qvfr_settings.h"
 #include "batch_watch.h"
 #include "dlss_extent.h"
 #include "double_render.h"
 #include "game.h"
+#include "replay_probe.h"
 #include "views3.h"
 #include "views4.h"
 
@@ -56,6 +59,13 @@ public:
     void qvfr_set_live(double focusFraction, double focusFractionY, double cullScale, bool gaze) override {
         simqvfr::views4_set_live(focusFraction, focusFractionY, cullScale, gaze);
     }
+    // The focus mask (quad/focus_mask.h) on the API path's focus views (replay_focus.cpp: drawn after their clear).
+    void qvfr_set_focus_mask(bool on, const float (&inset)[8], double cornerRadius, int marginTexels) override {
+        simqvfr::FocusArea area;
+        std::copy(std::begin(inset), std::end(inset), area.inset);
+        area.radius = area.corners() ? 0.0f : static_cast<float>(cornerRadius);
+        simqvfr::replay_probe_set_focus_mask(on, area, marginTexels > 0 ? static_cast<unsigned>(marginTexels) : 0u);
+    }
     bool qvfr_dlss_held() override { return simqvfr::views4_dlss_held(); }
     void qvfr_target_sizes(int (&render)[2], int (&output)[2]) override { simqvfr::views4_target_sizes(render, output); }
     bool qvfr_take_frame(Views4Frame& frame) override { return simqvfr::views4_take_frame(frame); }
@@ -70,7 +80,8 @@ public:
     void instance_created(const wchar_t* ini, const wchar_t* mode) override {
         views3_ = _wcsicmp(mode, L"views3") == 0;
         doubleRender_ = _wcsicmp(mode, L"double_render") == 0;
-        batchWatch_ = GetPrivateProfileIntW(L"experiment", L"batch_watch", 1, ini) != 0;
+        // (a hook in ACE's code, for the batch limit 4views' extra views could pass: 4views only by default)
+        batchWatch_ = GetPrivateProfileIntW(L"experiment", L"batch_watch", simqvfr::parse_render_mode(mode) == simqvfr::IniRenderMode::Qvfr ? 1 : 0, ini) != 0;
         if (views3_)  // before ACE creates its renderer, so renderer init sees the patched mode
             simqvfr::views3_patch();
     }

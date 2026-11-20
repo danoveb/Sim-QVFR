@@ -16,11 +16,13 @@
 #include "../engine/nr_settings.h"
 #include "../input/hotkeys.h"
 #include "../profile/profiles.h"
+#include "../quad/color_grade.h"
 #include "../quad/focus_offset.h"
 #include "../quad/focus_shape.h"
 #include "../quad/gaze_deadzone.h"
 #include "../quad/helmet.h"
 #include "../quad/osd.h"
+#include "../quad/qvfr_settings.h"
 #include "../quad/regulator_settings.h"
 
 namespace simqvfr::launcher {
@@ -31,32 +33,47 @@ enum class OutlineColor { Teal, Magenta, Green };
 struct Settings {
     RenderMode mode = RenderMode::Qvfr;
     bool eyeTracking = true;  // [quad] gaze: Eye tracked, or Fixed (centre)
-    int outer = 50;           // periphery_scale (QVFR) / eye_scale (Two-loop): percent of recommended
-    int inner = 100;          // focus_density (QVFR): focus pixel density, percent of recommended
-    int objectDetail = 100;   // object_detail (QVFR, X-Plane): object and tree LOD, percent of the focus views' (live)
-    // [quad] sharpen_percent (QVFR, a game with GameFeatures::sharpening: all four): CAS sharpening as the views are composed,
-    // 0 off (the default) to 100 the strongest (live).
-    int sharpen = 0;
+    int outer = kPeripheryScale.def;  // periphery_scale (QVFR) / eye_scale (Two-loop): percent of recommended
+    int inner = kFocusDensity.def;    // focus_density (QVFR): focus pixel density, percent of recommended
+    int objectDetail = kObjectDetail.def;  // object_detail (QVFR, X-Plane): object and tree LOD, percent of the focus views' (live)
+    // [quad] sharpen_percent (QVFR, a game with GameFeatures::sharpening: all four): CAS sharpening of the focus views as
+    // they are composed (CAS's own sharpness), 0 off (the default) to 100 the strongest (live).
+    int sharpen = kSharpenPercent.def;
+    // [quad] color_correction and its values (QVFR, a game with GameFeatures::sharpening; quad/color_grade.h): the
+    // headset image's exposure, brightness, contrast and saturation, off (the default) or on (live).
+    ColorGrade grade;
+    // [quad] eye_off (a game with GameFeatures::eyeOff: LMU; quad/eye_off.h): 0 both eyes on (the default), 1 the left
+    // eye off, 2 the right. The headset shows that eye black and the game renders little of it (live).
+    int eyeOff = 0;
     // [experiment] native_quad_views (QVFR, a game with GameFeatures::nativeQuadViews: LMU): on a Pimax or Varjo runtime,
     // the runtime composes the four views (layer/native_quad.cpp). 1 auto (the default), 0 off, 2 asked for even with
-    // another OpenXR layer between (the runtime's offer unknown). Next launch.
+    // another OpenXR layer between (the runtime's offer unknown). No control since 2026-11-16 (it was the Rendering
+    // card's Let the runtime compose): a 0 that card saved reads as auto once ([launcher] native_quad_reset), and a value
+    // set by hand after that is kept as it is. Next launch.
     int nativeQuad = 1;
-    int width = 39;           // focus_percent: foveated width, percent of the outer view
-    int height = 39;          // focus_height_percent: foveated height
+    int width = kFocusPercent.def;          // focus_percent: foveated width, percent of the outer view
+    int height = kFocusHeightPercent.def;   // focus_height_percent: foveated height
     bool outline = false;     // [quad] debug_border
-    OutlineColor color = OutlineColor::Teal;
-    int feather = 20;         // [quad] feather_percent: blend band, percent of the focus region
+    OutlineColor color = OutlineColor::Green;  // [quad] debug_border_color
+    int feather = kFeatherPercent.def;      // [quad] feather_percent: blend band, percent of the focus region
     int corner = 0;           // [quad] corner_radius_percent: corner radius, percent of half the shorter side
     FocusShape shape;         // [quad] focus_shape: the box (rounded by corner), or each corner pulled in on its own
+    // [quad] focus_mask and [experiment] focus_mask_margin (quad/focus_mask.h; a game with GameFeatures::focusMask):
+    // the focus views skip their pixels outside the shape; the readouts leave them out. Read only (the ini's own).
+    bool focusMask = kFocusMask.def != 0;
+    int focusMaskMargin = kFocusMaskMargin.def;
     FocusOffset offset;       // [quad] fixed_offset_y, gaze_offset_y: the focus region's vertical offset, degrees up
     int gazeDeadzone = kGazeDeadzoneDefault;  // [quad] gaze_deadzone: tenths of a degree the gaze moves before the region follows
     // The in-headset settings menu's place (the layer's MenuPlacement, src/quad/settings_menu.h): degrees
     // right and up of straight ahead, and the panel's width in degrees.
-    int menuYaw = 0;          // [menu] yaw
-    int menuPitch = -4;       // [menu] pitch
-    int menuWidth = 33;       // [menu] width
+    int menuYaw = -22;        // [menu] yaw
+    int menuPitch = -23;      // [menu] pitch
+    int menuWidth = 20;       // [menu] width
     bool hotkeyFooter = true; // [menu] hotkey_footer: the in-game hotkeys under the headset menu
+    // [cpu] isolate_main_thread (probe/cpu_isolation.h): the game's main thread gets a core to itself (live).
+    bool cpuIsolateMain = kCpuIsolateMain.def != 0;
     OsdPlacement osd;         // [osd]: the performance overlay, its corner and size (live)
+    ClockPlacement clock;     // [clock]: the clock's card, on or off, its place and size (live)
     // [regulator] (a game with GameFeatures::gpuRegulator: rFactor 2): Periphery and/or Focus density go down 1% at a time
     // while the GPU time per frame runs over a limit, and back up (never above the set values) while it runs under one (live).
     GpuRegulatorSettings regulator;
@@ -83,6 +100,9 @@ struct Settings {
     Hotkeys hotkeys = default_hotkeys();  // [hotkeys] (input/hotkeys.h; the Hotkeys pane): live
     // [launcher] baseline_next: the next launch runs without QVFR (ACE's own two views, measured), once.
     bool baselineNext = false;
+    // [launcher] debug_logs: launches left with detailed (debug) logs (Diagnostics pane, Detailed logs); each launch
+    // takes one, so a tester asked for detailed logs is back to normal ones without remembering to switch them off.
+    int debugLogs = 0;
     // [launcher] anticheat (Games pane, a game with GameInfo::antiCheatStart: LMU): start the game through its
     // anti-cheat's bootstrapper and run Sim-QVFR there too, at the user's risk. Next launch.
     bool antiCheat = false;
@@ -90,6 +110,9 @@ struct Settings {
     // user says otherwise: the first start asks once, and [launcher] update_asked keeps the answer from being asked again.
     bool updateCheck = false;
     bool updateAsked = false;
+    // [launcher] update_skip: a release the user chose to skip (About's Skip this version, or going back from it): the
+    // update check doesn't offer it (no badge); a newer one is offered again. Empty: none skipped.
+    std::wstring updateSkip;
     // The game tabs (Games pane; game_tabs.h), every game's, not per-game settings. An installed game has a tab unless
     // [launcher] hidden_games lists it; one that isn't installed has none unless [launcher] shown_games lists it (the
     // user gave it one). [launcher] color_<id>: a game's own colour (RRGGBB) in place of its built-in accent.
@@ -100,21 +123,27 @@ struct Settings {
 struct Range {
     int min, max;
 };
-inline constexpr Range kOuterRange{10, 100}, kInnerRange{50, 400}, kSizeRange{10, 100}, kFeatherRange{0, 50},
-    kCornerRange{0, 100}, kCropRange{0, 40}, kObjectDetailRange{0, 100},  // kCropRange: the layer's kCropMax
-    kSharpenRange{0, 100},
+// The shared table's (quad/qvfr_settings.h), as the sliders' ranges.
+constexpr Range range_of(const IniInt& k) { return {k.min, k.max}; }
+inline constexpr Range kOuterRange = range_of(kPeripheryScale), kInnerRange = range_of(kFocusDensity),
+    kSizeRange = range_of(kFocusPercent), kFeatherRange = range_of(kFeatherPercent), kCornerRange = range_of(kCornerRadiusPercent),
+    kCropRange = range_of(kCropTop), kObjectDetailRange = range_of(kObjectDetail), kSharpenRange = range_of(kSharpenPercent),
+    kColorExposureRange = range_of(kColorExposure), kColorBrightnessRange = range_of(kColorBrightness),
+    kColorContrastRange = range_of(kColorContrast), kColorSaturationRange = range_of(kColorSaturation),
     kFocusOffsetRange{-kFocusOffsetMax, kFocusOffsetMax}, kGazeDeadzoneRange{0, kGazeDeadzoneMax},
     kFocusCornerRange{0, kFocusCornerMax};
 // Dragging Inner resolution moves it in steps of this many percent, as the headset menu's Focus density does: its
 // 350 values span fewer pixels than that, so a plain drag skipped round values such as 100% (99, then 101).
-inline constexpr int kInnerDragStep = 5;
+inline constexpr int kInnerDragStep = kFocusDensity.step;
+// Detailed logs ([launcher] debug_logs): the launches they last once switched on.
+inline constexpr int kDebugLogLaunches = 3;
 // The GPU regulator's sliders (quad/regulator_settings.h): the limits in tenths of a ms, the frames before a step down and before a step up. Dragging a limit
 // moves it in steps of this many tenths (0.5 ms); the arrow keys move it by one (0.1 ms).
 inline constexpr Range kRegulatorMsRange{kRegulatorMsMin, kRegulatorMsMax},
     kRegulatorLowerFramesRange{kRegulatorLowerFramesMin, kRegulatorLowerFramesMax},
     kRegulatorRaiseFramesRange{kRegulatorRaiseFramesMin, kRegulatorRaiseFramesMax};
 inline constexpr int kRegulatorMsDragStep = 5;
-// Dragging Frames before raising (100-1000) moves it in steps of this many frames; the arrow keys move it by one.
+// Dragging Frames before raising (50-300) moves it in steps of this many frames; the arrow keys move it by one.
 inline constexpr int kRegulatorRaiseFramesDragStep = 10;
 // A slider's value at `share` (0..1) of its travel: on a grid of `step` from range.min, never past range.max.
 int slider_value_at(Range range, double share, int step = 1);
@@ -182,9 +211,13 @@ struct Size {
 };
 
 // The last session's measurements (runtime.ini's session_* keys, the layer's write_session_summary, updated
-// every ~10 s while ACE runs): for the Diagnostics pane and a summary users can paste. -1: not measured.
+// every ~10 s while ACE runs): for the Diagnostics pane and a summary users can paste. -1: not measured. They cover
+// the session's latest stint (quad/session_stint.h): the driving since the last settings change, the headset menu's
+// windows left out.
 struct SessionInfo {
     std::wstring time, mode, limited, layersBelow, log, cpuProfile;
+    int stint = 0;        // the stint's number in the session (1 the first; 0 a layer from before stints)
+    double seconds = -1;  // how long it ran, without the menu's windows
     double fps = -1, frameP50 = -1, frameP90 = -1, latePercent = -1, refreshHz = -1;
     double halfRatePercent = -1;  // the session's frames the runtime ran the game at half rate (or slower)
     double cpuMs = -1, gpuMs = -1, gpuBusy = -1, cores = -1, gazeMs = -1, layerMs = -1;
@@ -240,10 +273,14 @@ struct Readouts {
     double runtimePixels = 0;  // both eyes at the runtime's recommended size, as ACE renders without the layer
     double saved = 0;          // 1 - pixels / runtimePixels; negative when the layer renders more
     double focusDensity = 0;   // focus pixel density against recommended (horizontal)
+    double focusMasked = 0;    // the share of the focus views' pixels the focus mask skips (left out of `pixels`)
     double centerPpd = 0;      // the focus area's pixels per degree at its centre (0: not known yet)
     bool overRuntimeLimit = false;  // the offered eye is wider or taller than the runtime's maximum
 };
+// The chosen game (games::launcher_game) says whether it masks its focus views (GameFeatures::focusMask); the second
+// form says it outright (tests).
 Readouts readouts(const Settings& settings, const RuntimeInfo& runtime);
+Readouts readouts(const Settings& settings, const RuntimeInfo& runtime, bool gameMasksFocus);
 
 // VRAM at `settings` (QVFR), from the last launch's measurement: ACE's render targets that follow its
 // target scale with the target's area, the rest of its use stays. `mb` 0: not known (no QVFR launch yet,

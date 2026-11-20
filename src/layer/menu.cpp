@@ -9,24 +9,30 @@
 
 #include <dxgi1_4.h>
 
+#include "probe/frame_parts.h"
 #include "cheeky/cheeky_host.h"
 #include "cheeky/cheeky_settings.h"
 #include "engine/dlss_settings.h"
 #include "engine/ngx_dlss.h"
+#include "engine/nvapi_gpus.h"
 #include "engine/nr_settings.h"
 #include "games/adapter.h"
 #include "games/game.h"
 #include "ini_put.h"
 #include "input/hotkeys.h"
+#include "lang.h"
 #include "log.h"
 #include "profile/profiles.h"
 #include "quad/focus_turn.h"
 #include "quad/menu_panel.h"
 #include "quad/osd.h"
+#include "quad/output_density.h"
 #include "quad/session_graphics.h"
 #include "quad/settings_menu.h"
 #include "xr.h"
 #include "layer/layer.h"
+#include "probe/focus_ngx.h"
+#include "probe/hang_watch.h"
 
 namespace simqvfr::layer {
 
@@ -82,7 +88,8 @@ void menu_placement_changed(const MenuPlacement& placement) {
     live.menuPlacement = placement;
     menu_place(placement);
     logf("settings menu: moved to %d deg right, %d deg up, %d deg wide", placement.yaw, placement.pitch, placement.width);
-    if (experiment.views4 || experiment.quad || (game && game->measure_only()))
+    if (experiment.views4 || experiment.quad || experiment.replayCompose || game->shows_overlay() ||
+        (game && game->measure_only()))
         menu_open(qpc_now());
 }
 
@@ -100,7 +107,7 @@ std::wstring game_settings_ini(const std::wstring& settings) {
     const games::GameInfo* g = games::current_game();
     if (settings.empty() || !g)
         return settings;
-    return game_settings_target(settings, std::wstring(g->id, g->id + std::strlen(g->id)));
+    return game_settings_target(settings, games::wide_id(*g));
 }
 
 namespace {
@@ -173,6 +180,43 @@ void menu_open(int64_t now) {
                                  static_cast<int>(quad.nativeW), static_cast<int>(quad.nativeH), 0,
                                  experiment.eyeScale * 100};
         }
+        menu.model.launch.apiPath = experiment.replayCompose;
+        menu.model.launch.apiDlss = experiment.replayCompose && experiment.replayDlss != 0;
+        menu.model.launch.apiFocusScale = experiment.replayDlssFocusScale;
+        menu.model.dlssState.clear();
+        menu.model.colorState = v4d3d11.gradeState.load(std::memory_order_relaxed);  // the Color page's note
+        if (experiment.replayCompose) {  // what DLSS runs, read each time the menu is drawn
+            const focus_ngx::State d = focus_ngx::state();
+            // The panel's note (settings_menu.cpp menu_notes), in the player's language; never logged.
+            const auto letter = [](int preset) {
+                return preset > 0 && preset <= 26 ? std::wstring(1, static_cast<wchar_t>(L'A' + preset - 1))
+                                                  : std::wstring(lang::tr(L"default"));
+            };
+            static const wchar_t* const kModes[] = {I18N(L"Performance"), I18N(L"Balanced"), I18N(L"Quality"),
+                                                    I18N(L"Ultra Performance"), I18N(L"Ultra Quality"), L"DLAA"};
+            const std::wstring mode = d.gameQuality >= 0 && d.gameQuality <= 5 ? lang::tr(kModes[d.gameQuality]) : L"?";
+            if (!experiment.replayDlss) {
+                menu.model.dlssState = lang::tr(L"DLSS: off for the focus views (replay_dlss=0)");
+            } else if (!d.seen) {
+                menu.model.dlssState = lang::tr(L"DLSS: off in the game: periphery and focus without DLSS");
+            } else {
+                const bool dlaa = d.width == d.outWidth && d.height == d.outHeight;
+                const std::wstring focusMode =
+                    lang::tr(dlss_choice_name(kDlssFocusModes, experiment.replayDlssFocusScale));
+                if (!dlaa)  // the game renders its eyes smaller in its other modes, and the focus views with them
+                    menu.model.dlssState = lang::trf(
+                        L"Set the game's DLSS to DLAA (now {mode}): the focus mode is picked here", {{L"mode", mode}});
+                else if (d.focusRunning)
+                    menu.model.dlssState = lang::trf(L"DLSS: periphery DLAA preset {eye}, focus {mode} preset {preset}",
+                                                     {{L"eye", letter(d.eyePreset)}, {L"mode", focusMode},
+                                                      {L"preset", letter(d.focusPreset)}});
+                else
+                    menu.model.dlssState = lang::trf(L"DLSS: periphery DLAA preset {eye}, focus not running",
+                                                     {{L"eye", letter(d.eyePreset)}});
+            }
+        }
+        if (experiment.replayCompose)  // QVFR's own pages and items: the same [quad] keys drive this path
+            menu.model.launch.qvfr = true;
         menu.model.launch.cropWidth = l.cropWidth * 100;  // the launch crop
         menu.model.launch.cropHeight = l.cropHeight * 100;
         menu.model.launch.selfRendered = game && game->measure_only();  // RF2: the game renders QVFR, the menu steers it
@@ -182,24 +226,56 @@ void menu_open(int64_t now) {
         menu.model.launch.fgPage = features.frameGeneration;
         menu.model.launch.objectDetail = features.objectDetail;  // X-Plane only
         menu.model.launch.sharpening = features.sharpening;
+        menu.model.launch.eyeOff = features.eyeOff;
+        menu.model.launch.focusMask = features.focusMask;  // the pixels saved leave out what it skips (LMU)
         menu.model.launch.focusQuads = experiment.focusLayer == 2 && !nativeQuad.active;  // its test: the quads' distance
         menu.model.launch.runtimeComposes = nativeQuad.active;  // Pimax / Varjo: the box inside their focus region
         menu.model.launch.liveResolution = features.liveResolution;
+        if (experiment.replayCompose)
+            menu.model.launch.liveResolution = false;  // periphery and density: the next launch
+        if (game->shows_overlay()) {  // QVFR at the D3D11 level (ATS): the settings page, its sizes live
+            menu.model.launch.qvfr = true;
+            menu.model.launch.liveResolution = true;
+            menu.model.launch.cropPage = false;  // no view crop, helmet, focus shape or optimizer on this path
+            menu.model.launch.helmetPage = false;
+            menu.model.launch.shapePage = false;
+            menu.model.launch.optimize = false;
+        }
+        if (menu.model.launch.selfRendered) {  // RF2: no view crop, helmet, focus shape or optimizer (the game renders QVFR itself)
+            menu.model.launch.cropPage = false;
+            menu.model.launch.helmetPage = false;
+            menu.model.launch.shapePage = false;
+            menu.model.launch.optimize = false;
+        }
         // Sim-QVFR's own DLSS: a game with it, in QVFR on the multi-view path (the room beside each eye), in a build
         // with the NGX SDK.
         menu.model.launch.ownDlss = features.sideLoadedDlss && experiment.views4 &&
                                     experiment.views4Layout.secondViewRoom && ngx::built_in();
         menu.model.launch.sharpeningReady = menu.model.launch.ownDlss && experiment.textureSharpeningAtLaunch;
+        // AMD FSR in DLSS's place, an experiment (LMU's [experiment] lmu_fsr=1, games/lmu/adapter.cpp): the Upscaler row.
+        menu.model.launch.fsr = menu.model.launch.ownDlss && !live.ini.empty() &&
+                                GetPrivateProfileIntW(L"experiment", L"lmu_fsr", 0, live.ini.c_str()) != 0;
+        // No NVIDIA RTX card: AMD FSR runs those views (games/lmu/adapter.cpp), the page is FSR's.
+        menu.model.launch.fsrPc = menu.model.launch.ownDlss && nvapi::two_views_gpu() == nullptr;
         // DLSS-NR on those views: with the player's nvngx_dlssnr.dll where [dlss_nr] folder says (Sim-QVFR has none).
         {
             const std::wstring folder = read_nr_settings(live.ini.c_str()).folder;
             menu.model.launch.ownNr =
-                menu.model.launch.ownDlss && !folder.empty() &&
+                menu.model.launch.ownDlss && !menu.model.launch.fsrPc && !folder.empty() &&
                 GetFileAttributesW((folder + L"\\nvngx_dlssnr.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
         }
         {
             std::lock_guard guard(quad.mutex);
             menu.model.launch.helmetPieces = quad.helmetPiecesLoaded;
+            // The output's largest size (quad/output_density.h): the D3D12 chain is made once at launch.
+            double cap = 0;
+            if (experiment.composing() && !nativeQuad.active && experiment.focusLayer == 0) {
+                cap = output_density_cap(quad.nativeW, quad.nativeH, quad.maxW, quad.maxH,
+                                         experiment.outputDensityMax.load(std::memory_order_relaxed));
+                if (!experiment.views4ComposeD3D11 && quad.outChain)
+                    cap = std::min(cap, quad.outDensity.chainScale);
+            }
+            menu.model.launch.outputCap = cap * 100;
         }
         menu.model.launch.nativePpd = native_center_ppd();  // takes quad.mutex itself
         if (!optimize.optimizer.running()) {  // a finished run's detail is not kept over a reopen
@@ -211,7 +287,7 @@ void menu_open(int64_t now) {
         menu.visible = menu.dirty = true;
         log_line("settings menu: open");
     }
-    menu.hideAt = now + qpc_ms(kMenuHideMs);
+    menu.hideAt = now + qpc_ms(menu_hide_ms());
 }
 
 void menu_press(MenuKey key, int64_t now) {
@@ -219,7 +295,7 @@ void menu_press(MenuKey key, int64_t now) {
         menu_open(now);
         return;
     }
-    menu.hideAt = now + qpc_ms(kMenuHideMs);
+    menu.hideAt = now + qpc_ms(menu_hide_ms());
     menu.dirty = true;
     if (!menu_key(menu.model, key)) {
         menu_profile_use();
@@ -230,12 +306,18 @@ void menu_press(MenuKey key, int64_t now) {
         optimize.optimizer.cancel();
         log_line("optimize: stopped (a setting was changed)");
     }
-    {  // what was set, to check against what applies ("live:", "cheeky: settings applied")
-        const std::vector<MenuLine> lines = menu_lines(menu.model);
+    {  // what was set, to check against what applies ("live:", "cheeky: settings applied"); English in any language
+        const std::vector<MenuLine> lines = menu_lines(menu.model, false);
         const int i = menu.model.selected;
-        if (i >= 0 && i < static_cast<int>(lines.size()))
-            logf("settings menu: %ls: %ls -> %ls", menu_title(menu.model).c_str(), lines[i].label.c_str(),
-                 lines[i].value.c_str());
+        if (i >= 0 && i < static_cast<int>(lines.size())) {
+            // With its section (the launcher's card): a page has several "Horizontal" and "Size" lines.
+            std::wstring section;
+            for (int k = i; k >= 0 && section.empty(); --k)
+                if (lines[k].header)
+                    section = L" / " + lines[k].label;
+            logf("settings menu: %ls%ls: %ls -> %ls", menu_page_name(menu.model, false).c_str(), section.c_str(),
+                 lines[i].label.c_str(), lines[i].value.c_str());
+        }
     }
     // Written on the ini worker (off the render thread), to the ini the layer reloads and the launcher's
     // (the next launch starts from them); the live reload follows within a frame or two. Steps quicker than the
@@ -243,9 +325,10 @@ void menu_press(MenuKey key, int64_t now) {
     menu.lastWrite = ini_write_later([ini = live.ini, settings = menu.settingsIni, values = menu.model.values,
                      cheeky = menu.model.cheeky, qvfr = menu.model.launch.qvfr, detail = menu.model.launch.objectDetail,
                      quads = menu.model.launch.focusQuads, sharpening = menu.model.launch.sharpening,
-                     ownDlss = menu.model.launch.ownDlss, ownNr = menu.model.launch.ownNr,
+                     eyeOff = menu.model.launch.eyeOff,
+                     ownDlss = menu.model.launch.ownDlss || menu.model.launch.apiDlss, ownNr = menu.model.launch.ownNr,
                      selfRendered = menu.model.launch.selfRendered] {
-        write_menu_values(ini.c_str(), values, qvfr, detail, quads, sharpening, selfRendered);
+        write_menu_values(ini.c_str(), values, qvfr, detail, quads, sharpening, eyeOff, selfRendered);
         if (cheeky.available)
             write_cheeky_settings(ini.c_str(), cheeky.values, false);
         if (ownDlss)
@@ -254,7 +337,7 @@ void menu_press(MenuKey key, int64_t now) {
             write_nr_settings(ini.c_str(), values.nr);
         if (!settings.empty()) {
             const std::wstring target = game_settings_ini(settings);
-            write_menu_values(target.c_str(), values, qvfr, detail, quads, sharpening, selfRendered);
+            write_menu_values(target.c_str(), values, qvfr, detail, quads, sharpening, eyeOff, selfRendered);
             if (cheeky.available)
                 write_cheeky_settings(target.c_str(), cheeky.values, false);
             if (ownDlss)
@@ -263,6 +346,7 @@ void menu_press(MenuKey key, int64_t now) {
                 write_nr_settings(target.c_str(), values.nr);
             if (target != settings) {  // the panels' places and the overlay are every game's: the launcher's ini
                 write_osd_placement(settings.c_str(), values.overlay);
+                write_clock_placement(settings.c_str(), values.clock);
                 ini_put(settings.c_str(), L"menu", L"yaw", values.placement.yaw);
                 ini_put(settings.c_str(), L"menu", L"pitch", values.placement.pitch);
                 ini_put(settings.c_str(), L"menu", L"width", values.placement.width);
@@ -319,16 +403,29 @@ void menu_controllers(XrSession session, int64_t now) {
     bool toggle = false;
     XrVector2f stick{};
     {
-        std::lock_guard guard(gaze.mutex);
+        std::unique_lock guard(gaze.mutex, std::defer_lock);
+        {
+            FramePartTimer part(FramePart::gazeLock);
+            guard.lock();
+        }
         if (!gaze.attached || !gaze.menuToggle)
             return;
-        if (gaze.appSyncs == 0) {  // ACE never syncs actions: sync the layer's set alone
+        // The game syncs no actions (ACE, LMU): the layer's set needs syncing for its states to change. The gaze thread
+        // does that 250 times a second while it runs: its last sync is fresh enough for a menu button. Otherwise the
+        // menu syncs it itself, at most every kMenuSyncMs (a press or a push lasts far longer), not every frame.
+        constexpr int64_t kMenuSyncMs = 25;
+        const int64_t fresh = qpc_ms(kMenuSyncMs);
+        const bool threadSynced = gaze.threadSyncQpc && now - gaze.threadSyncQpc < fresh;
+        if (gaze.appSyncs == 0 && !threadSynced && (!gaze.menuSyncQpc || now - gaze.menuSyncQpc >= fresh)) {
+            FramePartTimer part(FramePart::actionSync);
             const XrActiveActionSet active{gaze.set, XR_NULL_PATH};
             XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
             sync.countActiveActionSets = 1;
             sync.activeActionSets = &active;
             next.SyncActions(session, &sync);
+            gaze.menuSyncQpc = now;
         }
+        FramePartTimer readPart(FramePart::actionRead);
         XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
         get.action = gaze.menuToggle;
         XrActionStateBoolean pressed{XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -374,7 +471,7 @@ void menu_controllers(XrSession session, int64_t now) {
 }
 
 bool menu_resources(XrSession session) {
-    if (!game->has_qvfr())  // log only: nothing of ours in the headset
+    if (!game->has_qvfr() && !game->shows_overlay())  // log only: nothing of ours in the headset
         return false;
     if (menu.chain)
         return true;
@@ -408,7 +505,7 @@ bool menu_resources(XrSession session) {
         return false;
     }
     XrCompositionLayerQuad& l = menu.layer;
-    l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied pixels (panel_rgba)
     l.space = menu.view;
     l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     l.subImage.swapchain = menu.chain;
@@ -445,20 +542,38 @@ void menu_render() {
     if (menu.model.launch.nativePpd <= 0)  // known once ACE has rendered a frame
         menu.model.launch.nativePpd = native_center_ppd();
     menu.model.launch.dlssHeld = experiment.views4 && game->qvfr_dlss_held();
-    const std::vector<uint32_t> pixels = draw_menu_panel(title, menu_resolution(menu.model), menu_stats(menu.model),
-                                                         menu_lines(menu.model),
-                                                         menu_notes(menu.model), hint, menu_subtitle(menu.model),
-                                                         menu.model.values.hotkeyFooter
-                                                             ? hotkey_footer(menu.model.values.helmet.on && experiment.composing())
-                                                             : L"");
+    {  // the helmet's images load when it is first turned on: its page follows (visor, size, height)
+        std::lock_guard guard(quad.mutex);
+        menu.model.launch.helmetPieces = quad.helmetPiecesLoaded;
+    }
+    menu_frame_line();
+    const MenuResolution resolution = menu_resolution(menu.model);
+    const std::vector<MenuLine> lines = menu_lines(menu.model);
+    const std::vector<std::wstring> notes = menu_notes(menu.model);
+    const std::wstring footer = menu.model.values.hotkeyFooter
+                                    ? hotkey_footer(menu.model.values.helmet.on && experiment.composing())
+                                    : L"";
+    // The list scrolls under the page switch to keep the selected line in view (menu_panel.h).
+    menu.model.scroll = menu_first_visible(
+        lines, menu.model.scroll,
+        menu_list_height(resolution.shown, notes.size() + (resolution.capped ? 1 : 0), !footer.empty()));
+    const std::vector<uint32_t> pixels =
+        draw_menu_panel(title, resolution, menu_stats(menu.model), lines, notes, hint, menu_subtitle(menu.model), footer,
+                        menu.model.frameLine, menu.model.frameBad, menu_tabs(menu.model), menu.model.page,
+                        menu.model.scroll);
     uint32_t index = 0;
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout = 100'000'000;
-    if (XR_FAILED(next.AcquireSwapchainImage(menu.chain, nullptr, &index)))
+    hang_watch_stage("menu panel: xrAcquireSwapchainImage");
+    // A timed-out wait leaves the image acquired, not waited for: not released, waited on again at the next draw.
+    if (acquire_wait(menu.chain, menu.pending, kImageWaitNs, 1, index, "menu panel: xrWaitSwapchainImage") != XR_SUCCESS) {
+        hang_watch_stage("menu panel: done");
         return;
-    const bool ok = XR_SUCCEEDED(next.WaitSwapchainImage(menu.chain, &wait)) && index < menu.images.size() &&
-                    menu.upload && menu.upload->upload(menu.images[index], pixels);
+    }
+    bool ok = index < menu.images.size() && menu.upload;
+    hang_watch_stage("menu panel: the upload");
+    ok = ok && menu.upload->upload(menu.images[index], pixels);
+    hang_watch_stage("menu panel: xrReleaseSwapchainImage");
     next.ReleaseSwapchainImage(menu.chain, nullptr);
+    hang_watch_stage("menu panel: done");
     if (ok) {
         menu.uploaded = true;
         menu.dirty = false;
@@ -474,7 +589,7 @@ const XrFrameEndInfo* menu_frame(XrSession session, const XrFrameEndInfo* info, 
     // The performance overlay also while measuring without QVFR (baseline=1), to compare the two; the settings
     // menu only with a method of the layer's (its settings would change nothing in mode=off), or for a game that
     // renders QVFR itself (RF2): its settings are live there too (live_ini.cpp), with the layer's menu to steer them.
-    const bool method = experiment.views4 || experiment.quad;
+    const bool method = experiment.views4 || experiment.quad || experiment.replayCompose || game->shows_overlay();
     const bool menuOn = method || (game && game->measure_only());
     if (live.ini.empty() || (!menuOn && !experiment.measure && !notice_pending()))
         return info;
@@ -491,23 +606,44 @@ const XrFrameEndInfo* menu_frame(XrSession session, const XrFrameEndInfo* info, 
     }
     const int64_t now = qpc_now();
     if (menuOn) {
-        menu_keyboard(now);
-        menu_controllers(session, now);
+        {
+            FramePartTimer part(FramePart::keyboard);
+            menu_keyboard(now);
+        }
+        {
+            FramePartTimer part(FramePart::controllers);
+            menu_controllers(session, now);
+        }
     }
-    if (method)
+    if (method) {
+        FramePartTimer part(FramePart::optimizer);
         optimize_tick(now);
+    }
     if (menu.visible && now >= menu.hideAt) {
         menu.visible = false;
         log_line("settings menu: hidden");
     }
     bool showMenu = menu.visible && menu_resources(session);
+    // A new language (the ini worker's follow_language, e.g. chosen in the launcher while the menu is open): redrawn in it.
+    static uint32_t languageDrawn = lang::generation();
+    if (const uint32_t g = lang::generation(); g != languageDrawn) {
+        languageDrawn = g;
+        menu.dirty = true;
+    }
     if (showMenu && menu.dirty)
         menu_render();
     showMenu = showMenu && menu.uploaded;
-    const XrCompositionLayerBaseHeader* card = osd_frame(session, now);
-    if (!showMenu && !card)
+    const XrCompositionLayerBaseHeader *card, *clock;
+    {
+        FramePartTimer part(FramePart::overlay);
+        card = osd_frame(session, now);
+        clock = clock_frame(session);
+    }
+    if (!showMenu && !card && !clock)
         return info;
     layers.assign(info->layers, info->layers + info->layerCount);
+    if (clock)
+        layers.push_back(clock);
     if (card)
         layers.push_back(card);
     if (showMenu)  // the menu over the card
@@ -527,6 +663,7 @@ void menu_shutdown() {
     menu.chain = XR_NULL_HANDLE;
     menu.view = XR_NULL_HANDLE;
     menu.images.clear();
+    menu.pending = {};
     menu.visible = menu.uploaded = menu.failed = false;
     menu.dirty = true;
 }

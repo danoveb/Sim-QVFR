@@ -29,6 +29,18 @@ struct GameFeatures {
     // Sim-QVFR's own DLSS for a game that ships none, "side-loaded" ([dlss], engine/dlss_settings.h, live): NGX called
     // at the API level on the game's views (engine/dlss_views.h); needs the multi-view path (LMU).
     bool sideLoadedDlss = false;
+    // QVFR through the D3D11 layer alone, the focus view drawn in each eye's pass (SCS Software's games:
+    // scssoftware/corner.h): by NVIDIA's multi-view rendering on an RTX 20 series or newer, by Sim-QVFR's own (instancing)
+    // elsewhere. It starts with the first frame that draws the world per eye: the menus and the garage show as without
+    // Sim-QVFR. The launcher says so (its Rendering card, the overview, the launch log); not multiView's layout.
+    bool layerMultiView = false;
+    // One eye off ([quad] eye_off, live; quad/eye_off.h): an accessibility option for a player who sees with one eye.
+    // The layer shows black in that eye for any game; a game with this also stops rendering most of it (LMU: no focus
+    // view, its scene cut to a few pixels, no DLSS on it). Offered in the launcher and the headset menu only with this.
+    bool eyeOff = false;
+    // The focus mask ([quad] focus_mask, live; quad/focus_mask.h): the focus views skip rendering their pixels outside the
+    // focus shape (pulled-in corners, rounding), so the launcher's and the headset menu's pixel counts leave them out.
+    bool focusMask = false;
     // The GPU regulator ([regulator], quad/regulator_settings.h, live): the game renders QVFR itself and the layer times its eye
     // passes, so it can take Periphery and Focus density down while frames run over a GPU time limit (rFactor 2).
     bool gpuRegulator = false;
@@ -67,7 +79,21 @@ struct GameInfo {
     // anticheat=1 the launcher starts the game through it and the layer runs as in any launch: Sim-QVFR patches game
     // code and the anti-cheat sees that as it is, so the user takes the risk of being kicked or banned.
     const wchar_t* antiCheatStart = nullptr;
+    // The sizes a fresh install starts this game with, in percent (0: the launcher's own defaults): the periphery's
+    // density, the focus views' density, the focus box's width and height. The launcher writes them into the game's
+    // first copy of the settings (settings.cpp); a copy that exists is left alone.
+    struct Defaults {
+        int periphery = 0, density = 0, focusWidth = 0, focusHeight = 0;
+    } defaults = {};
+    // QVFR runs on builds other than `builds` too (a game update, a beta branch), from what OpenXR and Direct3D show.
+    // The launcher then warns instead of saying Sim-QVFR stays off.
+    bool anyBuild = false;
 };
+
+// The game's id as the ini and the launcher's maps hold it (ids are ASCII: widened char by char).
+inline std::wstring wide_id(const GameInfo& game) {
+    return std::wstring(game.id, game.id + std::char_traits<char>::length(game.id));
+}
 
 // [launcher] anticheat=1 in the ini (the launcher's Games pane): the user runs Sim-QVFR with the game's anti-cheat.
 bool anticheat_chosen(const wchar_t* ini);

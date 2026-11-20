@@ -1,10 +1,7 @@
-#include "four_passes.h"
+#include "qvfr_frame.h"
 
 #include <windows.h>
 #include <d3d11.h>
-#include <intrin.h>
-
-#include <MinHook.h>
 
 #include <algorithm>
 #include <atomic>
@@ -21,8 +18,8 @@
 #include "../../engine/code_patch.h"
 #include "../../log.h"
 #include "../../probe/d3d11_capture.h"
-#include "../../probe/run_exit.h"
-#include "../../quad/d3d11_view_resample.h"
+#include "../../probe/frame_parts.h"
+#include "../../quad/eye_off.h"
 #include "../../sha256_file.h"
 #include "abi.h"
 #include "../../engine/dlss_math.h"
@@ -34,24 +31,16 @@
 #include "mvr_pass.h"
 #include "mvr_recovery.h"
 #include "mvr_probe.h"
-#include "tag_viewport.h"
+#include "qvfr_frame_internal.h"
 
 namespace lmu {
-namespace {
-
-using RenderSceneFn = void (*)(void* arg, char laterEye);
-using TargetFn = void* (*)(void* renderer);
-using SurfaceFn = void* (*)(void* texture, unsigned usage);
-using D3DObjectFn = void* (*)(void* surface);
-using HistoryCtorFn = void (*)(void* record);
-using SetDeltaTimeFn = long (*)(void* postEffect, float seconds);
-using MaskDrawFn = void (*)(void* mask, void* camera);
+namespace qvfr_frame_detail {
 
 bool installed = false;
-FourPassesRun cfg;           // the run's settings (four_passes.h)
+QvfrFrameRun cfg;           // the run's settings (qvfr_frame.h)
 bool qvfrMode = false;       // QVFR: four passes every frame, composed (no samples)
 // The frame capture hotkey (d3d11_capture_hotkey=1): the arm last acted on (capture_views), and as this frame's pass 0
-// read it (render_scene), so the views and the glare read back pass by pass are of one frame.
+// read it (pass_begin), so the views and the glare read back pass by pass are of one frame.
 std::uint64_t seenCaptureArm = 0;
 std::uint64_t frameCaptureArm = 0;
 bool capture_due(std::uint64_t arm) { return arm != seenCaptureArm && arm != 0 && arm != 0xFFFFFFFFull; }
@@ -62,18 +51,14 @@ bool capture_due(std::uint64_t arm) { return arm != seenCaptureArm && arm != 0 &
 std::mutex liveMutex;
 double focusFraction = 0.3;
 double focusFractionY = 0;
+// The focus mask as last set (qvfr_frame_set_focus_mask), handed to mvr_pass at each frame's pass 0.
+bool focusMaskOn = false;
+simqvfr::FocusArea focusMaskArea{};
+unsigned focusMaskMargin = 16;
 float gazeTan[2][2] = {};
 bool gazeValid[2] = {};
 
-// The eye loop's pass count, switched per frame: two (the stock loop, full frame rate) except in the short windows
-// before each sample, where four. It's the immediate of the tail stub's last `cmp edi, n`, in our own stub memory
-// (read-write-execute), written on the render thread between frames.
 unsigned long long sceneFrames = 0;  // frames that rendered the 3D scene (the eye loop ran)
-
-// Passes 2-3 render with YEBIS's frame time held near zero, so its auto exposure (one state for both eyes) isn't
-// advanced again by the extra passes: they use the exposure their eye just had, and a focus view can't pull it toward
-// its box. Not 0: YEBIS treats <= 0 as paused and divides by it elsewhere (docs/recon-lmu.md "[Post-effect time]").
-bool inPass = false;       // a pass of the eye loop is rendering (render thread)
 
 // QVFR: the mask's own FOV. VR_Init turns the runtime's mesh (tangents) into screen space with the FOV it just located,
 // so the mask fits only that FOV: after a live FOV crop change it would black out what the lens shows. Under liveMutex,
@@ -87,40 +72,77 @@ bool maskStaleLogged = false;
 int maskStaleThisFrame = 0;
 
 
-// The render thread's view of the frame (render_scene and frame_end both run on it; checked).
+// The render thread's view of the frame (pass_begin and frame_end both run on it; checked).
 unsigned long renderThread = 0;
-int pass = -1;  // this frame's pass, 0-3
+// xrEndFrame on another thread than the passes' (known once a pass ran): the immediate context is the render thread's,
+// so the frame end's context work waits for a frame end on it and the atlas isn't made (the eyes submitted alone).
+bool off_render_thread() { return renderThread && GetCurrentThreadId() != renderThread; }
 int passesThisFrame = 0;
 int eyeOfPass[4] = {-1, -1, -1, -1};
-unsigned long long frames = 0, fourPassFrames = 0, comparisons = 0;
-ID3D11Texture2D* copies[4] = {};
+unsigned long long frames = 0;
 
 std::uintptr_t base() { return simqvfr::module_base(); }
 
-ID3D11Texture2D* d3d_texture(void* textureObject) {
-    void* surface =
-        textureObject ? reinterpret_cast<SurfaceFn>(base() + kTextureSurface)(textureObject, kRenderTargetUsage) : nullptr;
-    auto* object = surface ? static_cast<IUnknown*>(reinterpret_cast<D3DObjectFn>(base() + kSurfaceD3D)(surface)) : nullptr;
-    if (!object)
-        return nullptr;
-    ID3D11Texture2D* result = nullptr;
-    ID3D11View* view = nullptr;
-    if (SUCCEEDED(object->QueryInterface(__uuidof(ID3D11View), reinterpret_cast<void**>(&view)))) {
-        ID3D11Resource* resource = nullptr;
-        view->GetResource(&resource);
-        view->Release();
-        if (resource) {
-            resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&result));
-            resource->Release();
-        }
-    } else {
-        object->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&result));
-    }
-    return result;  // AddRef'd
+// ---- The game's facts on any build ----
+// QVFR reads five facts of the game: the size it was offered, its render scale (its main targets' size), whether its FSR
+// is on, each eye's projection and the eye a pass rendered. On a build abi.h's addresses are from (knownBuild) they are
+// read there, as since the start; on any other build (a game update, the studio's beta or alpha branches) they come from
+// what the layer sees instead (buildFree): the size it offered at xrEnumerateViewConfigurationViews, the scene target a
+// pass binds, FSR's compute writes into the eye's image, the FOV the game was handed at xrLocateViews, and the passes'
+// order. [experiment] lmu_build_free=1 takes them that way on a known build too (the check of this path). On a known
+// build both are taken and compared (check_facts), so a run says whether the layer's agree with the game's.
+bool knownBuild = false;
+bool buildFree = false;
+std::atomic<std::uint32_t> offeredW{0}, offeredH{0};  // the stereo views' size the layer offered the game
+float gameFovTan[2][4] = {};  // the FOV the game was last handed (jitter included), tangents l r d u (under liveMutex)
+bool gameFovValid = false;
+bool fsrSeen = false;          // FSR's compute writes into an eye's image seen in the last frame with passes
+int fsrSeenFrames = 0;         // frames in a row whose writes said otherwise (two change it)
+std::string buildSha;
+
+bool exe_known_build() {
+    static const bool known = [] {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        buildSha = simqvfr::sha256_file(exe);
+        return simqvfr::games::supported_build(kGame, buildSha);
+    }();
+    return known;
 }
 
-// Eye e's render texture (the eye-texture array), AddRef'd.
-ID3D11Texture2D* eye_texture(int e) { return d3d_texture(*reinterpret_cast<void**>(base() + kEyeTextures + e * 8)); }
+// The comparison of the two sources on a known build (the log): each fact's checks and mismatches, the first of each
+// kind said with its values, a summary every 5400 checked frames (a minute at 90 Hz).
+struct FactCheck {
+    const char* name;
+    unsigned long long checks = 0, mismatches = 0;
+    int said = 0;
+};
+FactCheck factChecks[4] = {{"offered size"}, {"main targets' size"}, {"eye projection"}, {"FSR"}};
+unsigned long long factFrames = 0;
+
+void fact(int k, bool agree, const char* detail) {
+    FactCheck& c = factChecks[k];
+    ++c.checks;
+    if (agree)
+        return;
+    ++c.mismatches;
+    if (c.said < 3) {
+        ++c.said;
+        simqvfr::logf("lmu qvfr: frame %llu: build-free facts: the %s from the layer differs from the game's: %s%s", frames,
+                      c.name, detail, buildFree ? " (the layer's taken)" : " (the game's taken)");
+    }
+}
+
+void log_fact_checks(const char* when) {
+    if (!knownBuild || factFrames == 0)
+        return;
+    char text[256];
+    int n = 0;
+    for (const FactCheck& c : factChecks)
+        n += std::snprintf(text + n, sizeof(text) - n, "%s%s %llu of %llu", n ? ", " : "", c.name, c.checks - c.mismatches,
+                           c.checks);
+    simqvfr::logf("lmu qvfr: build-free facts %s: agree with the game's (%s)", when, text);
+}
 
 // The multi-view path's eye images, without calling the game's code: LMU's submit copies each eye's image into that eye's
 // swapchain image (CopySubresourceRegion), so at xrEndFrame the copy into the submitted image names eye e's
@@ -160,17 +182,38 @@ ID3D11Texture2D* game_eye_image(int e) {
 // ---- Focus views ----
 
 // The projection slots' 4x4 (focus_math.h): the camera update copies its eye's two into the camera each pass.
-float* slot_matrix(int eye, int kind) {
-    return reinterpret_cast<float*>(base() + (kind ? kEyeProjectionFar : kEyeProjection) + eye * kEyeSlotStride +
-                                    kSlotMatrix);
+const float* game_slot(int eye, int kind) {
+    return reinterpret_cast<const float*>(base() + (kind ? kEyeProjectionFar : kEyeProjection) + eye * kEyeSlotStride +
+                                          kSlotMatrix);
+}
+
+// The same from the FOV the game was handed (any build): what the focus maths read of it (focus_math.h
+// projection_from_tangents). False before the first.
+bool layer_slot(int eye, float (&out)[16]) {
+    float t[4];
+    {
+        std::lock_guard guard(liveMutex);
+        if (!gameFovValid)
+            return false;
+        std::memcpy(t, gameFovTan[eye], sizeof(t));
+    }
+    return projection_from_tangents(t, out);
+}
+
+// Eye `eye`'s projection (kind 0; 1 its slot with a fixed far plane: the same tangents): the game's slot on a known
+// build, the layer's on any other (both compared on a known build: kind 0, check_facts). False: none yet.
+bool slot_matrix(int eye, int kind, float (&out)[16]) {
+    if (buildFree)
+        return layer_slot(eye, out);
+    std::memcpy(out, game_slot(eye, kind), sizeof(out));
+    return true;
 }
 
 FocusBox boxes[2];
-float saved[2][2][16];
 bool shapeLogged = false;
 
-// MVR (lmu_mvr): both eyes' focus projections taken once at pass 0, so the focus view drawn in its eye's pass and the
-// one pass 2/3 renders use the same box (the gaze moves between them).
+// Both eyes' focus projections taken once at pass 0, so both eye passes and the frame's record use the same boxes (the
+// gaze moves between them).
 float frozenFocus[2][2][16];
 FocusBox frozenBox[2];
 ClipRemap frozenRemap[2];
@@ -191,7 +234,11 @@ bool focus_matrices(int eye, float (&eyeM)[2][16], float (&focusM)[2][16], Focus
         }
     }
     for (int k = 0; k < 2; ++k)
-        std::memcpy(eyeM[k], slot_matrix(eye, k), sizeof(eyeM[k]));
+        if (!slot_matrix(eye, k, eyeM[k])) {  // a build-free run before the game was handed a FOV
+            for (int j = 0; j < 2; ++j)
+                box[j] = FocusBox{};
+            return false;
+        }
     // A share of the eye's tangent span: on the gaze, kept inside the eye (QVFR), else on the eye's forward axis (gates).
     clamp_focus_centre(eyeM[0], fx, fy, cx, cy);
     bool ok = true;
@@ -236,11 +283,9 @@ void freeze_focus() {
 ID3D11Texture2D* atlas = nullptr;
 unsigned viewW = 0, viewH = 0;  // every view's size (the eye targets')
 DXGI_FORMAT atlasFormat = DXGI_FORMAT_UNKNOWN;
-bool eyesInAtlas = false;   // this frame's eyes are in the top row while the focus views use their targets
-bool frameFocusOk = false;  // this frame's focus passes rendered with their focus projections
-bool atlasReady = false;    // this frame's four views are in the atlas, until the layer takes it
+bool atlasReady = false;    // this frame's focus finals are both made, until the layer takes them into the atlas
 unsigned long long composedFrames = 0, refusedFrames = 0;
-bool atlasRefusalLogged = false, atlasThreadLogged = false;
+bool atlasRefusalLogged = false, atlasThreadLogged = false, frameEndThreadLogged = false;
 
 DXGI_FORMAT typeless_of(DXGI_FORMAT f) {
     switch (f) {
@@ -316,134 +361,12 @@ bool ensure_atlas(ID3D11Texture2D* eyeTexture) {
     return true;
 }
 
-// ---- QVFR: what the four passes cost ----
-// CPU: each pass's time on the render thread, wall clock and the thread's own CPU (its cycle counter), and this code's
-// own work in its hooks. GPU: timestamp queries around this code's copies, read back frames later without stalling.
-// Averages logged every 900 frames while the scene runs (four_passes_frame_end).
-double qpcPerMs = 0, tscPerMs = 0;
-long long calibQpc = 0;
-unsigned long long calibTsc = 0;
-
-double now_ms() {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    if (qpcPerMs == 0) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        qpcPerMs = static_cast<double>(f.QuadPart) / 1000.0;
-    }
-    return static_cast<double>(t.QuadPart) / qpcPerMs;
-}
-
-unsigned long long thread_cycles() {
-    ULONG64 c = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &c);
-    // The cycle counter's rate (TSC): calibrated against QPC over the first second.
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    if (calibQpc == 0) {
-        calibQpc = t.QuadPart;
-        calibTsc = __rdtsc();
-    } else if (tscPerMs == 0 && qpcPerMs > 0 && static_cast<double>(t.QuadPart - calibQpc) > 1000 * qpcPerMs) {
-        tscPerMs = static_cast<double>(__rdtsc() - calibTsc) / (static_cast<double>(t.QuadPart - calibQpc) / qpcPerMs);
-    }
-    return c;
-}
-
-struct CostWindow {
-    double passWallMs[4] = {}, passCpuCycles[4] = {}, hookCycles = 0;
-    double gpuMs[4] = {};  // spans: eyes set aside, focus 0 copied, focus 1 copied + eyes back, atlas filled
-    unsigned frames = 0, gpuFrames = 0;
-} costWindow;
-
-// GPU spans of one frame: a disjoint query around timestamp pairs, a ring of frames read back when done.
-struct GpuSpans {
-    static constexpr int kSlots = 4, kSpans = 4;
-    ID3D11DeviceContext* context = nullptr;
-    ID3D11Query* disjoint[kSlots] = {};
-    ID3D11Query* stamp[kSlots][kSpans][2] = {};
-    bool used[kSlots][kSpans] = {}, pending[kSlots] = {};
-    int slot = 0;
-    bool open = false, failed = false;
-
-    bool ready(ID3D11Texture2D* any) {
-        if (context)
-            return true;
-        if (failed || !any)
-            return false;
-        ID3D11Device* device = nullptr;
-        any->GetDevice(&device);
-        D3D11_QUERY_DESC dj{D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, ts{D3D11_QUERY_TIMESTAMP, 0};
-        bool ok = true;
-        for (int s = 0; s < kSlots; ++s) {
-            ok = ok && SUCCEEDED(device->CreateQuery(&dj, &disjoint[s]));
-            for (int k = 0; k < kSpans; ++k)
-                for (int w = 0; w < 2; ++w)
-                    ok = ok && SUCCEEDED(device->CreateQuery(&ts, &stamp[s][k][w]));
-        }
-        if (ok)
-            device->GetImmediateContext(&context);
-        device->Release();
-        failed = !ok;
-        if (!ok)
-            simqvfr::log_line("lmu qvfr cost: GPU timestamp queries unavailable: copies not timed");
-        return ok;
-    }
-    void collect(int s) {
-        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
-        if (context->GetData(disjoint[s], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
-            return;  // not done yet (or lost when the slot is reused)
-        pending[s] = false;
-        if (dj.Disjoint || dj.Frequency == 0)
-            return;
-        double ms[kSpans] = {};
-        for (int k = 0; k < kSpans; ++k) {
-            UINT64 b = 0, e = 0;
-            if (!used[s][k])
-                continue;
-            if (context->GetData(stamp[s][k][0], &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
-                context->GetData(stamp[s][k][1], &e, sizeof(e), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || e < b)
-                return;
-            ms[k] = static_cast<double>(e - b) * 1000.0 / static_cast<double>(dj.Frequency);
-        }
-        for (int k = 0; k < kSpans; ++k)
-            costWindow.gpuMs[k] += ms[k];
-        ++costWindow.gpuFrames;
-    }
-    void begin_frame() {
-        if (open)
-            end_frame();
-        for (int s = 0; s < kSlots; ++s)
-            if (pending[s])
-                collect(s);
-        slot = (slot + 1) % kSlots;
-        pending[slot] = false;
-        for (bool& u : used[slot])
-            u = false;
-        context->Begin(disjoint[slot]);
-        open = true;
-    }
-    void mark(int span, int which) {
-        if (!open)
-            return;
-        context->End(stamp[slot][span][which]);
-        used[slot][span] = true;
-    }
-    void end_frame() {
-        if (!open)
-            return;
-        context->End(disjoint[slot]);
-        open = false;
-        pending[slot] = true;
-    }
-} gpuSpans;
-
 // ---- QVFR: live resolution ----
-// Each pass renders into the top-left of its launch-size target at the eye render size its camera copied at the pass's
-// head (kEyeRenderSize, which VR_UpdateEyes sets once per frame from the render scale). So the size and the scale (which
-// the pass's post-processing reads) are set together at the end of the pass before: the focus share after pass 1, the
-// outer share after pass 3 (and so for the next frame's VR_UpdateEyes), each the game's own scale times the share
-// (four_passes_set_live_scales).
+// Nothing is written into the game: it renders its eye passes at its own render size (its render scale, read), and
+// mvr_pass.h mvr_size_cut cuts their viewports and scissors to the live eye size at the d3d11 level, the eye in the
+// top-left of its launch-size targets, its focus view beside it (docs/recon-lmu.md "Census run 3": nothing else in the
+// pass follows the size; YEBIS works on its whole targets at any size). The eye size is the game's own scale times the
+// outer share (qvfr_frame_set_live_scales), as the game itself would size a pass at that scale.
 // Two sizes per pass (focus_math.h final_extent): sceneW/sceneH, what it rendered of the main targets (the scene, the
 // resolve, YEBIS: glare share and MVR's side-by-side viewports work there); passW/passH, the part of its eye target
 // that holds its view after the final blit or FSR stretched the main target over it (the copies, the atlas regions, the
@@ -452,38 +375,124 @@ struct GpuSpans {
 float liveScale[2] = {1, 1};  // outer, focus (under liveMutex)
 float liveAxes[2][2] = {{1, 1}, {1, 1}};  // per axis (perAxis): outer, focus; width, height shares (under liveMutex)
 float gameScale = 0;          // the game's own render scale (its setting; what the launch-size targets were made with)
-float lastWritten = 0;        // what this code last wrote to it
 unsigned passW[4] = {}, passH[4] = {};
 unsigned sceneW[4] = {}, sceneH[4] = {};
 double extentW[4] = {}, extentH[4] = {};
 bool liveLogged = false, stretchLogged = false;
-
-// The runtime's recommended size as the game took it (VR_Init).
-void real_recommended(std::uint32_t (&out)[2]) {
+// The runtime's recommended size as the game took it (VR_Init): read in the game on a known build, else the size the
+// layer offered it (the same: the game takes what it is offered).
+void game_recommended(std::uint32_t (&out)[2]) {
     const auto* rec = reinterpret_cast<const std::uint32_t*>(base() + kRecommendedSize);
     out[0] = rec[0];
     out[1] = rec[1];
 }
+void real_recommended(std::uint32_t (&out)[2]) {
+    if (buildFree) {
+        out[0] = offeredW.load(std::memory_order_relaxed);
+        out[1] = offeredH.load(std::memory_order_relaxed);
+        return;
+    }
+    game_recommended(out);
+}
 
 // The main targets' size: the recommended size at the game's own render scale, as cubeDX11_CreateVRMainTargets makes
-// them; 0 x 0 before the game's scale is known.
+// them (build-free: the scene target the last pass began on, which is one of them); 0 x 0 before the game's scale is
+// known.
 void main_size(unsigned (&out)[2]) {
     out[0] = out[1] = 0;
     if (gameScale <= 0)
         return;
+    if (buildFree) {
+        mvr_scene_size(out[0], out[1]);
+        return;
+    }
     std::uint32_t rec[2];
     real_recommended(rec);
     out[0] = scaled_size(rec[0], gameScale);
     out[1] = scaled_size(rec[1], gameScale);
 }
 
+// The game's render scale: read on a known build; build-free, from its main targets' size over the recommended size
+// (focus_math.h render_scale_from_sizes). 0: not known yet.
+float game_render_scale() { return *reinterpret_cast<const float*>(base() + kRenderScale); }
+float layer_render_scale() {
+    unsigned m[2];
+    std::uint32_t rec[2] = {offeredW.load(std::memory_order_relaxed), offeredH.load(std::memory_order_relaxed)};
+    return mvr_scene_size(m[0], m[1]) ? render_scale_from_sizes(m[0], m[1], rec[0], rec[1]) : 0.0f;
+}
+
 // LMU's FSR 1 is on (its UpscaleMethod): each view's post-processing ends in FSR's upscale, not in the final blit.
-bool fsr_on() {
+// Build-free: FSR's compute writes into an eye's image seen (qvfr_frame_frame_end note_fsr), a frame late.
+bool game_fsr_on() {
     const auto* renderer = *reinterpret_cast<const std::uint8_t* const*>(base() + kRenderer);
     if (!renderer)
         return false;
     const auto* fsr = *reinterpret_cast<const std::uint8_t* const*>(renderer + kRendererFsr);
     return fsr && *reinterpret_cast<const int*>(fsr + kFsrMethod) != 0;
+}
+bool fsr_on() { return buildFree ? fsrSeen : game_fsr_on(); }
+
+// A frame end with both eye passes: whether FSR wrote an eye's image this frame; two frames in a row that say otherwise
+// change the build-free answer (one stray frame, a loading screen's, doesn't).
+void note_fsr(bool passes) {
+    const bool written = mvr_fsr_written();
+    if (!passes)
+        return;
+    if (knownBuild) {
+        const bool game = game_fsr_on();
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "the layer saw FSR %s, the game's setting says %s", written ? "on" : "off",
+                      game ? "on" : "off");
+        fact(3, written == game, detail);
+    }
+    if (written == fsrSeen) {
+        fsrSeenFrames = 0;
+        return;
+    }
+    if (++fsrSeenFrames < 2)
+        return;
+    fsrSeenFrames = 0;
+    fsrSeen = written;
+    if (buildFree)
+        simqvfr::logf("lmu qvfr: frame %llu: FSR %s (its compute writes into the eye's image %s): from the next frame",
+                      frames, written ? "on" : "off", written ? "seen" : "gone");
+}
+
+// Pass 0 on a known build: the layer's facts against the game's (the log; nothing changes with them).
+void check_facts() {
+    if (!knownBuild)
+        return;
+    ++factFrames;
+    std::uint32_t game[2], layer[2] = {offeredW.load(std::memory_order_relaxed), offeredH.load(std::memory_order_relaxed)};
+    game_recommended(game);
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "layer %ux%u, game %ux%u", layer[0], layer[1], game[0], game[1]);
+    fact(0, layer[0] == game[0] && layer[1] == game[1], detail);
+    unsigned scene[2];
+    const float scale = game_render_scale();
+    if (mvr_scene_size(scene[0], scene[1]) && scale > 0) {
+        const unsigned want[2] = {scaled_size(game[0], scale), scaled_size(game[1], scale)};
+        const float layerScale = render_scale_from_sizes(scene[0], scene[1], layer[0], layer[1]);
+        std::snprintf(detail, sizeof(detail), "scene target %ux%u (scale %.4f), the game's scale %.4f makes %ux%u", scene[0],
+                      scene[1], layerScale, scale, want[0], want[1]);
+        fact(1, scene[0] == want[0] && scene[1] == want[1] && layerScale == scale, detail);
+    }
+    for (int e = 0; e < 2; ++e) {
+        float mine[16];
+        if (!layer_slot(e, mine))
+            continue;
+        const float* theirs = game_slot(e, 0);
+        const int at[4] = {0, 5, 8, 9};
+        float worst = 0;
+        for (int i : at)
+            worst = (std::max)(worst, std::fabs(mine[i] - theirs[i]));
+        std::snprintf(detail, sizeof(detail),
+                      "eye %d: m0 %.5f/%.5f m5 %.5f/%.5f m8 %.5f/%.5f m9 %.5f/%.5f (layer/game; largest gap %.2g)", e,
+                      mine[0], theirs[0], mine[5], theirs[5], mine[8], theirs[8], mine[9], theirs[9], worst);
+        fact(2, worst < 1e-4f, detail);
+    }
+    if (factFrames % 5400 == 0)
+        log_fact_checks("so far");
 }
 
 // Pass p's part of its eye target from what it rendered of the main targets (passW from sceneW), at most the target.
@@ -502,27 +511,64 @@ void set_final_size(int p) {
         extentH[p] = viewH;
 }
 
-int probe_active();  // the render scale probe owns the scale (below)
+bool plain_now();  // the eyes at the game's own size meanwhile (mvr_recovery.h; below)
 
-// At a pass's start: the size its camera copied (what it renders), and the game's own scale (first seen, or changed by
-// the game: its video settings).
+// ---- One eye off ([quad] eye_off, quad/eye_off.h; GameFeatures::eyeOff) ----
+// The setting as each frame's pass 0 reads it, so both passes of a frame agree. That eye's pass draws no focus view,
+// its scene is cut to kOffEyeSize square in the corner (mvr_size_cut: its pixels' work gone; its draws, the
+// post-processing over its targets and the game's own CPU stay), DLSS leaves it out (mvr_eye_off), and the frame is
+// QVFR's with the other eye's focus final alone (after_two_passes). The layer shows black in that eye (eye_off.cpp).
+constexpr unsigned kOffEyeSize = 16;
+int frameEyeOff = simqvfr::kEyeOffNone;
+int loggedEyeOff = simqvfr::kEyeOffNone;
+unsigned long long offEyePasses = 0;  // eye passes rendered off since the session began (the log)
+void eye_off_frame_begin() {
+    const int eye = simqvfr::eye_off();
+    frameEyeOff = eye;
+    mvr_eye_off(eye);
+    if (eye != loggedEyeOff) {
+        loggedEyeOff = eye;
+        simqvfr::logf("lmu qvfr: frame %llu: %s%s (%llu eye passes rendered off so far)", frames,
+                      simqvfr::eye_off_name(eye),
+                      eye == simqvfr::kEyeOffNone
+                          ? ""
+                          : ": its pass with no focus view, its scene cut to 16x16, no DLSS on it (the headset shows it "
+                            "black)",
+                      offEyePasses);
+    }
+}
+bool off_pass(int p) { return p < 2 && p == frameEyeOff; }
+
+// At a pass's start: the game's own scale (first seen, or changed by the game: its video settings) and the size the pass's
+// eye is cut to (the whole of the main targets while recovery shows the eyes alone).
 void qvfr_before_pass(int p) {
     if (p >= 4)
         return;
-    const float scale = *reinterpret_cast<const float*>(base() + kRenderScale);
-    if (!probe_active() && (gameScale <= 0 || (lastWritten > 0 && scale != lastWritten))) {
+    if (p == 0)
+        check_facts();
+    const float scale = buildFree ? layer_render_scale() : game_render_scale();
+    if (scale > 0 && scale != gameScale) {
         if (gameScale > 0)
             simqvfr::logf("lmu qvfr: frame %llu: the game's render scale changed (%.3f -> %.3f): live scales from it",
                           frames, gameScale, scale);
         gameScale = scale;
-        lastWritten = 0;
         stretchLogged = false;
     }
-    const auto* size = reinterpret_cast<const float*>(base() + kEyeRenderSize);
     unsigned m[2];
     main_size(m);
-    sceneW[p] = size[0] >= 1 ? static_cast<unsigned>(size[0]) : 1u;
-    sceneH[p] = size[1] >= 1 ? static_cast<unsigned>(size[1]) : 1u;
+    sceneW[p] = m[0] ? m[0] : 1u;
+    sceneH[p] = m[1] ? m[1] : 1u;
+    if (gameScale > 0 && m[0] && m[1] && !plain_now()) {
+        float share;
+        {
+            std::lock_guard guard(liveMutex);
+            share = liveScale[0];
+        }
+        std::uint32_t rec[2];
+        real_recommended(rec);
+        sceneW[p] = scaled_size(rec[0], gameScale * share);
+        sceneH[p] = scaled_size(rec[1], gameScale * share);
+    }
     if (m[0] && m[1]) {
         sceneW[p] = std::min(sceneW[p], m[0]);
         sceneH[p] = std::min(sceneH[p], m[1]);
@@ -544,127 +590,42 @@ void qvfr_before_pass(int p) {
 // The focus views stopped coming (mvr_recovery.h): the eyes at full resolution meanwhile, a try again after a wait. No
 // fallback for the session from it.
 MvrRecovery recovery;
+bool plain_now() { return cfg.trackerDrives && recovery.plain(); }
 int recoveryLogged = 0;
 unsigned long long eyesOnlyRun = 0;  // scene frames in a row without focus views (the overlay's badge)
 // A frame with eye passes but no four views: the part of each eye's image its pass rendered (the top-left, at the live
-// resolution), which the layer submits in place of the whole image (four_passes_eye_extent).
+// resolution), which the layer submits in place of the whole image (qvfr_frame_eye_extent).
 bool eyeExtentReady = false;
 unsigned eyeExtent[2][2] = {};
-
-// The next passes' size: render scale and eye render size, the game's own scale times the outer (which = 0) or focus
-// share. At the end of pass 1 (focus) and pass 3 (outer: also what the next frame's VR_UpdateEyes computes).
-void set_next_passes(int which) {
-    if (probe_active() || gameScale <= 0)
-        return;
-    // Plain (mvr_recovery.h): the eyes at the game's own size, the whole of their targets, until the next try.
-    if (cfg.trackerDrives && recovery.plain()) {
-        *reinterpret_cast<float*>(base() + kRenderScale) = gameScale;
-        lastWritten = gameScale;
-        const auto* recommended = reinterpret_cast<const std::uint32_t*>(base() + kRecommendedSize);
-        auto* size = reinterpret_cast<float*>(base() + kEyeRenderSize);
-        size[0] = static_cast<float>(scaled_size(recommended[0], gameScale));
-        size[1] = static_cast<float>(scaled_size(recommended[1], gameScale));
-        return;
-    }
-    // The focus passes beside their eyes (perAxis): their post-processing at the one scale that covers them (YEBIS
-    // processes the top-left at the render scale on both axes, whatever the render size says: 2026-11-08 09:28 run),
-    // their own width and height recorded (the region their eye's pass drew; they skip the scene, gate D).
-    if (cfg.perAxis && which == 1) {
-        float sw, sh, share;
-        {
-            std::lock_guard guard(liveMutex);
-            sw = liveAxes[1][0];
-            sh = liveAxes[1][1];
-            share = liveScale[1];
-        }
-        const float written = gameScale * share;
-        *reinterpret_cast<float*>(base() + kRenderScale) = written;
-        lastWritten = written;
-        std::uint32_t rec[2];
-        real_recommended(rec);
-        auto* size = reinterpret_cast<float*>(base() + kEyeRenderSize);
-        size[0] = static_cast<float>(scaled_size(rec[0], gameScale * sw));
-        size[1] = static_cast<float>(scaled_size(rec[1], gameScale * sh));
-        return;
-    }
-    float share;
-    {
-        std::lock_guard guard(liveMutex);
-        share = liveScale[which];
-    }
-    const float written = gameScale * share;
-    *reinterpret_cast<float*>(base() + kRenderScale) = written;
-    lastWritten = written;
-    const auto* recommended = reinterpret_cast<const std::uint32_t*>(base() + kRecommendedSize);
-    auto* size = reinterpret_cast<float*>(base() + kEyeRenderSize);
-    size[0] = static_cast<float>(scaled_size(recommended[0], written));
-    size[1] = static_cast<float>(scaled_size(recommended[1], written));
-}
 
 // ---- MVR (lmu_mvr, mvr_pass.h): passes 0-1 draw their focus views beside the eye ----
 
 bool mvrInstalled = false;
-// The eye passes' room check (mvr_before_pass). The first scene frame after menus or loading refuses by design: its
-// passes still render at the game's own size (the live resolution is written at its pass 1's end). A refusal on a frame
-// after a scene frame is not expected, so the two are logged apart, once each, and counted for the fallback's summary.
+// The eye passes' room check (mvr_before_pass). A refusal is not expected (the eyes are cut to the live size from the
+// first scene frame); the first scene frame after others and a later one are logged apart, once each, and counted.
 bool mvrRoomLogged[2] = {};  // [0] the first scene frame after others, [1] a later one
 bool lastFrameScene = false;  // the frame before rendered the scene (its passes at the live resolution)
 unsigned long long mvrRoomRefused = 0, mvrRoomRefusedLater = 0, mvrNoBox = 0;
 char mvrLastRefusal[160] = {};  // the last refusal's sizes
 // Two-pass frames without both focus finals, by the first reason found (after_two_passes); and those with both.
 unsigned long long finalsNoBlit = 0, finalsNoBox = 0, finalsOutside = 0, finalsNoViews = 0, finalsBoth = 0;
-// R4a (FourPassesRun::focusFinal, docs/recon-lmu.md "R4 plan"): this frame runs the game's two eye passes only, its
-// focus views the focus finals beside the eyes (mvr_focus_final); the atlas takes them from there.
-bool atlasFromFinals = false;
+// R4a (docs/recon-lmu.md "R4 plan"): each frame runs the game's two eye passes only, its focus views the focus finals
+// beside the eyes (mvr_focus_final); the atlas takes them from there.
 bool frameFinalsOk = false;          // this frame's focus finals both made (after_two_passes)
 unsigned finalAt[2][2] = {};  // each focus final's top-left in its eye's texture
-bool finalsMissingLogged = false, twoPassLogged = false, countLogged = false;
-unsigned long long twoPassFrames = 0, finalsMissing = 0;
+bool finalsMissingLogged = false;
+unsigned long long twoPassFrames = 0;
 
-// lmu_mvr_backend_ab's side of this frame: 0 NVIDIA's single-pass stereo, 1 instancing.
-int backendSide = 0;
-bool backendAbOk = false, backendAbLogged = false;
-// lmu_car_vectors_ab's: 0 with the other cars' motion, 1 without; the cars' motion went on at the install.
-int carSide = 0;
-bool carAbLogged = false, carsOn = false;
-bool car_ab_on() { return cfg.carAb > 0 && carsOn; }
-
-// The A/B side of this frame: lmu_focus_final_ab's (0 two passes, 1 four), lmu_mvr_backend_ab's (0 NVIDIA's, 1
-// instancing) or lmu_mvr_ab's (0 MVR, 1 without).
-int ab_side() { return cfg.backendAb > 0 ? backendSide : carSide; }
-bool ab_run() { return (cfg.backendAb > 0 && backendAbOk) || car_ab_on(); }
-
-// An A/B run (FourPassesRun::mvrAb): each side's CPU per pass since the last cost line, in thread cycles.
-struct AbWindow {
-    double cpu[2][4] = {};  // [0] with MVR, [1] without
-    unsigned frames[2] = {};
-} ab;
-
-// Gate D (lmu_mvr=2): passes 2-3 skip the scene work before their post-processing (abi.h [MVR]) while skipScene is set
-// (render thread only: Cull_Item is also called from elsewhere).
-using ViewSceneFn = void (*)(void*, void*, void*, unsigned, char);
-using SortMeshBucketFn = std::uintptr_t (*)(void*, void*, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
-using CullItemFn = void (*)(void*, void*, void*, float);
-using CullSceneGraphFn = void (*)(void*, void*, void*);
-SortMeshBucketFn originalSortMeshBucket = nullptr;
-bool skipScene = false;
-unsigned long long skipped[4] = {};  // view scenes, sort buckets, cull items, scene graph culls: since the last log
-unsigned long long passesSkipped = 0, passesNotSkipped = 0;
-
-bool skipping() { return skipScene && GetCurrentThreadId() == renderThread; }
-
-
-// Before pass p: the eye's size (qvfr_before_pass took it), its focus view's (as set_next_passes will set pass 2-3's),
-// this frame's remap (frozen at pass 0), and whether this frame is a gate sample.
 // MVR's context hooks on `device` (at the first pass, or with the pass tracker at the session's first frame end, so menus
 // are seen too). False: MVR off for the session.
-ID3D11Device* sessionDevice = nullptr;  // four_passes_device (not referenced: the session keeps it)
+ID3D11Device* sessionDevice = nullptr;  // qvfr_frame_device (not referenced: the session keeps it)
 void pass_begin(int p);
 void pass_end(int p);
 void panel_draw(ID3D11DeviceContext* context, bool after, unsigned count, unsigned start);
 bool install_mvr(ID3D11Device* device) {
     mvr_focus_replay(cfg.focusReplay);  // before the install: the draws hooked for it only
     mvr_ui_mips(cfg.uiMips);
+    mvr_glass_depth(cfg.glassDepth);  // before the install: its state hooks only when on
     // Texture sharpening's pixel shader hook only when it's on at launch (no cost otherwise; its three settings are live
     // from then on) and where DLSS can run: a build with NGX, an NVIDIA GPU that draws two views, the passes the
     // tracker drives (DLSS's only way in).
@@ -678,6 +639,12 @@ bool install_mvr(ID3D11Device* device) {
     mvr_car_slots(cars ? cfg.carSlots : 0);
     mvr_car_slot_images(cars && cfg.carForced);  // a freeze each: never the player's
     carsOn = cars && cfg.carSlots >= 2;  // the A/B measures what players get (DLSS taking the motion)
+    // FSR seen at the d3d11 level: build-free runs take it from there, a known build compares it with the game's setting.
+    mvr_fsr_watch(cfg.trackerDrives);
+    // DLSS's camera from the per-draw buffer (view_pair.h): where it is the source (build-free), and where the cars'
+    // hooks are in anyway (a known build's comparison with the renderer's, at no cost).
+    mvr_view_track(cfg.trackerDrives && (buildFree || cars));
+    mvr_viewport_reads(cfg.viewportReads);  // the game's viewport reads answered with its own (lmu_viewport_reads)
     mvrInstalled = device && mvr_pass_install(device);
     if (!mvrInstalled) {
         cfg.mvr = false;
@@ -686,6 +653,7 @@ bool install_mvr(ID3D11Device* device) {
     if (cfg.passTracker) {
         mvr_track_passes(true);
         mvr_pass_trace(cfg.passTrace);
+        mvr_post_census(cfg.postCensus);
         if (cfg.trackerDrives) {
             mvr_track_drive(&pass_begin, &pass_end);
             mvr_mask_stale(&maskStale);  // R6c: the lens mask's draw dropped while stale
@@ -707,10 +675,10 @@ bool install_mvr(ID3D11Device* device) {
     return true;
 }
 
+// Before eye pass p: its focus view's size, this frame's remap (frozen at pass 0) and the room check.
 void mvr_before_pass(int p) {
-    if (!mvrInstalled)  // (the tracker's passes come only once its hooks are in: four_passes_frame_end)
+    if (!mvrInstalled)  // (the tracker's passes come only once its hooks are in: qvfr_frame_frame_end)
         return;
-    bool sample = false;
     if (p == 0) {
         mvr_frame_mode(0);
         {
@@ -745,13 +713,39 @@ void mvr_before_pass(int p) {
                 carSide = static_cast<int>((sceneFrames / static_cast<unsigned long long>(cfg.carAb)) % 2);
                 mvr_car_active(carSide == 0);
                 mvr_frame_mode(carSide);
+            } else if (carsOn) {  // DLSS or the cars' motion turned off while the game runs: no tracking for nothing
+                const bool pause = !carsWanted.load(std::memory_order_relaxed);
+                if (pause != carsPaused) {
+                    carsPaused = pause;
+                    mvr_car_active(!pause);
+                    simqvfr::log_line(pause ? "lmu mvr: other cars' motion paused (DLSS or its car motion turned off; "
+                                              "the hooks stay in until the session ends)"
+                                            : "lmu mvr: other cars' motion resumed");
+                }
+            }
+            if (cfg.maskAb > 0) {  // the lens mask this frame or not (between frames)
+                if (!maskAbLogged) {
+                    maskAbLogged = true;
+                    simqvfr::logf("lmu mvr: lens mask A/B: %d frames with the game's mask draw, then %d without, in "
+                                  "turn (lmu_mask_ab)",
+                                  cfg.maskAb, cfg.maskAb);
+                }
+                maskSide = static_cast<int>((sceneFrames / static_cast<unsigned long long>(cfg.maskAb)) % 2);
+                mvr_mask_ab_drop(maskSide == 1);
+                mvr_frame_mode(maskSide);
+            }
+            {  // the focus mask as last set (live)
+                std::lock_guard guard(liveMutex);
+                mvr_focus_mask(focusMaskOn, focusMaskArea, focusMaskMargin);
             }
         }
         freeze_focus();
     }
     MvrPassView v;
     bool draw = false;
-    if (p < 2 && frozen[p] && gameScale > 0 && !recovery.plain()) {  // (plain: no focus view asked for)
+    if (off_pass(p)) {
+        // The eye that's off: no focus view (nothing of it is shown).
+    } else if (p < 2 && frozen[p] && gameScale > 0 && !recovery.plain()) {  // (plain: no focus view asked for)
         const ClipRemap& r = frozenRemap[p];
         v.eye = p;
         v.remap[0] = static_cast<float>(r.a);
@@ -827,7 +821,7 @@ void mvr_before_pass(int p) {
     } else {
         ++mvrNoBox;  // no focus box this frame (its projection, or the game's scale not known yet)
     }
-    mvr_pass_begin(p, draw ? &v : nullptr, sample);
+    mvr_pass_begin(p, draw ? &v : nullptr, false);  // (no gate samples)
 }
 
 // The view `src` (its top-left w x h) into the atlas at (x, y), or (atlas_out) the atlas's at (x, y) into `dst`.
@@ -853,68 +847,6 @@ void atlas_in_from(ID3D11Texture2D* src, unsigned sx, unsigned sy, unsigned x, u
     context->Release();
     device->Release();
 }
-
-// The focus views' own images, render targets: the game's VR UI (the HUD, the in-car menus) is drawn into the eyes after
-// the eye loop, and into these too (vrui_draw). The atlas gets them at xrEndFrame.
-ID3D11Texture2D* focusTex[2] = {};
-
-// ---- QVFR: the menus at native resolution ----
-// A frame without the eye loop (the main menu, loading) is the game's eye images as they are, at the views' size: its
-// UI as soft as the periphery. Instead each eye's image is scaled up to the native eye into an image of ours before the
-// game draws its UI, the UI panel drawn into that at native after (as into the focus views), and the layer composes a
-// menu atlas of the two (the focus views the same pixels). Kept for the session (the compositor holds views of them).
-bool menuNative = false;        // FourPassesRun::menuNative
-double layerShare[2] = {1, 1};  // the views' layer in native eye widths and heights (FourPassesRun)
-simqvfr::D3D11ViewResample menuResample;
-bool menuResampleTried = false;
-ID3D11Texture2D* menuTex[2] = {};
-ID3D11RenderTargetView* menuRtv[2] = {};
-ID3D11Texture2D* menuAtlas = nullptr;
-unsigned menuW = 0, menuH = 0;
-bool menuReady = false;  // this frame's menu is in the menu atlas, until the layer takes it
-float menuUv[4][4] = {};
-unsigned long long menuFrames = 0;
-bool menuRefusalLogged = false;
-
-// ---- QVFR: the driver tags under live resolution (tag_viewport.h) ----
-// The tags are drawn after each pass's post-processing with a viewport of the whole eye target; a pass rendered smaller
-// (live resolution) gets them too far out and too large. For that draw the viewport is cut to what the pass rendered.
-using LabelsDrawFn = void (*)(void* camera, void* labels);
-unsigned long long labelsCut = 0, labelsKept = 0;
-bool labelsCutLogged = false, labelsKeptLogged = false, labelsResetLogged = false;
-
-// ---- QVFR: the VR UI in the focus views ----
-// VR_Present draws the HUD canvas onto a curved panel in each eye's final with the eye's projection x view (kVruiDraw);
-// the same draw again into the focus images, with that matrix remapped to the focus view's clip space (uiRemap).
-
-// RTVs on `textures` like the game's eye RTV `like`; false (none made) when they can't be.
-bool make_rtvs(ID3D11DeviceContext* context, ID3D11RenderTargetView* like, ID3D11Texture2D* const (&textures)[2],
-               ID3D11RenderTargetView* (&out)[2]) {
-    for (auto*& view : out)
-        if (view) {
-            view->Release();
-            view = nullptr;
-        }
-    D3D11_RENDER_TARGET_VIEW_DESC d{};
-    like->GetDesc(&d);
-    ID3D11Device* device = nullptr;
-    context->GetDevice(&device);
-    bool ok = d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D;
-    for (int e = 0; e < 2; ++e)
-        ok = ok && textures[e] && SUCCEEDED(device->CreateRenderTargetView(textures[e], &d, &out[e]));
-    device->Release();
-    if (!ok)
-        for (auto*& view : out)
-            if (view) {
-                view->Release();
-                view = nullptr;
-            }
-    return ok;
-}
-
-
-// The menus at native resolution (below): before and after the game's own UI draw in a frame without the eye loop.
-bool menu_background(ID3D11DeviceContext* context, ID3D11RenderTargetView* like);
 
 // The frame's record for the layer (adapter.h Views4Frame: tangents left, right, up, down; the focus views off-centre,
 // unturned). Under liveMutex.
@@ -943,219 +875,11 @@ void store_record() {
     haveRecord = true;
 }
 
-// The menu images (native: w x h, the eye texture `like`'s format) and the menu atlas (2w x h); false if they can't be.
-bool ensure_menu(ID3D11DeviceContext* context, ID3D11Texture2D* like, ID3D11RenderTargetView* likeRtv, unsigned w,
-                 unsigned h) {
-    ID3D11Device* device = nullptr;
-    context->GetDevice(&device);
-    if (!menuResample.ready() && !menuResampleTried) {
-        menuResampleTried = true;
-        if (!menuResample.initialize(device))
-            simqvfr::log_line("lmu qvfr: the menu's scaler couldn't be made: menus at the views' size");
-    }
-    D3D11_TEXTURE2D_DESC d;
-    like->GetDesc(&d);
-    bool ok = menuResample.ready();
-    if (ok && !(menuTex[0] && menuTex[1] && menuAtlas && menuRtv[0] && menuRtv[1] && menuW == w && menuH == h)) {
-        for (int e = 0; e < 2; ++e) {
-            if (menuRtv[e])
-                menuRtv[e]->Release();
-            if (menuTex[e])
-                menuTex[e]->Release();
-            menuRtv[e] = nullptr;
-            menuTex[e] = nullptr;
-        }
-        if (menuAtlas)
-            menuAtlas->Release();
-        menuAtlas = nullptr;
-        D3D11_TEXTURE2D_DESC t{};
-        t.Width = w;
-        t.Height = h;
-        t.MipLevels = 1;
-        t.ArraySize = 1;
-        t.Format = d.Format;
-        t.SampleDesc = {1, 0};
-        t.Usage = D3D11_USAGE_DEFAULT;
-        t.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        for (int e = 0; e < 2; ++e)
-            ok = ok && SUCCEEDED(device->CreateTexture2D(&t, nullptr, &menuTex[e]));
-        D3D11_TEXTURE2D_DESC a = t;
-        a.Width = 2 * w;
-        a.Format = typeless_of(d.Format);
-        a.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        ok = ok && SUCCEEDED(device->CreateTexture2D(&a, nullptr, &menuAtlas)) && make_rtvs(context, likeRtv, menuTex, menuRtv);
-        menuW = ok ? w : 0;
-        menuH = ok ? h : 0;
-        simqvfr::logf(ok ? "lmu qvfr: menu images %ux%u (the native eye; the views %ux%u), menu atlas %ux%u"
-                         : "lmu qvfr: the menu images %ux%u couldn't be made (the views %ux%u, atlas %ux%u): menus at the "
-                           "views' size",
-                      w, h, d.Width, d.Height, 2 * w, h);
-    }
-    device->Release();
-    return ok;
-}
-
-bool menu_background(ID3D11DeviceContext* context, ID3D11RenderTargetView* like) {
-    ID3D11Texture2D* eyes[2] = {game_eye_image(0), game_eye_image(1)};
-    bool ok = like && eyes[0] && eyes[1];
-    D3D11_TEXTURE2D_DESC d{};
-    unsigned w = 0, h = 0;
-    if (ok) {
-        eyes[0]->GetDesc(&d);
-        // The native eye: the size the layer offered over the layer's share of it.
-        std::uint32_t recommended[2];
-        real_recommended(recommended);
-        w = std::min(8192u, static_cast<unsigned>(std::lround(recommended[0] / layerShare[0])));
-        h = std::min(8192u, static_cast<unsigned>(std::lround(recommended[1] / layerShare[1])));
-        ok = d.SampleDesc.Count == 1 && (w > d.Width || h > d.Height);  // else the eyes are as sharp already
-    }
-    ok = ok && ensure_menu(context, eyes[0], like, w, h);
-    if (ok) {
-        // The same tangents both sides: a straight bilinear scale of the whole eye image.
-        const simqvfr::ViewMapping same{{-1, 1, 1, -1}, {-1, 1, 1, -1}, {1, 0, 0, 0, 1, 0, 0, 0, 1}};
-        for (int e = 0; e < 2; ++e)
-            ok = ok && menuResample.resample_target(eyes[e], {0, 0, static_cast<int>(d.Width), static_cast<int>(d.Height)},
-                                                    menuTex[e], {0, 0, static_cast<int>(menuW), static_cast<int>(menuH)},
-                                                    same);
-        if (!ok && !menuRefusalLogged) {
-            menuRefusalLogged = true;
-            simqvfr::log_line("lmu qvfr: the menu background couldn't be scaled up: menus at the views' size");
-        }
-    }
-    for (ID3D11Texture2D* t : eyes)
-        if (t)
-            t->Release();
-    return ok;
-}
-
-// A menu frame's record: the eyes' own projections, each focus view its box's part of the eye (the same pixels), and
-// the views' places in the menu atlas. False: the eyes as they are.
-bool menu_record(simqvfr::Views4Frame& f, float (&uv)[4][4]) {
-    double fx, fy, cx[2] = {}, cy[2] = {};
-    {
-        std::lock_guard guard(liveMutex);
-        fx = focusFraction;
-        fy = focusFractionY > 0 ? focusFractionY : focusFraction;
-        for (int e = 0; e < 2; ++e)
-            if (gazeValid[e]) {
-                cx[e] = gazeTan[e][0];
-                cy[e] = gazeTan[e][1];
-            }
-    }
-    f = {};
-    for (int e = 0; e < 2; ++e) {
-        float eyeM[16], focusM[16];
-        std::memcpy(eyeM, slot_matrix(e, 0), sizeof(eyeM));
-        FocusBox box;
-        clamp_focus_centre(eyeM, fx, fy, cx[e], cy[e]);
-        if (!focus_projection(eyeM, fx, fy, cx[e], cy[e], box, focusM))
-            return false;
-        const float outer[4] = {box.eyeTan[0], box.eyeTan[1], box.eyeTan[3], box.eyeTan[2]};
-        const float focus[4] = {box.focusTan[0], box.focusTan[1], box.focusTan[3], box.focusTan[2]};
-        std::memcpy(f.outerTan[e], outer, sizeof(outer));
-        std::memcpy(f.focusTan[e], focus, sizeof(focus));
-        f.turn[e] = {0, 0, 0, 1};
-        const float o[4] = {0.5f * e, 0.0f, 0.5f, 1.0f};
-        const float b[4] = {0.5f * e + 0.5f * static_cast<float>(box.rect[0]), static_cast<float>(box.rect[1]),
-                            0.5f * static_cast<float>(box.rect[2] - box.rect[0]), static_cast<float>(box.rect[3] - box.rect[1])};
-        std::memcpy(uv[e], o, sizeof(o));
-        std::memcpy(uv[e + 2], b, sizeof(b));
-    }
-    f.live = true;
-    for (int v = 0; v < 4; ++v) {
-        f.width[v] = f.renderWidth[v] = 0.5;
-        f.height[v] = f.renderHeight[v] = 1.0;
-    }
-    return true;
-}
-
-// The menu images (their UI drawn) into the menu atlas, the record stored: the layer composes the menu (four_passes_atlas).
-void menu_publish(const simqvfr::Views4Frame& f, const float (&uv)[4][4]) {
-    ID3D11Device* device = nullptr;
-    menuAtlas->GetDevice(&device);
-    ID3D11DeviceContext* immediate = nullptr;
-    device->GetImmediateContext(&immediate);
-    for (int e = 0; e < 2; ++e)
-        immediate->CopySubresourceRegion(menuAtlas, 0, e * menuW, 0, 0, menuTex[e], 0, nullptr);
-    immediate->Release();
-    device->Release();
-    std::memcpy(menuUv, uv, sizeof(uv));
-    {
-        std::lock_guard guard(liveMutex);
-        latestRecord = f;
-        haveRecord = true;
-    }
-    menuReady = true;
-}
-
-// R6b, the multi-view path: the menus at native from the d3d11 calls alone (mvr_pass.h mvr_panel_draws), no call into
-// the game's code. In a frame without passes, before the first VR UI panel draw into an eye's image the eyes are scaled
-// up into the menu images (menu_background); after each panel draw the same draw into that eye's menu image at its size
-// (mvr_redraw_panel); at the frame's end, both eyes' drawn, the atlas and the record (menu_finish).
-bool menuFrameStarted = false, menuBackgroundOk = false, menuPanelDrawn[2] = {};
-unsigned long long menuPanelReplays = 0, menuPanelMisses = 0;
-bool menuPanelLogged = false;
-
-void panel_draw(ID3D11DeviceContext* context, bool after, unsigned count, unsigned start) {
-    if (!qvfrMode || !menuNative || passesThisFrame != 0)
-        return;
-    ID3D11RenderTargetView* rtv = nullptr;
-    context->OMGetRenderTargets(1, &rtv, nullptr);
-    if (!rtv)
-        return;
-    ID3D11Resource* target = nullptr;
-    rtv->GetResource(&target);
-    int eye = -1;
-    for (int e = 0; e < 2; ++e) {
-        ID3D11Texture2D* t = game_eye_image(e);
-        if (t && target && static_cast<ID3D11Resource*>(t) == target)
-            eye = e;
-        if (t)
-            t->Release();
-    }
-    if (target)
-        target->Release();
-    if (eye >= 0 && !after && !menuFrameStarted) {
-        menuFrameStarted = true;
-        menuBackgroundOk = menu_background(context, rtv);
-    } else if (eye >= 0 && after && menuBackgroundOk && menuRtv[eye]) {
-        mvr_redraw_panel(context, menuRtv[eye], menuW, menuH, count, start);
-        menuPanelDrawn[eye] = true;
-        ++menuPanelReplays;
-        if (!menuPanelLogged) {
-            menuPanelLogged = true;
-            simqvfr::logf("lmu qvfr: frame %llu: the VR UI's panel drawn again into the menu images at %ux%u (from its "
-                          "d3d11 draw)",
-                          frames, menuW, menuH);
-        }
-    } else if (eye < 0 && after) {
-        ++menuPanelMisses;  // a panel into something else than an eye's image
-    }
-    rtv->Release();
-}
-
-// At the frame's end (xrEndFrame, before the layer takes the atlas): a menu frame whose panels were drawn into both menu
-// images is published.
-void menu_finish() {
-    const bool both = menuPanelDrawn[0] && menuPanelDrawn[1];
-    menuFrameStarted = menuBackgroundOk = menuPanelDrawn[0] = menuPanelDrawn[1] = false;
-    if (!both || !menuAtlas)
-        return;
-    simqvfr::Views4Frame f{};
-    float uv[4][4];
-    if (menu_record(f, uv))
-        menu_publish(f, uv);
-}
-
-// QVFR, after pass p: the eyes go into the atlas's top row while the focus views render into their targets (pass 2 =
-// focus 0 in eye 0's, pass 3 = focus 1 in eye 1's), each focus view into its own image, then the eyes back for the
-// game's VR UI and submit.
 // R4a, after pass 1 of a two-pass frame: the eye loop ends here; the eyes stay in their targets with the focus finals
 // beside them (the VR UI is doubled onto those after the loop). The frame's record and sizes from the focus finals;
-// the atlas takes them at xrEndFrame (four_passes_atlas). No focus finals: no four views this frame.
+// the atlas takes them at xrEndFrame (qvfr_frame_atlas). No focus finals: no four views this frame.
 void after_two_passes() {
-    eyesInAtlas = frameFocusOk = false;
-    atlasFromFinals = false;
+    atlasReady = false;  // this pass's finals decide (pass 0 cleared it already, unless the tracker saw pass 1 again)
     ID3D11Texture2D* e0 = game_eye_image(0);
     ID3D11Texture2D* e1 = game_eye_image(1);
     // The multi-view path, once: the copies' eye images are the targets the passes' final blits drew into.
@@ -1171,6 +895,18 @@ void after_two_passes() {
             set_final_size(q);
         bool ok = true;
         for (int e = 0; e < 2 && ok; ++e) {
+            if (off_pass(e)) {
+                // The eye that's off drew none: the frame is QVFR's with the other's alone. Its focus view's record
+                // stays valid (its box, a few pixels from the eye's corner), so the composition runs as for any frame;
+                // the layer shows the eye black whatever it holds.
+                finalAt[e][0] = finalAt[e][1] = 0;
+                passW[2 + e] = passH[2 + e] = std::min(kOffEyeSize, std::min(viewW, viewH));
+                extentW[2 + e] = passW[2 + e];
+                extentH[2 + e] = passH[2 + e];
+                if (frozen[e])
+                    boxes[e] = frozenBox[e];
+                continue;
+            }
             unsigned x = 0, y = 0, w = 0, h = 0;
             const bool final = mvr_focus_final(e, x, y, w, h);
             ok = final && frozen[e] && x + w <= viewW && y + h <= viewH && w && h;
@@ -1189,12 +925,11 @@ void after_two_passes() {
         frameFinalsOk = ok;
         if (ok) {
             ++finalsBoth;
-            atlasReady = atlasFromFinals = true;
+            atlasReady = true;
             store_record();
             if (gpuSpans.ready(e0))
                 gpuSpans.begin_frame();
         } else {
-            ++finalsMissing;
             if (!finalsMissingLogged) {
                 finalsMissingLogged = true;
                 simqvfr::logf("lmu mvr: frame %llu: two passes without both focus finals: no four views this frame (the eyes "
@@ -1216,9 +951,8 @@ void qvfr_after_pass(int p) {
         after_two_passes();
 }
 
-// The work around one eye pass: render_scene's (the game's scene render, hooked), or with R4b's pass tracker driving
-// (FourPassesRun::trackerDrives) the d3d11 bounds' (mvr_pass.h mvr_track_drive): pass_begin before the pass's draws,
-// pass_end after them, on the render thread.
+// The work around one eye pass, at the bounds R4b's pass tracker finds at the d3d11 level (mvr_pass.h mvr_track_drive):
+// pass_begin before the pass's draws, pass_end after them, on the render thread.
 double passWall0 = 0;
 unsigned long long passCpu0 = 0;
 int trackedEyeLogged = 0;                    // tracked passes that rendered another eye: the first 5 logged
@@ -1226,41 +960,51 @@ unsigned long long trackedEyeMismatches = 0;  // and counted
 
 void pass_begin(int p) {
     renderThread = GetCurrentThreadId();
-    pass = p;
     ++passesThisFrame;
     if (p == 0) {
         atlasReady = menuReady = false;  // a new frame: its own four views, or none
         frameFinalsOk = false;
+        eye_off_frame_begin();
     }
     unsigned long long hook0 = thread_cycles();
     qvfr_before_pass(p);  // live resolution: the size this pass renders at
-    if (cfg.mvr && p < 2)
+    if (cfg.mvr && p < 2) {
+        unsigned m[2];
+        main_size(m);
+        if (off_pass(p)) {  // the eye that's off: a few pixels, whatever the live size or a recovery
+            ++offEyePasses;
+            mvr_size_cut(true, m[0], m[1], std::min(kOffEyeSize, m[0]), std::min(kOffEyeSize, m[1]));
+        } else {
+            mvr_size_cut(!plain_now(), m[0], m[1], sceneW[p], sceneH[p]);
+        }
         mvr_before_pass(p);
+    }
     if (p == 0)  // the frame capture hotkey as this frame's first pass sees it (capture_views)
         frameCaptureArm = simqvfr::d3d11_capture_armed();
     passWall0 = now_ms();
     passCpu0 = thread_cycles();
     costWindow.hookCycles += static_cast<double>(passCpu0 - hook0);
-    inPass = true;
 }
 
 void pass_end(int p) {
     const double wall0 = passWall0;
     const unsigned long long cpu0 = passCpu0;
-    inPass = false;
     if (cfg.mvr && p < 2)
         mvr_pass_end(p);
     const unsigned long long cpu1 = thread_cycles();
-    if (p < 4) {  // what the game's own pass cost (four_passes_frame_end logs the averages)
+    if (p < 4) {  // what the game's own pass cost (qvfr_frame_frame_end logs the averages)
         costWindow.passWallMs[p] += now_ms() - wall0;
         costWindow.passCpuCycles[p] += static_cast<double>(cpu1 - cpu0);
         if (cfg.mvr && ab_run())
             ab.cpu[ab_side()][p] += static_cast<double>(cpu1 - cpu0);
     }
     if (p < 4) {
-        void* renderer = *reinterpret_cast<void**>(base() + kRenderer);
-        eyeOfPass[p] = renderer ? *reinterpret_cast<const int*>(static_cast<const std::uint8_t*>(renderer) + kRendererViewEye)
-                                : -1;
+        // The eye the game rendered: its view params' on a known build; build-free, the passes' order (left first, as
+        // the game's eye loop runs them).
+        void* renderer = buildFree ? nullptr : *reinterpret_cast<void**>(base() + kRenderer);
+        eyeOfPass[p] = buildFree ? p
+                       : renderer ? *reinterpret_cast<const int*>(static_cast<const std::uint8_t*>(renderer) + kRendererViewEye)
+                                  : -1;
         if (p < 2 && eyeOfPass[p] != p) {
             ++trackedEyeMismatches;
             if (trackedEyeLogged < 5) {
@@ -1271,95 +1015,18 @@ void pass_end(int p) {
             }
         }
         qvfr_after_pass(p);
-        if (p == 1)  // live resolution: the next frame's eye passes' size, before their cameras copy it
-            set_next_passes(0);
         costWindow.hookCycles += static_cast<double>(thread_cycles() - cpu1);
     }
 }
 
-std::wstring captures_folder() {
-    const std::filesystem::path dir = std::filesystem::path(simqvfr::log_directory()) / L"captures";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir.wstring();
-}
-
 const char* tag() { return "lmu qvfr"; }
-
-// ---- QVFR diagnostic: the render scale changed live (FourPassesRun::renderScaleProbe) ----
-// Scene frames 600-719 at the probe's share of the scale, the images saved at 660; then the scale as it was.
-constexpr unsigned long long kProbeStart = 600, kProbeShot = 60, kProbeEnd = 120;  // the last two after the start
-float probeOldScale = 0;
-int probeStage = 0;  // 0 waiting, 1 scaled, 2 saved, 3 done
-unsigned long long probeFrom = 0;
-
-int probe_active() { return probeStage == 1 || probeStage == 2; }
-
-void probe_save(ID3D11Texture2D* texture, const wchar_t* what) {
-    std::vector<std::uint8_t> px;
-    unsigned w = 0, h = 0;
-    if (!texture || !simqvfr::d3d11_read_bgra8(texture, px, w, h)) {
-        simqvfr::logf("lmu render scale probe: the %ls image can't be read back", what);
-        return;
-    }
-    // How much of it the frame drew: the bounding box of pixels that aren't black.
-    unsigned x0 = w, y0 = h, x1 = 0, y1 = 0;
-    for (unsigned y = 0; y < h; y += 2)
-        for (unsigned x = 0; x < w; x += 2) {
-            const std::size_t i = (static_cast<std::size_t>(y) * w + x) * 4;
-            if (px[i] > 4 || px[i + 1] > 4 || px[i + 2] > 4) {
-                x0 = (std::min)(x0, x);
-                y0 = (std::min)(y0, y);
-                x1 = (std::max)(x1, x);
-                y1 = (std::max)(y1, y);
-            }
-        }
-    wchar_t name[96];
-    swprintf_s(name, L"\\lmu-scale-probe-frame%llu-%ls.png", frames, what);
-    simqvfr::write_png_bgra(captures_folder() + name, px, w, h);
-    simqvfr::logf("lmu render scale probe: %ls image %ux%u saved (%ls); not black within x %u-%u y %u-%u", what, w, h, name + 1,
-                  x0, x1, y0, y1);
-}
-
-void render_scale_probe(int passes) {
-    if (!cfg.renderScaleProbe || probeStage == 3)
-        return;
-    auto* scale = reinterpret_cast<float*>(base() + kRenderScale);
-    if (probeStage == 0) {
-        if (sceneFrames < kProbeStart || passes < 4)
-            return;
-        probeOldScale = *scale;
-        *scale = probeOldScale * static_cast<float>(cfg.renderScaleProbe) / 100.0f;
-        probeFrom = sceneFrames;
-        probeStage = 1;
-        simqvfr::logf("lmu render scale probe: frame %llu: render scale %.3f -> %.3f for %llu scene frames (views %ux%u)",
-                      frames, probeOldScale, *scale, kProbeEnd, viewW, viewH);
-    } else if (probeStage == 1 && sceneFrames >= probeFrom + kProbeShot && passes >= 4) {
-        probeStage = 2;
-        ID3D11Texture2D* e0 = eye_texture(0);
-        if (e0) {
-            D3D11_TEXTURE2D_DESC d;
-            e0->GetDesc(&d);
-            simqvfr::logf("lmu render scale probe: frame %llu: the eye target is %ux%u (the views at launch %ux%u)", frames,
-                          d.Width, d.Height, viewW, viewH);
-        }
-        probe_save(e0, L"eye0");
-        if (e0)
-            e0->Release();
-        probe_save(focusTex[0], L"focus0");
-    } else if (probeStage >= 1 && sceneFrames >= probeFrom + kProbeEnd) {
-        *scale = probeOldScale;
-        probeStage = 3;
-        simqvfr::logf("lmu render scale probe: frame %llu: render scale back to %.3f", frames, probeOldScale);
-    }
-}
 
 // ---- QVFR: the four views at the frame capture hotkey ----
 // [experiment] d3d11_capture_hotkey=1: each press saves the swapchains' images (probe/d3d11_capture.h); the next composed
 // frame's four views are saved too, each as far as it rendered, and the log gives each focus view's box in its eye:
 // what tools/halo_profile.py and tools/focus_compare.py measure.
 void capture_views() {
-    const std::uint64_t arm = frameCaptureArm;  // as this frame's pass 0 saw it (render_scene)
+    const std::uint64_t arm = frameCaptureArm;  // as this frame's pass 0 saw it (pass_begin)
     if (arm == seenCaptureArm)
         return;
     seenCaptureArm = arm;
@@ -1371,7 +1038,7 @@ void capture_views() {
         simqvfr::logf("lmu qvfr: frame capture: frame %llu's views couldn't be read back", frames);
         return;
     }
-    const std::wstring dir = captures_folder();
+    const std::wstring dir = simqvfr::captures_directory();
     const wchar_t* names[4] = {L"eye0", L"eye1", L"focus0", L"focus1"};
     std::wstring paths[4];
     for (int v = 0; v < 4; ++v) {
@@ -1395,14 +1062,16 @@ void capture_views() {
     }
 }
 
-}  // namespace
+}  // namespace qvfr_frame_detail
+
+using namespace qvfr_frame_detail;
 
 // R5: the multi-view path (the tracker driving the game's two passes) gives way to the four passes without MVR, for
 // the rest of the session: at xrCreateSession when the device can't do it, or at a frame end (render thread, between
 // frames) when MVR fails while running. Logged once with `why`.
 int badgeLogged = 0;
 bool losingForTest = false;  // lmu_mvr_lose_at's window is open
-std::atomic<int> multiViewNow{0};  // four_passes_multi_view's (a QvfrMultiView), as of the last frame end
+std::atomic<int> multiViewNow{0};  // qvfr_frame_multi_view's (a QvfrMultiView), as of the last frame end
 
 // What the multi-view path did before it stopped, step by step, so a log shows which one the focus views didn't get past:
 // the eye passes' room check and focus box (mvr_before_pass), drawing the focus view, the focus post's copy, composite
@@ -1440,7 +1109,7 @@ void stop_multi_view(const char* why) {
                   frames, why);
 }
 
-bool four_passes_start(const FourPassesRun& run) {
+bool qvfr_frame_start(const QvfrFrameRun& run) {
     if (installed)
         return true;
     cfg = run;
@@ -1448,35 +1117,29 @@ bool four_passes_start(const FourPassesRun& run) {
     menuNative = run.qvfr && run.menuNative && run.layerWidth > 0 && run.layerHeight > 0;
     layerShare[0] = run.layerWidth;
     layerShare[1] = run.layerHeight;
-    four_passes_set_box(run.fraction, run.fractionY);
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (!simqvfr::games::supported_build(kGame, simqvfr::sha256_file(exe))) {
-        simqvfr::logf("%s: not the build its addresses are from; not installed", tag());
-        return false;
-    }
-    struct Anchor {
-        std::uintptr_t rva;
-        const std::uint8_t* bytes;
-        std::size_t size;
-        const char* name;
-    };
-    const Anchor anchors[] = {
-        {kTextureSurface, kTextureSurfaceAnchor, sizeof(kTextureSurfaceAnchor), "texture surface"},
-        {kSurfaceD3D, kSurfaceD3DAnchor, sizeof(kSurfaceD3DAnchor), "surface's D3D11 object"},
-    };
-    for (const Anchor& a : anchors)
-        if (!simqvfr::code_matches(a.rva, a.bytes, a.size)) {
-            simqvfr::logf("%s: the %s isn't this build's; not installed", tag(), a.name);
-            return false;
-        }
+    qvfr_frame_set_box(run.fraction, run.fractionY);
+    // Any build: on one abi.h's addresses are from the game's facts are read there (and compared with the layer's), on
+    // any other they come from what the layer sees (buildFree, above).
+    knownBuild = exe_known_build();
+    buildFree = !knownBuild || run.buildFree;
+    if (!knownBuild)
+        simqvfr::logf("%s: a game build Sim-QVFR wasn't made for (sha256 %s): the eye size, render scale, FSR and eye "
+                      "projections from what OpenXR and Direct3D show, DLSS's camera from the draws' constant buffers, "
+                      "nothing read in the game",
+                      tag(), buildSha.c_str());
+    else if (buildFree)
+        simqvfr::logf("%s: lmu_build_free=1: the game's facts from what OpenXR and Direct3D show, as on a build Sim-QVFR "
+                      "wasn't made for (compared with the game's in the log)",
+                      tag());
+    else
+        simqvfr::logf("%s: a build Sim-QVFR was made for: the game's facts read in it, compared with what OpenXR and "
+                      "Direct3D show (the log's build-free lines)",
+                      tag());
     // The game's own two eye passes, found at the d3d11 level, and the lens mask and the VR UI from their d3d11 draws:
     // no game code hooked.
     const bool driven = cfg.trackerDrives;
-    if (const MH_STATUS init = MH_Initialize(); init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
-        simqvfr::logf("%s: MH_Initialize failed", tag());
+    if (!simqvfr::minhook_ready(tag()))
         return false;
-    }
     if (driven) {
         installed = true;
         mvr_time_hooks(cfg.mvrTiming);
@@ -1495,7 +1158,7 @@ bool four_passes_start(const FourPassesRun& run) {
     return false;
 }
 
-void four_passes_device(ID3D11Device* device) {
+void qvfr_frame_device(ID3D11Device* device) {
     sessionDevice = device;
     recovery.new_session();  // a graphics setting may have changed: no waiting for the next try
     // R5: the device decides; the game is still in its menus, the eye loop not yet run.
@@ -1509,16 +1172,28 @@ void four_passes_device(ID3D11Device* device) {
                           : "");
 }
 
-void four_passes_frame_end() {
+void qvfr_frame_frame_end() {
     if (!installed)
         return;
     ++frames;
-    if (cfg.mvr && cfg.passTracker && !mvrInstalled && sessionDevice)  // the tracker sees the menus too
+    const bool offThread = off_render_thread();
+    if (offThread && !frameEndThreadLogged) {
+        frameEndThreadLogged = true;
+        simqvfr::log_line("lmu qvfr: xrEndFrame isn't on the thread that rendered the views: the frame end's work on the "
+                          "game's context waits for a frame end on it (logged once)");
+    }
+    if (cfg.mvr && cfg.passTracker && !mvrInstalled && sessionDevice && !offThread)  // the tracker sees the menus too
         if (!install_mvr(sessionDevice))
             stop_multi_view("multi-view's context hooks couldn't be installed");
-    simqvfr::dlss_frame_end(frames);
+    {
+        simqvfr::FramePartTimer part(simqvfr::FramePart::dlssEnd);
+        simqvfr::dlss_frame_end(frames);
+    }
     if (cfg.mvr) {
-        mvr_frame_end(frames);
+        if (!offThread) {  // (skipped: the next frame end on the render thread ends the tracker's frame)
+            simqvfr::FramePartTimer part(simqvfr::FramePart::mvrEnd);
+            mvr_frame_end(frames);
+        }
         frozen[0] = frozen[1] = false;
     }
     const int passes = passesThisFrame;
@@ -1535,6 +1210,8 @@ void four_passes_frame_end() {
     if (cfg.trackerDrives) {
         // FSR on: each eye's post-processing ends in FSR's upscale (compute) instead of the final blit; the focus
         // composite goes beside the eye before it, so FSR carries it into the eye's image (mvr_fsr).
+        if (!offThread)
+            note_fsr(passes >= 2);  // build-free: FSR as this frame's compute writes showed it
         mvr_fsr(fsr_on(), eyeImage[0], eyeImage[1]);
         const char* why = mvr_broken()           ? "the driver refused NVIDIA's multi-view rendering (and instancing "
                                                    "couldn't take over)"
@@ -1614,20 +1291,6 @@ void four_passes_frame_end() {
         if (passes < fullPasses) {
             atlasReady = false;  // no four views this frame (menus, loading): the layer submits the eyes as they are
             seenCaptureArm = simqvfr::d3d11_capture_armed();  // a frame capture now has no views to save (not later)
-            // ... so they render at the game's own scale, filling their targets (the next scene pass sets it again).
-            // Not after a frame that did render an eye (the tracker found one pass of two): the live size stays, or the
-            // next frame's eyes fill their targets, its focus views don't fit and the miss repeats itself for good.
-            if (passes == 1) {
-                set_next_passes(0);
-            } else if (!probe_active() && gameScale > 0 && lastWritten != gameScale) {
-                *reinterpret_cast<float*>(base() + kRenderScale) = gameScale;
-                lastWritten = gameScale;
-            }
-        }
-        render_scale_probe(passes);
-        if (eyesInAtlas) {
-            eyesInAtlas = false;
-            simqvfr::logf("lmu qvfr: frame %llu stopped after %d passes with the eyes set aside", frames, passes);
         }
         menu_finish();  // before the layer takes the atlas (views4_submit, after this)
         maskStaleThisFrame += mvr_mask_dropped();
@@ -1652,6 +1315,32 @@ void four_passes_frame_end() {
         if (passes >= fullPasses && frames % 900 == 0) {
             unsigned mainWH[2];
             main_size(mainWH);
+            if (cfg.mvr) {
+                const MvrSizeCutStats c = mvr_size_cut_stats();
+                simqvfr::logf("lmu qvfr: frame %llu: live resolution: eyes %ux%u %ux%u cut in %ux%u main targets (the "
+                              "game's render scale %.3f); since launch %llu viewports and %llu scissors cut, %llu left",
+                              frames, sceneW[0], sceneH[0], sceneW[1], sceneH[1], mainWH[0], mainWH[1], gameScale,
+                              c.viewports, c.scissors, c.left);
+            }
+            {  // where the gaze is and where the focus boxes drawn this frame sit (whether the box follows the gaze)
+                float gaze[2][2];
+                bool valid[2];
+                {
+                    std::lock_guard guard(liveMutex);
+                    std::memcpy(gaze, gazeTan, sizeof(gaze));
+                    valid[0] = gazeValid[0];
+                    valid[1] = gazeValid[1];
+                }
+                const auto centre = [](const FocusBox& b, int axis) {
+                    return 0.5 * (b.focusTan[axis * 2] + b.focusTan[axis * 2 + 1]);
+                };
+                simqvfr::logf("lmu qvfr: frame %llu: gaze tangents %.3f %.3f%s | %.3f %.3f%s; the focus boxes drawn at "
+                              "%.3f %.3f | %.3f %.3f (%s)",
+                              frames, gaze[0][0], gaze[0][1], valid[0] ? "" : " (not valid)", gaze[1][0], gaze[1][1],
+                              valid[1] ? "" : " (not valid)", centre(frozenBox[0], 0), centre(frozenBox[0], 1),
+                              centre(frozenBox[1], 0), centre(frozenBox[1], 1),
+                              buildFree ? "build-free" : "the game's facts");
+            }
             std::uint32_t rec[2];
             real_recommended(rec);
             if (mainWH[0] && (mainWH[0] != rec[0] || mainWH[1] != rec[1]))  // render scale not 1: scene and eye target apart
@@ -1715,7 +1404,9 @@ void four_passes_frame_end() {
 
 }
 
-void four_passes_set_gaze(const float (&tan)[2][2], const bool (&valid)[2]) {
+void qvfr_frame_cars_wanted(bool wanted) { carsWanted.store(wanted, std::memory_order_relaxed); }
+
+void qvfr_frame_set_gaze(const float (&tan)[2][2], const bool (&valid)[2]) {
     std::lock_guard guard(liveMutex);
     for (int e = 0; e < 2; ++e) {
         gazeValid[e] = valid[e] && std::isfinite(tan[e][0]) && std::isfinite(tan[e][1]);
@@ -1724,17 +1415,24 @@ void four_passes_set_gaze(const float (&tan)[2][2], const bool (&valid)[2]) {
     }
 }
 
-void four_passes_set_box(double fractionX, double fractionY) {
+void qvfr_frame_set_box(double fractionX, double fractionY) {
     std::lock_guard guard(liveMutex);
     focusFraction = std::clamp(fractionX, 0.05, 1.0);
     focusFractionY = fractionY > 0 ? std::clamp(fractionY, 0.05, 1.0) : 0.0;
 }
 
-simqvfr::games::QvfrMultiView four_passes_multi_view() {
+void qvfr_frame_set_focus_mask(bool on, const simqvfr::FocusArea& area, unsigned marginTexels) {
+    std::lock_guard guard(liveMutex);
+    focusMaskOn = on;
+    focusMaskArea = area;
+    focusMaskMargin = marginTexels;
+}
+
+simqvfr::games::QvfrMultiView qvfr_frame_multi_view() {
     return static_cast<simqvfr::games::QvfrMultiView>(multiViewNow.load(std::memory_order_relaxed));
 }
 
-bool four_passes_eye_extent(unsigned (&width)[2], unsigned (&height)[2]) {
+bool qvfr_frame_eye_extent(unsigned (&width)[2], unsigned (&height)[2]) {
     if (!eyeExtentReady)
         return false;
     eyeExtentReady = false;  // this frame's
@@ -1745,7 +1443,7 @@ bool four_passes_eye_extent(unsigned (&width)[2], unsigned (&height)[2]) {
     return true;
 }
 
-bool four_passes_record(simqvfr::Views4Frame& frame) {
+bool qvfr_frame_record(simqvfr::Views4Frame& frame) {
     std::lock_guard guard(liveMutex);
     if (!haveRecord)
         return false;
@@ -1753,7 +1451,16 @@ bool four_passes_record(simqvfr::Views4Frame& frame) {
     return true;
 }
 
-ID3D11Texture2D* four_passes_atlas(ID3D11Texture2D* const (&eyes)[2], float (&uv)[4][4]) {
+ID3D11Texture2D* qvfr_frame_atlas(ID3D11Texture2D* const (&eyes)[2], float (&uv)[4][4]) {
+    if (off_render_thread()) {  // the copies would race the render thread on its context: the eyes as submitted
+        if (!atlasThreadLogged) {
+            atlasThreadLogged = true;
+            simqvfr::log_line("lmu qvfr: xrEndFrame isn't on the thread that rendered the views: no atlas from it (the "
+                              "headset shows the eyes that frame)");
+        }
+        atlasReady = menuReady = false;
+        return nullptr;
+    }
     if (cfg.trackerDrives)
         learn_eye_images(eyes);  // this frame's submit copies: the next frame's eye images
     if (qvfrMode && menuReady && menuAtlas) {  // a menu frame, at native (menu_ui)
@@ -1780,25 +1487,18 @@ ID3D11Texture2D* four_passes_atlas(ID3D11Texture2D* const (&eyes)[2], float (&uv
         }
         return nullptr;
     }
-    if (GetCurrentThreadId() != renderThread && !atlasThreadLogged) {
-        atlasThreadLogged = true;
-        simqvfr::log_line("lmu qvfr: xrEndFrame isn't on the thread that rendered the views (the atlas copies race)");
-    }
-    // The eyes again, as the game submitted them: with what it drew after its eye loop (the VR UI); the focus views with
-    // the UI drawn into them too (vrui_draw).
-    // Each only as far as its pass rendered (live resolution: the top-left of the launch-size targets).
+    // The eyes as the game submitted them, with what it drew after its eye loop (the VR UI), each only as far as its pass
+    // rendered (live resolution: the top-left of the launch-size targets); the focus finals beside them, the VR UI
+    // doubled onto them.
     const unsigned long long c0 = thread_cycles();
     gpuSpans.mark(3, 0);
-    atlas_in(eyes[0], 0, 0, passW[0], passH[0]);
-    atlas_in(eyes[1], viewW, 0, passW[1], passH[1]);
-    if (atlasFromFinals) {  // R4a: the focus finals beside the eyes, the VR UI doubled onto them
-        atlasFromFinals = false;
-        atlas_in_from(eyes[0], finalAt[0][0], finalAt[0][1], 0, viewH, passW[2], passH[2]);
-        atlas_in_from(eyes[1], finalAt[1][0], finalAt[1][1], viewW, viewH, passW[3], passH[3]);
-    } else {
-        atlas_in(focusTex[0], 0, viewH, passW[2], passH[2]);
-        atlas_in(focusTex[1], viewW, viewH, passW[3], passH[3]);
-    }
+    // The eye that's off: only the few pixels its pass drew (the headset shows it black).
+    const auto eyeW = [](int e) { return off_pass(e) ? std::min(kOffEyeSize, passW[e]) : passW[e]; };
+    const auto eyeH = [](int e) { return off_pass(e) ? std::min(kOffEyeSize, passH[e]) : passH[e]; };
+    atlas_in(eyes[0], 0, 0, eyeW(0), eyeH(0));
+    atlas_in(eyes[1], viewW, 0, eyeW(1), eyeH(1));
+    atlas_in_from(eyes[0], finalAt[0][0], finalAt[0][1], 0, viewH, passW[2], passH[2]);
+    atlas_in_from(eyes[1], finalAt[1][0], finalAt[1][1], viewW, viewH, passW[3], passH[3]);
     gpuSpans.mark(3, 1);
     gpuSpans.end_frame();
     costWindow.hookCycles += static_cast<double>(thread_cycles() - c0);
@@ -1823,7 +1523,7 @@ ID3D11Texture2D* four_passes_atlas(ID3D11Texture2D* const (&eyes)[2], float (&uv
     return atlas;
 }
 
-void four_passes_note_views(const XrView* views, uint32_t count) {
+void qvfr_frame_note_views(const XrView* views, uint32_t count) {
     if (!views || count < 2)
         return;
     std::lock_guard guard(liveMutex);
@@ -1840,7 +1540,33 @@ void four_passes_note_views(const XrView* views, uint32_t count) {
     maskStale.store(stale, std::memory_order_relaxed);
 }
 
-void four_passes_mask_taken(uint32_t viewIndex) {
+bool qvfr_frame_known_build() { return exe_known_build(); }
+bool qvfr_frame_build_free() { return buildFree; }
+bool qvfr_frame_eye_projection(int eye, float (&out)[16]) { return eye >= 0 && eye < 2 && layer_slot(eye, out); }
+
+void qvfr_frame_offered(std::uint32_t width, std::uint32_t height) {
+    const bool changed = width != offeredW.load(std::memory_order_relaxed) ||
+                         height != offeredH.load(std::memory_order_relaxed);
+    offeredW.store(width, std::memory_order_relaxed);
+    offeredH.store(height, std::memory_order_relaxed);
+    if (changed)
+        simqvfr::logf("lmu qvfr: the game offered %ux%u per eye (the eye targets' size%s)", width, height,
+                      buildFree ? "; this run's, nothing read in the game" : "");
+}
+
+void qvfr_frame_game_views(const XrView* views, uint32_t count) {
+    if (!views || count < 2)
+        return;
+    std::lock_guard guard(liveMutex);
+    for (int e = 0; e < 2; ++e) {
+        const XrFovf& f = views[e].fov;
+        const float t[4] = {std::tan(f.angleLeft), std::tan(f.angleRight), std::tan(f.angleDown), std::tan(f.angleUp)};
+        std::memcpy(gameFovTan[e], t, sizeof(t));
+    }
+    gameFovValid = true;
+}
+
+void qvfr_frame_mask_taken(uint32_t viewIndex) {
     if (viewIndex >= 2)
         return;
     std::lock_guard guard(liveMutex);
@@ -1852,7 +1578,7 @@ void four_passes_mask_taken(uint32_t viewIndex) {
                   viewIndex, t[0], t[1], t[2], t[3], locatedValid ? "" : " -- none located yet: the mask is always drawn");
 }
 
-void four_passes_set_live_scales(double outer, double focus) {
+void qvfr_frame_set_live_scales(double outer, double focus) {
     const float o = static_cast<float>(std::clamp(outer, 0.1, 1.0)), f = static_cast<float>(std::clamp(focus, 0.1, 1.0));
     std::lock_guard guard(liveMutex);
     if (o == liveScale[0] && f == liveScale[1])
@@ -1864,7 +1590,7 @@ void four_passes_set_live_scales(double outer, double focus) {
                   o * 100, f * 100);
 }
 
-void four_passes_set_live_axes(double outerWidth, double outerHeight, double focusWidth, double focusHeight) {
+void qvfr_frame_set_live_axes(double outerWidth, double outerHeight, double focusWidth, double focusHeight) {
     const auto share = [](double v) { return static_cast<float>(std::clamp(v, 0.05, 1.0)); };
     const float a[2][2] = {{share(outerWidth), share(outerHeight)}, {share(focusWidth), share(focusHeight)}};
     std::lock_guard guard(liveMutex);
@@ -1877,7 +1603,7 @@ void four_passes_set_live_axes(double outerWidth, double outerHeight, double foc
                       a[0][0] * 100, a[0][1] * 100, a[1][0] * 100, a[1][1] * 100);
 }
 
-void four_passes_view_size(int (&size)[2]) {
+void qvfr_frame_view_size(int (&size)[2]) {
     size[0] = static_cast<int>(viewW);
     size[1] = static_cast<int>(viewH);
 }

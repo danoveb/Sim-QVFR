@@ -8,14 +8,17 @@
 #include <vector>
 
 #include "input/hotkeys.h"
+#include "lang.h"
 #include "log.h"
 #include "probe/cpu_load.h"
 #include "probe/cpu_profile.h"
 #include "probe/d3d11_capture.h"
 #include "probe/gpu_frame_timer.h"
 #include "probe/gpu_load.h"
+#include "probe/pix_capture.h"
 #include "quad/osd.h"
 #include "quad/qvfr_optimizer.h"
+#include "quad/qvfr_settings.h"
 #include "quad/settings_menu.h"
 #include "layer/layer.h"
 
@@ -52,7 +55,7 @@ void optimize_start(int64_t now) {
     optimize.note.clear();
     // It measures what each step does, so the views must resize live (with DLSS: views4_dlss_live).
     if (game->qvfr_dlss_held()) {
-        optimize.note = L"DLSS holds the view sizes until the next launch (DLAA, or views4_dlss_live=0): it can't measure live";
+        optimize.note = L"DLSS keeps this launch's view sizes, so it can't measure live: set them for the next launch";
         return;
     }
     int nativeW = 0;
@@ -77,9 +80,10 @@ void optimize_start(int64_t now) {
     const MenuValues& v = menu.model.values;
     const MenuLaunch& l = menu.model.launch;
     QvfrLimits limits;
-    const int minFocus = read(L"min_focus", limits.floor.width, 10, 100);
-    limits.floor = {read(L"min_periphery", limits.floor.periphery, 10, 100), read(L"min_density", limits.floor.density, 50, 400),
-                    minFocus, minFocus};
+    // The floors stay inside the settings' own ranges (quad/qvfr_settings.h).
+    const int minFocus = read(L"min_focus", limits.floor.width, kFocusPercent.min, kFocusPercent.max);
+    limits.floor = {read(L"min_periphery", limits.floor.periphery, kPeripheryScale.min, kPeripheryScale.max),
+                    read(L"min_density", limits.floor.density, kFocusDensity.min, kFocusDensity.max), minFocus, minFocus};
     limits.cropWidth = v.crop_width();
     limits.cropHeight = v.crop_height();
     limits.nativeWidth = nativeW;
@@ -148,7 +152,7 @@ void optimize_tick(int64_t now) {
     }
     if (o.running()) {
         if (menu.visible)  // shown until it is done
-            menu.hideAt = std::max(menu.hideAt, now + qpc_ms(kMenuHideMs));
+            menu.hideAt = std::max(menu.hideAt, now + qpc_ms(menu_hide_ms()));
         if (now >= optimize.nextWindow) {
             optimize.nextWindow = now + qpc_ms(kOptimizeWindowMs);
             if (const QvfrAction a = o.feed(optimize_window()); a.apply)
@@ -157,16 +161,16 @@ void optimize_tick(int64_t now) {
     } else {
         optimize.frames.clear();
     }
-    // The menu's line and detail.
+    // The menu's line (English; the menu shows it translated) and detail (English: it is logged too).
     std::wstring line, detail;
     if (optimize.shown) {
         detail = optimize.note.empty() ? o.status() : optimize.note;
         switch (o.state()) {
         case QvfrState::Measuring:
-        case QvfrState::Settling: line = L"Running…"; break;
-        case QvfrState::Done: line = o.can_undo() ? L"Done (Left: undo)" : L"Done"; break;
-        case QvfrState::Failed: line = L"Not possible"; break;
-        default: line = optimize.note.empty() ? L"" : L"Not possible"; break;
+        case QvfrState::Settling: line = I18N(L"Running…"); break;
+        case QvfrState::Done: line = o.can_undo() ? I18N(L"Done (Left: undo)") : I18N(L"Done"); break;
+        case QvfrState::Failed: line = I18N(L"Not possible"); break;
+        default: line = optimize.note.empty() ? L"" : I18N(L"Not possible"); break;
         }
     }
     if (line != menu.model.optimizeStatus || detail != menu.model.optimizeDetail) {
@@ -198,13 +202,20 @@ void profile_notice(const std::wstring& text, int64_t ms) {
 // The frame capture hotkey (d3d11_capture_hotkey, probe/d3d11_capture.h): each press saves the next frame's swapchain
 // images, the game's and the composed output: what the headset gets at that moment.
 void frame_capture_poll() {
-    if (!experiment.d3d11CaptureHotkey)
+    if (!experiment.d3d11CaptureHotkey && !experiment.pixCaptureHotkey)
         return;
     const bool held = hotkey_held(HotkeyAction::FrameCapture);
     const bool pressed = held && !frameCaptureHotkeyHeld;
     frameCaptureHotkeyHeld = held;
-    if (pressed && d3d11_capture_arm(endFrames + 1))
-        profile_notice(L"Frame capture: saved to the logs folder (captures)", 2500);
+    if (pressed && experiment.d3d11CaptureHotkey && d3d11_capture_arm(endFrames + 1))
+        profile_notice(lang::tr(L"Frame capture: saved to the logs folder (captures)"), 2500);
+    // pix_capture_hotkey (D3D12): a PIX GPU capture of the next frames, into the logs folder's pix folder.
+    if (pressed && experiment.pixCaptureHotkey) {
+        if (pix_capture_arm(endFrames + 1))
+            profile_notice(lang::tr(L"PIX capture: saved to the logs folder (pix)"), 2500);
+        else
+            log_line("pix: the frame capture hotkey: no capture (one is running, or no PIX capturer)");
+    }
 }
 
 void cpu_profile_poll() {
@@ -212,7 +223,7 @@ void cpu_profile_poll() {
         return;
     const bool running = cpu_profile_running();
     if (profileNotice.wasRunning && !running)
-        profile_notice(L"CPU capture done: the report is in the logs folder", 5000);
+        profile_notice(lang::tr(L"CPU capture done: the report is in the logs folder"), 5000);
     profileNotice.wasRunning = running;
     if (profileNotice.until && qpc_now() >= profileNotice.until) {
         profileNotice.until = 0;
@@ -246,7 +257,9 @@ void cpu_profile_poll() {
         }
     if (cpu_profile_start(request)) {
         profileNotice.wasRunning = true;
-        profile_notice(L"CPU capture: " + std::to_wstring(experiment.cpuProfileSeconds) + L" s, keep driving", 4000);
+        profile_notice(lang::trf(L"CPU capture: {seconds} s, keep driving",
+                                  {{L"seconds", std::to_wstring(experiment.cpuProfileSeconds)}}),
+                       4000);
     }
 }
 

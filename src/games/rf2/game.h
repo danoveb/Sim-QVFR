@@ -24,8 +24,8 @@ inline constexpr simqvfr::games::GameInfo kGame = {
     nullptr,
 
     // Identity/probe stage only. Do not expose launcher controls for features that
-    // the RF2 adapter does not implement yet.
-    {false, false, false, false, false, false, false, false, false, false, /* gpuRegulator */ true},
+    // the RF2 adapter does not implement yet. By name: GameFeatures has more members than it had.
+    {.gpuRegulator = true},
 
     kBuilds,
     std::size(kBuilds),

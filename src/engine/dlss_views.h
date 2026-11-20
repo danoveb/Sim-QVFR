@@ -23,6 +23,7 @@
 
 #include <openxr/openxr.h>
 
+struct ID3D11CommandList;
 struct ID3D11DepthStencilView;
 struct ID3D11DeviceContext;
 struct ID3D11Resource;
@@ -57,6 +58,23 @@ struct DlssRun {
     int focusScale = 100;
     // Textures sampled sharper (dlss_mip_bias): 0 off, 1 the focus views, 2 the focus views and the eyes.
     int textureSharpening = 0;
+    // The upscaler that runs the views (the same inputs, jitter and modes either way): 0 NVIDIA DLSS (NGX on the game's
+    // D3D11 device), 1 AMD FSR (engine/fsr_upscale.h: our D3D12 device beside the game's; FSR 4 where AMD's runtime
+    // offers it, else 3.1; its "native AA" for DLAA; NGX's presets don't apply). fsrWhereNoDlss: where DLSS can't run (a
+    // GPU not NVIDIA's by its DXGI vendor id, or NGX refusing to start: an older NVIDIA card), FSR whatever `upscaler`
+    // says.
+    // 0x1002), where NGX can't run, FSR whatever `upscaler` says.
+    int upscaler = 0;
+    bool fsrWhereNoDlss = false;
+    std::wstring fsrFolder;  // AMD's two DLLs' folder, looked in first (empty: beside the layer, then the game's exe)
+    int fsrProvider = 0;     // 0 the newest AMD's runtime offers on this GPU, 3 the newest FSR 3.x (fsr::Provider)
+    // With the depth copied before the transparents (dlss_depth_copy_list): every ~2 s, one eye's copy compared with the
+    // scene's depth at the pass's end (every 8th texel), logged: how much of the view transparents writing depth (a
+    // car's glass) drew nearer, at what distance, and what lies behind them.
+    bool depthMeasure = false;
+    // The copy taken only where what was drawn over it lies nearer than this (metres; 0: everywhere): the player's car's
+    // glass, not another car drawn blended with its depth written (whose surface the depth is).
+    double depthCopyNear = 3.0;
 };
 
 // The game's side: eye `eye`'s pass's view matrix (world -> view, row vectors) and projection as rendered (jitter
@@ -77,8 +95,11 @@ struct DlssLive {
     int preset = 0;       // DlssRun::preset (the focus views')
     int eyePreset = -1;   // DlssRun::eyePreset
     int textureSharpening = 0;  // DlssRun::textureSharpening (no new feature: taken at once)
+    int upscaler = 0;           // DlssRun::upscaler (every view's feature made again by the other)
 };
 void dlss_live(const DlssLive& live);
+// Checks: how long the settings must hold before a change that makes features again is taken (500 ms in the game).
+void dlss_live_settle_for_tests(int ms);
 // The end of xrLocateViews for the game's stereo views: this frame's jitter put into their FOV.
 void dlss_jitter_views(XrView* views, uint32_t count);
 // The focus views' render scale for the frame being set up: a focus view w x h is drawn at dlss::render_size(w, s) x
@@ -115,7 +136,20 @@ struct DlssPass {
     ID3D11ShaderResourceView* objectSlots = nullptr;
     ID3D11ShaderResourceView* objectMotion = nullptr;
     unsigned objectCount = 0;
+    // The scene's depth was copied in this pass before its transparents wrote theirs (dlss_depth_copy_list, executed):
+    // with depthCopyRead the vectors and DLSS take that copy in place of the depth target (what lies behind a car's
+    // glass, not the glass); without, it is only measured (DlssRun::depthMeasure; an A/B's other side).
+    bool depthCopied = false;
+    bool depthCopyRead = true;
 };
+// Transparents that write depth (LMU's car glass: blended, depth written): through them DLSS would see the glass's
+// distance for the world behind it, and every pixel there would get the vector of a point half a metre away (the road
+// ahead smears; with the car's box, it moves with the head alone). The game's side, at the first such draw of an eye
+// pass after its opaque depth: a command list (the scene's depth `depth` as it stands, its first sample, the top-left
+// `width` x `height`, into the module's own copy) to execute on the immediate context with its state restored
+// (ExecuteCommandList(list, TRUE)); then DlssPass::depthCopied at the pass's dlss_after_resolve. Null: not now (the
+// module not started yet, or the depth target unreadable). Recorded again only for another depth target or size.
+ID3D11CommandList* dlss_depth_copy_list(ID3D11DepthStencilView* depth, unsigned width, unsigned height);
 // Right after an eye pass's scene is complete in `resolved` (a resolve's target, or the scene's own single-sample
 // target), on the game's immediate context; `depth` the scene's depth target. The caller keeps its own hooks out of
 // the way (the work draws and copies on `context`); the context's state is put back call by call before it returns.
@@ -130,6 +164,12 @@ bool dlss_vectors_for_checks(ID3D11DeviceContext* context, int index, std::vecto
 // The session's end (or a check's): every feature released, NGX shut down, nothing of the device held. A later pass
 // starts it again.
 void dlss_shutdown();
+
+// The upscaler running the views now (DlssRun::upscaler as resolved for the GPU): 0 DLSS, 1 FSR; -1 none started yet.
+int dlss_upscaler_in_use();
+// Its name for the overlay, from any thread: "DLSS", "FSR4", "FSR3.1" (the provider AMD's runtime took); "DLSS" until
+// one is known.
+const wchar_t* dlss_upscaler_badge();
 
 // The evaluations that succeeded since the start, and the focus views stretched instead (checks outside the game).
 unsigned long long dlss_evaluations_total();

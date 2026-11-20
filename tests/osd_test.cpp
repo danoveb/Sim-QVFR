@@ -1,26 +1,21 @@
 // Offline check of the performance overlay (quad/osd.h): frame rate, pacing and headroom from frame
 // times, which processor limits the frame, the rows' states, the [osd] round trip, and that the card
 // draws with rounded, see-through corners.
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 
 #include "quad/osd.h"
+#include "quad/session_stint.h"
+#include "test_util.h"
 
 using namespace simqvfr;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
-}
-
-bool close_to(double a, double b, double tolerance = 0.05) { return a > b - tolerance && a < b + tolerance; }
 
 OsdInput steady(double intervalMs, double cpuMs, double gpuMs, double periodMs = 11.111) {
     OsdInput in;
@@ -63,7 +58,7 @@ void save_card(const wchar_t* path, const std::vector<uint32_t>& pixels) {
 int SIM_QVFR_TEST_MAIN() {
     {
         const OsdSummary s = osd_summary(steady(11.111, 5, 7));
-        check(close_to(s.fps, 90, 0.1) && close_to(s.budgetMs, 11.111) && s.latePercent == 0 && close_to(s.jitterMs, 0),
+        check(close_to(s.fps, 90, 0.1) && close_to(s.budgetMs, 11.111, 0.05) && s.missedPercent == 0 && close_to(s.jitterMs, 0, 0.05),
               "a steady 90 Hz frame: 90 fps, on budget, smooth");
         check(close_to(s.cpuHeadroom, 55, 0.1) && close_to(s.gpuHeadroom, 37, 0.1) && s.bound == OsdBound::None,
               "headroom is the budget left; neither processor limits");
@@ -87,7 +82,7 @@ int SIM_QVFR_TEST_MAIN() {
         in.fg = OsdFg::On;
         in.fgMultiplier = 2;
         const OsdSummary s = osd_summary(in);
-        check(close_to(s.budgetMs, 22.222) && s.latePercent == 0 && s.bound == OsdBound::None,
+        check(close_to(s.budgetMs, 22.222, 0.05) && s.missedPercent == 0 && s.bound == OsdBound::None,
               "frame generation 2x: ACE's budget is two refresh periods");
     }
     {
@@ -97,9 +92,55 @@ int SIM_QVFR_TEST_MAIN() {
         const OsdSummary s = osd_summary(in);
         const std::vector<OsdRow> rows = osd_rows(in, s);
         const OsdRow* pacing = row(rows, L"Pacing");
-        check(close_to(s.latePercent, 100.0 * 5 / 45, 0.1) && pacing && pacing->tone == OsdTone::Bad &&
-                  pacing->value.find(L"late") != std::wstring::npos,
-              "skipped frames show as late in the pacing row");
+        check(close_to(s.missedPercent, 100.0 * 5 / 45, 0.1) && pacing && pacing->tone == OsdTone::Bad &&
+                  pacing->value.find(L"missed") != std::wstring::npos,
+              "skipped frames show as missed in the pacing row");
+    }
+    {
+        // A locked 90 as the CPU sees it: xrEndFrame's interval swings 1 ms either side of the period (a long one
+        // followed by a short one); the runtime showed every frame on its refresh. All green, smooth.
+        OsdInput in = steady(11.111, 5, 7);
+        for (size_t i = 0; i < in.frames.size(); ++i) {
+            in.frames[i].intervalMs = i % 2 ? 10.1 : 12.1;
+            in.frames[i].refreshes = 1;
+        }
+        const OsdSummary s = osd_summary(in);
+        const std::vector<OsdRow> rows = osd_rows(in, s);
+        const OsdRow* pacing = row(rows, L"Pacing");
+        const OsdRow* p90 = row(rows, L"Frame p90 · 1% low");
+        check(s.missedPercent == 0 && pacing && pacing->tone == OsdTone::Good && pacing->value.find(L"Smooth") == 0 &&
+                  p90 && p90->tone == OsdTone::Good,
+              "a locked 90 with the CPU's interval 9% over every other frame: smooth, p90 green");
+        // Without the display times the interval in whole budgets says the same.
+        for (OsdFrame& f : in.frames)
+            f.refreshes = 0;
+        check(osd_summary(in).missedPercent == 0, "and without display times: 12.1 ms is still one refresh");
+    }
+    {
+        // The display times say what the interval cannot: a frame handed in on time for a refresh the runtime had
+        // already passed (a 2-period step) is missed, whatever its interval.
+        OsdInput in = steady(11.111, 5, 7);
+        for (OsdFrame& f : in.frames)
+            f.refreshes = 1;
+        in.frames[10].refreshes = 2;
+        in.frames[20].refreshes = 3;
+        const OsdSummary s = osd_summary(in);
+        const OsdRow* pacing = row(osd_rows(in, s), L"Pacing");
+        check(close_to(s.missedPercent, 100.0 * 2 / 45, 0.1) && pacing && pacing->tone == OsdTone::Warn,
+              "two of 45 frames missed a refresh (by the display times): inconsistent, yellow");
+    }
+    {
+        const int64_t period = 11'111'111, t = 1'000'000'000'000;
+        check(osd_refreshes_between(t, t + period, period) == 1 && osd_refreshes_between(t, t + 2 * period, period) == 2 &&
+                  osd_refreshes_between(t, t + 3 * period + 300'000, period) == 3 &&
+                  osd_refreshes_between(t, t + period - 200'000, period) == 1,
+              "display-time steps in whole periods, a prediction's drift aside");
+        check(osd_refreshes_between(0, t, period) == 0 && osd_refreshes_between(t, t, period) == 0 &&
+                  osd_refreshes_between(t, t + period, 0) == 0,
+              "no previous frame, the same display time again, or no period: unknown");
+        check(osd_refreshes(OsdFrame{12.1}, 11.111) == 1 && osd_refreshes(OsdFrame{22.4}, 11.111) == 2 &&
+                  osd_refreshes(OsdFrame{30, -1, -1, -1, 1}, 11.111) == 1,
+              "a frame's refreshes: its interval in whole budgets, the display times first when known");
     }
     {
         const OsdSummary s = osd_summary(steady(14, 3, 6));
@@ -143,7 +184,7 @@ int SIM_QVFR_TEST_MAIN() {
                   tiles[1].value == L"11.1" && tiles[1].tone == OsdTone::Good && tiles[2].label == L"CPU" &&
                   tiles[2].detail == L"55% headroom" && tiles[3].value == L"7.0" && tiles[3].detail == L"37% headroom",
               "four tiles: frame rate, frame time, CPU and GPU with their headroom");
-        check(vram && vram->value == L"11.0 / 12.0 GB" && vram->tone == OsdTone::Warn && close_to(vram->meter, 11.0 / 12),
+        check(vram && vram->value == L"11.0 / 12.0 GB" && vram->tone == OsdTone::Warn && close_to(vram->meter, 11.0 / 12, 0.05),
               "VRAM: used of the budget, with a meter, amber above 85%");
         check(fg && fg->pill && fg->value == L"Waiting for guides" && fg->tone == OsdTone::Warn,
               "frame generation not yet generating shows Cheeky's state");
@@ -203,14 +244,14 @@ int SIM_QVFR_TEST_MAIN() {
         const OsdInput in = measured(22.222, 9, 12.5, 9.7, 98, 60);
         const OsdSummary s = osd_summary(in);
         check(s.gpuWhole && close_to(s.gpuMs, 0.98 * 22.222, 0.01) && close_to(s.gpuRestMs, 0.98 * 22.222 - 19 - 1.1 - 0.4, 0.01) &&
-                  close_to(s.gpuFgMs, 1.1) && s.bound == OsdBound::Gpu && s.gpuHeadroom < 3,
+                  close_to(s.gpuFgMs, 1.1, 0.05) && s.bound == OsdBound::Gpu && s.gpuHeadroom < 3,
               "the whole GPU 98% busy: its time per frame, the rest beyond ACE, FG and the layer; GPU bound, ~2% left");
         const std::vector<OsdRow> rows = osd_rows(in, s);
         check(row(rows, L"GPU ms: game/FG/layer/rest")->value == L"19.0 / 1.1 / 0.4 / 1.3" &&
                   row(rows, L"Limited by")->value == L"GPU" && osd_tiles(in, s)[3].label == L"GPU (all work)",
               "the GPU row shows its parts; the tile says it is all the GPU's work");
-        check(close_to(s.cpuMs, 12.5) && close_to(s.cpuBusyMs, 9) && close_to(s.cpuBlockedMs, 3.5) &&
-                  close_to(s.cpuThreadMs, 0.6 * 22.222, 0.01) && close_to(s.waitMs, 9.7) &&
+        check(close_to(s.cpuMs, 12.5, 0.05) && close_to(s.cpuBusyMs, 9, 0.05) && close_to(s.cpuBlockedMs, 3.5, 0.05) &&
+                  close_to(s.cpuThreadMs, 0.6 * 22.222, 0.01) && close_to(s.waitMs, 9.7, 0.05) &&
                   row(rows, L"Render thread")->value == L"9.0 busy · 3.5 blocked",
               "the render thread: 12.5 ms of work, 9 running and 3.5 blocked; the busiest thread 60% of the frame");
         check(close_to(s.cpuHeadroom, (22.222 - 0.6 * 22.222) / 22.222 * 100, 0.1),
@@ -224,7 +265,7 @@ int SIM_QVFR_TEST_MAIN() {
         in.gpuGamePercent = 80;
         const OsdSummary s = osd_summary(in);
         const double frame = 22.222;
-        check(s.gpuWhole && close_to(s.gpuGameMs, 0.8 * frame - 0.4, 0.01) && close_to(s.gpuLayerMs, 0.4) &&
+        check(s.gpuWhole && close_to(s.gpuGameMs, 0.8 * frame - 0.4, 0.01) && close_to(s.gpuLayerMs, 0.4, 0.05) &&
                   close_to(s.gpuRestMs, 0.9 * frame - (0.8 * frame - 0.4) - 1.1 - 0.4, 0.01),
               "D3D11: game = its GPU share less the layer's composition; rest = whole less game, FG and layer");
         const std::wstring parts = row(osd_rows(in, s), L"GPU ms: game/FG/layer/rest")->value;
@@ -248,12 +289,12 @@ int SIM_QVFR_TEST_MAIN() {
         doubled.periodMs = 22.222;
         doubled.refreshMs = 11.111;
         const OsdSummary d = osd_summary(doubled);
-        check(close_to(d.budgetMs, 22.222) && close_to(d.refreshHz, 90, 0.01) &&
+        check(close_to(d.budgetMs, 22.222, 0.05) && close_to(d.refreshHz, 90, 0.01) &&
                   close_to(d.gpuHeadroom, (22.222 - 0.71 * 22.4) / 22.222 * 100, 0.1),
               "frame generation through Cheeky's layer: the budget is 22.2 ms (not 44.4), the refresh 90 Hz");
         OsdInput plain = doubled;
         plain.periodMs = 11.111;  // a runtime that gives ACE the refresh period itself
-        check(close_to(osd_summary(plain).budgetMs, 22.222), "the refresh period given as it is: multiplied once");
+        check(close_to(osd_summary(plain).budgetMs, 22.222, 0.05), "the refresh period given as it is: multiplied once");
         // ACE held in xrWaitFrame yet 3% past its slot (43 fps of 45), neither processor full: pacing.
         OsdInput slip = doubled;
         for (OsdFrame& f : slip.frames)
@@ -276,13 +317,14 @@ int SIM_QVFR_TEST_MAIN() {
             in.frames[i * 10].intervalMs = 23.5;  // 6% over
         in.frames[50].intervalMs = 40;
         const OsdSummary s = osd_summary(in);
-        check(close_to(s.latePercent, 10) && close_to(s.frameP90Ms, 23.5) && close_to(s.low1Fps, 1000 / 40.0, 0.01),
-              "frames 6% over count as late; p90 23.5 ms; the 1% low from the slowest frame");
+        check(close_to(s.missedPercent, 1, 0.05) && close_to(s.frameP90Ms, 23.5, 0.05) && close_to(s.low1Fps, 1000 / 40.0, 0.01),
+              "frames 6% over still make their refresh, the 40 ms one missed one; p90 23.5 ms; the 1% low from the slowest");
     }
     {
         const std::wstring ini = (std::filesystem::temp_directory_path() / L"simqvfr_osd_test.ini").wstring();
         DeleteFileW(ini.c_str());
-        check(read_osd_placement(ini.c_str()) == OsdPlacement{}, "no [osd]: off, above the centre, 26 degrees");
+        check(read_osd_placement(ini.c_str()) == OsdPlacement{} && OsdPlacement{}.pitch == -25 && OsdPlacement{}.width == 19,
+              "no [osd]: off, 25 degrees below the centre, 19 degrees");
         const OsdPlacement p{true, -20, -8, 22};
         check(write_osd_placement(ini.c_str(), p) && read_osd_placement(ini.c_str()) == p,
               "[osd] round trip, negative degrees included");
@@ -290,7 +332,38 @@ int SIM_QVFR_TEST_MAIN() {
         check(read_osd_placement(ini.c_str()).width == kOsdWidthMax, "the width is clamped");
         WritePrivateProfileStringW(L"osd", L"yaw", L"-90", ini.c_str());
         check(read_osd_placement(ini.c_str()).yaw == -kOsdYawMax, "and so is the yaw");
+        // The clock: its own section, off by default, low on the right.
+        check(read_clock_placement(ini.c_str()) == ClockPlacement{} && !ClockPlacement{}.enabled && ClockPlacement{}.yaw > 0,
+              "no [clock]: off, low on the right");
+        const ClockPlacement c{true, -30, 12, 10};
+        check(write_clock_placement(ini.c_str(), c) && read_clock_placement(ini.c_str()) == c &&
+                  read_osd_placement(ini.c_str()).yaw == -kOsdYawMax,
+              "[clock] round trip, [osd] untouched");
+        WritePrivateProfileStringW(L"clock", L"width", L"1", ini.c_str());
+        WritePrivateProfileStringW(L"clock", L"pitch", L"80", ini.c_str());
+        const ClockPlacement clamped = read_clock_placement(ini.c_str());
+        check(clamped.width == kClockWidthMin && clamped.pitch == kClockPitchMax, "the clock's width and pitch are clamped");
         DeleteFileW(ini.c_str());
+    }
+    {
+        // The clock's card: the time in white on the translucent card, its corners clear.
+        const std::vector<uint32_t> pixels = draw_clock_panel(osd_clock(21, 47));
+        bool white = false;
+        for (uint32_t p : pixels)
+            white |= (p & 0xff) > 0xe0 && ((p >> 8) & 0xff) > 0xe0 && ((p >> 16) & 0xff) > 0xe0;
+        const auto alpha = [&](int x, int y) { return pixels[static_cast<size_t>(y) * kClockWidth + x] >> 24; };
+        bool clearIsBlack = true;  // premultiplied: no colour where nothing shows (the corners)
+        for (uint32_t p : pixels)
+            clearIsBlack &= (p >> 24) != 0 || (p & 0xffffff) == 0;
+        const int w = kClockWidth - 1, h = kClockHeight - 1;
+        check(pixels.size() == static_cast<size_t>(kClockWidth) * kClockHeight && white && alpha(0, 0) == 0 &&
+                  alpha(w, 0) == 0 && alpha(0, h) == 0 && alpha(w, h) == 0 && clearIsBlack &&
+                  alpha(kClockWidth / 2, kClockHeight / 2) > 0xc0 && (kClockWidth * 4) % 256 == 0,
+              "the clock's card: white text, all four corners clear and black, opaque middle; its rows fit the D3D12 "
+              "copy's pitch");
+        check(panel_rgba(0xffffff, 0xff) == 0xffffffff && panel_rgba(0x1c1c1e, 0) == 0 &&
+                  (panel_rgba(0xffffff, 0x80) & 0xff) > 0x80 && (panel_rgba(0xffffff, 0x80) >> 24) == 0x80,
+              "panel_rgba: opaque kept, clear is black, half alpha premultiplied in linear light (brighter than half in sRGB)");
     }
     // SIMQVFR_OSD_SAVE=<file.bmp>: the card with every cell filled, as a bitmap to look at.
     if (wchar_t path[MAX_PATH] = {}; GetEnvironmentVariableW(L"SIMQVFR_OSD_SAVE", path, MAX_PATH)) {
@@ -303,7 +376,7 @@ int SIM_QVFR_TEST_MAIN() {
         full.cpuBusiestName = L"GameThread";
         full.multiView = OsdMultiView::Smvr;
         const OsdSummary s = osd_summary(full);
-        std::vector<double> history(150, 24.6);
+        std::vector<OsdFrame> history(150, OsdFrame{24.6});
         const std::vector<uint32_t> pixels =
             draw_osd_panel(s, history, osd_tiles(full, s), osd_rows(full, s), osd_badge(full), osd_clock(21, 47));
         save_card(path, pixels);
@@ -311,8 +384,8 @@ int SIM_QVFR_TEST_MAIN() {
     {
         OsdInput in = steady(11.111, 5, 7);
         const OsdSummary s = osd_summary(in);
-        std::vector<double> history(120, 11.1);
-        history[60] = 30;
+        std::vector<OsdFrame> history(120, OsdFrame{11.1});
+        history[60].intervalMs = 30;
         const std::vector<uint32_t> pixels = draw_osd_panel(s, history, osd_tiles(in, s), osd_rows(in, s));
         const auto alpha = [&](int x, int y) { return pixels[static_cast<size_t>(y) * kOsdWidth + x] >> 24; };
         bool text = false;
@@ -345,8 +418,17 @@ int SIM_QVFR_TEST_MAIN() {
         in.dlss = false;
         check(withDlss.value == L"MVR + DLSS" && withDlss.tone == OsdTone::Good && noneWithDlss.value.empty(),
               "the multi-view badge says DLSS while it evaluates views (MVR + DLSS), nothing without a multi-view path");
+        in.dlss = true;
+        in.upscaler = L"FSR4";
+        const OsdRow withFsr = badge(OsdMultiView::Smvr);
+        in.upscaler = L"FSR3.1";
+        const OsdRow withFsr3 = badge(OsdMultiView::Mvr);
+        in.dlss = false;
+        in.upscaler = L"DLSS";
+        check(withFsr.value == L"SMVR + FSR4" && withFsr3.value == L"MVR + FSR3.1",
+              "the multi-view badge names AMD FSR's version where it runs instead (SMVR + FSR4, MVR + FSR3.1)");
         const OsdSummary s = osd_summary(in);
-        const std::vector<double> history(120, 11.1);
+        const std::vector<OsdFrame> history(120, OsdFrame{11.1});
         const std::vector<uint32_t> plain = draw_osd_panel(s, history, osd_tiles(in, s), osd_rows(in, s), none);
         const std::vector<uint32_t> with = draw_osd_panel(s, history, osd_tiles(in, s), osd_rows(in, s), fallback);
         int inside = 0, outside = 0;
@@ -392,11 +474,63 @@ int SIM_QVFR_TEST_MAIN() {
             }
         for (int y = 132; y < 220; ++y)  // the first paragraph: white
             for (int x = 64; x < 600; ++x)
-                white |= (pixels[static_cast<size_t>(y) * kOsdWidth + x] & 0xffffff) == 0xf7f5f5;
+                white |= (pixels[static_cast<size_t>(y) * kOsdWidth + x] & 0xffffff) ==
+                         (panel_rgba(0xf5f5f7, 0xd9) & 0xffffff);  // kPrimary on the card, premultiplied
         check(pixels.size() == static_cast<size_t>(kOsdWidth) * kOsdHeight && (pixels[0] >> 24) == 0 && yellow && white,
               "the notice card: a yellow title, the first paragraph in white, rounded corners");
         if (wchar_t path[MAX_PATH] = {}; GetEnvironmentVariableW(L"SIMQVFR_NOTICE_SAVE", path, MAX_PATH))
             save_card(path, pixels);
+    }
+    {  // The headset menu's frame line: GPU, CPU, what is left of the budget, the missed share
+        OsdSummary s;
+        s.fps = 90;
+        s.budgetMs = 11.1;
+        s.gpuMs = 9.8;
+        s.cpuMs = 7.1;
+        bool bad = true;
+        check(osd_menu_line(s, bad) == L"GPU 9.8 ms · CPU 7.1 ms · 1.3 ms left · 0% missed" && !bad,
+              "menu line: the times and the headroom");
+        s.gpuMs = 11.9;
+        s.missedPercent = 4;
+        check(osd_menu_line(s, bad) == L"GPU 11.9 ms · CPU 7.1 ms · 0.8 ms over · 4% missed" && bad,
+              "menu line: over the budget, in red");
+        s.fps = 0;
+        check(osd_menu_line(s, bad).empty(), "menu line: nothing before the overlay has frames");
+    }
+    {  // The session record's stint: whole stints, the menu's windows left out, a settings change a new one
+        SessionStint st;
+        const std::vector<float> fast(900, 11.111f), slow(900, 22.222f);
+        const auto window = [](const std::vector<float>& v, double gpu) {
+            return StintWindow{&v, 11.111, 0, 6.0, gpu, 80, 2};
+        };
+        st.add(0, false, window(fast, 9));
+        st.add(0, true, window(slow, 20));  // the menu was open: not the drive's
+        st.add(0, false, window(fast, 10));
+        StintNumbers n = st.numbers();
+        check(st.known() && n.index == 1 && std::fabs(n.fps - 90) < 0.1 && std::fabs(n.seconds - 20) < 0.1 &&
+                  n.latePercent == 0 && std::fabs(n.gpuMs - 9.5) < 1e-6,
+              "stint: two windows' frames, the menu's window left out, the GPU time frame-weighted");
+        st.add(1, false, window(slow, 20));  // a settings change: this window straddles it, dropped
+        check(!st.known() && st.numbers().index == 2, "stint: a change starts the next stint, its first window dropped");
+        st.add(1, false, window(slow, 20));
+        n = st.numbers();
+        check(n.index == 2 && std::fabs(n.fps - 45) < 0.1 && n.latePercent == 100 && std::fabs(n.frameP90 - 22.222) < 1e-3,
+              "stint: the new stint's own numbers");
+        st.add(2, true, window(fast, 9));
+        st.add(3, false, window(fast, 9));  // a stint with no windows of its own doesn't count
+        check(st.numbers().index == 3, "stint: an empty stint keeps its number for the next");
+        // A long stint: past the sample's size the frames are thinned evenly, the numbers stay the stint's.
+        SessionStint longer;
+        std::vector<float> mixed(900, 11.111f);
+        for (size_t i = 0; i < mixed.size(); i += 5)
+            mixed[i] = 22.222f;  // one frame in five slow
+        for (int i = 0; i < 40; ++i)  // 36000 frames, past kMaxFrames
+            longer.add(0, false, window(mixed, 9));
+        n = longer.numbers();
+        check(std::fabs(n.seconds - 36000 * (0.8 * 11.111 + 0.2 * 22.222) / 1000) < 0.5 &&
+                  std::fabs(n.latePercent - 20) < 0.01 && std::fabs(n.frameP90 - 22.222) < 1e-3 &&
+                  std::fabs(n.frameP50 - 11.111) < 1e-3,
+              "stint: a long stint, its percentiles from an even sample");
     }
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;

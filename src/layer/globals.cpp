@@ -17,6 +17,8 @@
 
 namespace simqvfr::layer {
 
+std::atomic<bool> processTerminating{false};  // constant-initialised: set from DllMain (early_load.cpp)
+
 Dispatch next;
 NativeQuad nativeQuad;
 
@@ -57,6 +59,8 @@ Views4Outline v4outline;
 
 uint64_t endFrames = 0;
 
+std::atomic<XrSwapchain> measuredEyeChain{XR_NULL_HANDLE};
+
 uint64_t locates = 0;
 
 CpuTimes cpu;
@@ -64,6 +68,8 @@ CpuTimes cpu;
 Pacing pacing;
 
 SessionSummary summary;
+
+std::atomic<uint32_t> stintGeneration{0};
 
 std::string layersBelow;  // the layers between this one and the runtime (log_layer_order)
 
@@ -86,6 +92,8 @@ PadWatch padWatch;
 Menu menu;
 
 Osd osd;
+
+Clock clockCard;
 
 Notice notice;
 

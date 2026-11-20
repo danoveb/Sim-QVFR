@@ -27,8 +27,11 @@ float menu_height_deg(int widthDeg) { return panel_height_deg(widthDeg, kMenuAsp
 
 float osd_height_deg(int widthDeg) { return panel_height_deg(widthDeg, static_cast<float>(kOsdHeight) / kOsdWidth); }
 
+float clock_height_deg(int widthDeg) { return panel_height_deg(widthDeg, static_cast<float>(kClockHeight) / kClockWidth); }
+
 std::wstring degrees(int v, const wchar_t* plus, const wchar_t* minus) {
-    return v == 0 ? L"0°" : std::to_wstring(std::abs(v)) + L"° " + (v > 0 ? plus : minus);
+    // `plus` and `minus` are whole texts with {degrees} ("{degrees} right"), marked with I18N where they are passed.
+    return v == 0 ? L"0°" : trf(v > 0 ? plus : minus, {{L"degrees", std::to_wstring(std::abs(v)) + L"°"}});
 }
 
 }  // namespace
@@ -114,20 +117,41 @@ float placement_preview(float x, float y, float w, bool draw) {
             if (focused(kOsdPanel))
                 focus_ring(card, r);
         }
+        // The clock, when it is on: its card with the time as one white bar.
+        Rect clock{};
+        if (app.s.clock.enabled) {
+            const float cw = app.s.clock.width * k, ch = clock_height_deg(app.s.clock.width) * k;
+            const float ccx = x + (kRefFovX / 2 + app.s.clock.yaw) * k, ccy = y + (kRefFovY / 2 - app.s.clock.pitch) * k;
+            clock = {ccx - cw / 2, ccy - ch / 2, cw, ch};
+            const bool held = app.dragging == kClockPanel;
+            const float r = std::max(2.0f, cw * 28 / kClockWidth);
+            app.canvas.fill({clock.x, clock.y + 2, clock.w, clock.h}, {0, 0.35f}, r);
+            app.canvas.fill(clock, col(kOsdCard, 0.9f), r);
+            app.canvas.fill({clock.x + cw * 0.2f, clock.y + ch * 0.32f, cw * 0.6f, std::max(1.5f, ch * 0.36f)}, col(kMenuLabel), 1);
+            app.canvas.stroke(clock, col(held ? app.c->accent : app.c->preview_label, held ? 1 : 0.45f), held ? 1.5f : 0.75f, r);
+            if (focused(kClockPanel))
+                focus_ring(clock, r);
+        }
         rt->PopLayer();
         app.canvas.stroke(frame, col(app.c->separator), 0.5f, t::kRadiusGroup);
         app.hits.push_back({kMenuPanel, frame, 0});  // empty space: the panel's centre jumps there
         app.hits.push_back({kMenuPanel, panel, 1});  // the panel: dragged from where it is held
         if (app.s.osd.enabled)
             app.hits.push_back({kOsdPanel, card, 1});  // the overlay, over the menu
+        if (app.s.clock.enabled)
+            app.hits.push_back({kClockPanel, clock, 1});  // the clock, over both
     }
     return frameH;
 }
 
 // How to use the placement preview. Returns its height.
 float placement_caption(float x, float y, float w, bool draw) {
-    const std::wstring caption = app.s.osd.enabled ? L"Drag the menu or the overlay to place it. Headsets’ fields of view vary."
-                                                   : L"Drag the panel to place it. Headsets’ fields of view vary.";
+    const bool osd = app.s.osd.enabled, clock = app.s.clock.enabled;
+    const std::wstring caption =
+        osd && clock ? tr(L"Drag the menu, the overlay or the clock to place it. Headsets’ fields of view vary.")
+        : osd        ? tr(L"Drag the menu or the overlay to place it. Headsets’ fields of view vary.")
+        : clock      ? tr(L"Drag the menu or the clock to place it. Headsets’ fields of view vary.")
+                     : tr(L"Drag the panel to place it. Headsets’ fields of view vary.");
     const float ch = app.canvas.measure_height(caption, t::kSubheadline, w);
     if (draw)
         app.canvas.text(caption, t::kSubheadline, {x, y, w, ch + 2}, col(app.c->label_secondary), Align::Leading, false, true);
@@ -140,12 +164,14 @@ float placement_readouts(float x, float y, float w, bool draw) {
     std::snprintf(size, sizeof(size), "%d° × %d°", app.s.menuWidth, static_cast<int>(std::lround(menu_height_deg(app.s.menuWidth))));
     std::snprintf(metres, sizeof(metres), "%.2f m", 2 * kMenuDistance * std::tan(app.s.menuWidth * 3.14159265 / 360));
     std::snprintf(distance, sizeof(distance), "%.1f m", kMenuDistance);
-    float h = eyebrow(x, y, w, L"Headset menu", draw) + t::kSpace2;
-    h += readout(x, y + h, w, L"Horizontal", degrees(app.s.menuYaw, L"right", L"left"), draw) + 6;
-    h += readout(x, y + h, w, L"Vertical", degrees(app.s.menuPitch, L"up", L"down"), draw) + 6;
-    h += readout(x, y + h, w, L"Panel size", widen(size), draw) + 6;
-    h += readout(x, y + h, w, L"Panel width", widen(metres), draw) + 6;
-    h += readout(x, y + h, w, L"Distance", widen(distance), draw);
+    float h = eyebrow(x, y, w, tr(L"Headset menu"), draw) + t::kSpace2;
+    h += readout(x, y + h, w, tr(L"Horizontal"),
+                 degrees(app.s.menuYaw, I18N(L"{degrees} right"), I18N(L"{degrees} left")), draw) + 6;
+    h += readout(x, y + h, w, tr(L"Vertical"), degrees(app.s.menuPitch, I18N(L"{degrees} up"), I18N(L"{degrees} down")),
+                 draw) + 6;
+    h += readout(x, y + h, w, tr(L"Panel size"), widen(size), draw) + 6;
+    h += readout(x, y + h, w, tr(L"Panel width"), widen(metres), draw) + 6;
+    h += readout(x, y + h, w, tr(L"Distance"), widen(distance), draw);
     return h;
 }
 

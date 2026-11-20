@@ -18,10 +18,16 @@ namespace simqvfr::launcher::ui::win {
 
 // ---- OpenXR layers -----------------------------------------------------------------------------
 
+namespace {
+constexpr wchar_t kSystemOrderFixed[] =
+    I18N(L"The order of Windows’ own layers can’t be changed safely without the launcher. Their on/off switches still "
+         L"apply; Launches from here has its own order.");
+}  // namespace
+
 // Reads both profiles again; Windows' draft is kept while it has changes (`keepDraft`).
 void refresh_layers(bool keepDraft) {
     app.layerPlan = launcher_layer_plan();
-    const bool dirty = app.layersDraft != app.layersWindows || app.layersLockMoved;
+    const bool dirty = app.layersDraft != app.layersWindows;
     app.layersWindows = read_system_layers(HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER, kImplicitLayersKey, &app.layersLockMoved);
     if (!keepDraft || !dirty || app.layersDraft.size() != app.layersWindows.size())
         app.layersDraft = app.layersWindows;
@@ -83,16 +89,21 @@ void move_layer(int i, int step) {
         edit_launcher_layers([&](LauncherLayers& p) { moved = move_launcher_layer(p, app.layerPlan, name, step); });
         if (moved)
             app.layerRow = i + step;
-    } else if (move_system_layer(app.layersDraft, static_cast<size_t>(i), step)) {
-        app.layerRow = i + step;
+        app.layerMessage.clear();
+    } else {
+        // Reordering Windows' list would mean rewriting other vendors' registry values: never ours to do.
+        app.layerMessage = tr(kSystemOrderFixed);
+        app.layerTone = 2;
     }
-    app.layerMessage.clear();
 }
 
 void apply_layers() {
     const std::wstring error = apply_system_layers(app.hwnd, app.layersDraft);
     refresh_layers(!error.empty());
-    app.layerMessage = error.empty() ? L"Windows’ OpenXR layers updated. A backup of each list is in the logs folder." : error;
+    app.layerMessage = error.empty()
+                           ? std::wstring(tr(L"Windows’ OpenXR layers updated. A backup of each list is in the logs "
+                                             L"folder."))
+                           : error;
     app.layerTone = error.empty() ? 0 : 2;
 }
 
@@ -110,7 +121,8 @@ void arrow_button(Ctl id, int option, const Rect& r, bool disabled) {
     app.canvas.path(id == kLayerUp ? "M3 7.5L6 4.5l3 3" : "M3 4.5L6 7.5l3-3", {r.x + (r.w - 12) / 2, r.y + (r.h - 12) / 2, 12, 12},
                     12, col(disabled ? app.c->label_tertiary : app.c->label), 1.5f);
     if (!disabled)
-        app.hits.push_back({id, r, option, L"", id == kLayerUp ? L"Move up" : L"Move down"});  // the row says which layer
+        // The row says which layer.
+        app.hits.push_back({id, r, option, L"", id == kLayerUp ? tr(L"Move up") : tr(L"Move down")});
 }
 
 constexpr float kLayerControlsW = 40 + 14 + 32 + 4 + 32;
@@ -141,7 +153,7 @@ std::wstring layer_chain() {
             if (l.on)
                 add(friendly_layer(l.name, l.manifest));
     }
-    add(L"OpenXR runtime");
+    add(tr(L"OpenXR runtime"));
     return chain;
 }
 
@@ -150,7 +162,7 @@ std::wstring layer_chain() {
 // The OpenXR layers card: the profile (with the launcher, or Windows' own list), its layers nearest the game first, each
 // with its switch and moves, and the chain a frame goes through.
 Card layers_card() {
-    Card c{Tab::Game, L"OpenXR layers", Applies::NextLaunch};
+    Card c{Tab::Game, tr(L"OpenXR layers"), Applies::NextLaunch};
     c.body = [](Body& b) {
         // What loads, in a line; the list, its order and Windows' own list behind a More (for troubleshooting).
         int below = 0;
@@ -159,30 +171,36 @@ Card layers_card() {
             if (l.on) {
                 names += (below++ ? L", " : L"") + friendly_layer(l.name);
             }
-        b.note(below == 0 ? L"No other VR add-ons load with " + short_name() + L" from here."
-                          : std::to_wstring(below) + (below == 1 ? L" other VR add-on loads" : L" other VR add-ons load") +
-                                L" with " + short_name() + L" from here: " + names + L".");
-        b.more(kLayersMore, {L"Layers for", L"Load order, nearest the game first", L"A frame’s path"}, [](Body& b) {
-            b.segments(kLayerProfile, L"Layers for", {kLayerProfileNames[0], kLayerProfileNames[1]}, app.layerProfile);
+        b.note(below == 0   ? trf(L"No other VR add-ons load with {game} from here.", {{L"game", short_name()}})
+                            : trn(below, L"{count} other VR add-on loads with {game} from here: {names}.",
+                                  L"{count} other VR add-ons load with {game} from here: {names}.",
+                                  {{L"count", std::to_wstring(below)}, {L"game", short_name()}, {L"names", names}}));
+        b.more(tr(kLayersMore), {tr(L"Layers for"), tr(L"Load order, nearest the game first"), tr(L"A frame’s path")},
+               [](Body& b) {
+            b.segments(kLayerProfile, tr(L"Layers for"), {tr(kLayerProfileNames[0]), tr(kLayerProfileNames[1])},
+                       app.layerProfile);
             b.note(app.layerProfile == 0
-                       ? L"What " + short_name() + L" loads when you launch it from here. Windows’ own list stays as it is."
-                       : L"What every other app loads, and " + short_name() + L" started from Steam. Changes Windows’ registry.");
+                       ? trf(L"What {game} loads when you launch it from here. Windows’ own list stays as it is.",
+                             {{L"game", short_name()}})
+                       : trf(L"What every other app loads, and {game} started from Steam. Changes Windows’ registry.",
+                             {{L"game", short_name()}}));
             if (app.layerProfile == 0) {
-                b.group(L"Load order, nearest the game first");
+                b.group(tr(L"Load order, nearest the game first"));
                 for (const std::string& name : app.layerPlan.above)
-                    b.status(friendly_layer(name), L"No switch to turn it off per launch, so it stays above the Sim-QVFR layer.", 3,
-                             L"Above");
-                b.status(friendly_layer(kLayerName), L"Always nearest the game.", 3, L"Locked");
+                    b.status(friendly_layer(name),
+                             tr(L"No switch to turn it off per launch, so it stays above the Sim-QVFR layer."), 3,
+                             tr(L"Above"));
+                b.status(friendly_layer(kLayerName), tr(L"Always nearest the game."), 3, tr(L"Locked"));
                 const int n = static_cast<int>(app.layerPlan.layers.size());
                 for (int i = 0; i < n; ++i) {
                     const PlannedLayer& l = app.layerPlan.layers[i];
-                    std::wstring desc = !l.lock.empty() ? widen(l.lock) : l.systemOn ? L"" : L"Off in Windows";
+                    std::wstring desc = !l.lock.empty() ? widen(l.lock) : l.systemOn ? L"" : tr(L"Off in Windows");
                     // Cheeky's layer isn't the Picture tab's Use Cheeky Foveated DLSS: say which it is, while that is off.
                     if (l.name == kCheekyLayer && l.lock.empty()) {
                         const std::wstring what = !game_has(&games::GameFeatures::foveatedDlss)
-                                                      ? L"Cheeky’s VR add-on, for Foveated DLSS in ACE and ACC"
-                                                  : !app.s.cheeky.load ? L"Cheeky’s VR add-on. Foveated DLSS itself is off (Picture tab)"
-                                                                       : L"";
+                                ? tr(L"Cheeky’s VR add-on, for Foveated DLSS in ACE and ACC")
+                            : !app.s.cheeky.load ? tr(L"Cheeky’s VR add-on. Foveated DLSS itself is off (Picture tab)")
+                                                 : L"";
                         if (!what.empty())
                             desc = what + (desc.empty() ? L"" : L" · " + desc);
                     }
@@ -200,39 +218,41 @@ Card layers_card() {
                         if (l.machine != machine)
                             continue;
                         if (!any) {
-                            b.group(machine ? L"All users" : L"This user");
-                            b.note(machine ? L"Changing these needs administrator rights: Windows asks once when you apply."
-                                           : L"Windows loads these after the machine-wide ones.");
+                            b.group(machine ? tr(L"All users") : tr(L"This user"));
+                            b.note(machine ? tr(L"Changing these needs administrator rights: Windows asks once when "
+                                                L"you apply.")
+                                           : tr(L"Windows loads these after the machine-wide ones."));
                         }
                         any = true;
-                        const bool up = i > 0 && app.layersDraft[i - 1].machine == machine && app.layersDraft[i - 1].lock.empty() &&
-                                        l.lock.empty();
-                        const bool down = i + 1 < n && app.layersDraft[i + 1].machine == machine && l.lock.empty();
                         // Its manifest's path is its switch's tip, not its line (no developer paths in the text).
                         std::wstring desc = l.lock.empty() ? std::wstring() : widen(l.lock);
                         if (l.name.empty())
-                            desc += (desc.empty() ? L"" : L" · ") + std::wstring(L"Its manifest can’t be read");
+                            desc += (desc.empty() ? L"" : L" · ") + std::wstring(tr(L"Its manifest can’t be read"));
                         const bool on = l.on;
                         const std::wstring name = friendly_layer(l.name, l.manifest), manifest = l.manifest;
                         b.trailing(name, desc, kLayerControlsW, 32,
-                                   [=](const Rect& r) { layer_controls(r, name, i, on, false, up, down, manifest); });
+                                   [=](const Rect& r) { layer_controls(r, name, i, on, false, false, false, manifest); });  // no moves: Windows' order is shown, not changed
                     }
                 }
                 if (app.layersDraft.empty())
-                    b.chip(3, L"No OpenXR layers are registered in Windows.");
-                if (layers_dirty()) {
-                    b.chip(1, L"Changes not applied");
-                    b.actions({{kLayerRevert, L"Revert"}, {kLayerApply, L"Apply", Btn::Primary}});
+                    b.chip(3, tr(L"No OpenXR layers are registered in Windows."));
+                // Only switches apply here, so the lock's place alone is no change to apply.
+                if (app.layersDraft != app.layersWindows) {
+                    b.chip(1, tr(L"Changes not applied"));
+                    b.actions({{kLayerRevert, tr(L"Revert")}, {kLayerApply, tr(L"Apply"), Btn::Primary}});
                 }
-                b.note(app.layersLockMoved ? L"The Sim-QVFR layer is not first in its list: applying moves it there."
-                                           : L"The current list is backed up into the logs folder before it changes.");
+                b.note(app.layersLockMoved
+                           ? tr(L"In Windows’ list the Sim-QVFR layer is below another layer. Launches from here "
+                                L"always load it nearest the game.")
+                           : tr(L"Only the on/off switches change here, and the current list is backed up into the "
+                                L"logs folder first."));
             }
-            b.group(L"A frame’s path");
+            b.group(tr(L"A frame’s path"));
             b.note(layer_chain());
         });
-        b.note(L"Change these only when Launch checks or a guide asks you to.");
+        b.note(tr(L"Change these only when Launch checks or a guide asks you to."));
         if (!app.layerMessage.empty()) {
-            b.chip(app.layerTone, app.layerTone == 0 ? L"Applied" : L"Not applied");
+            b.chip(app.layerTone, app.layerTone == 0 ? tr(L"Applied") : tr(L"Not applied"));
             b.note(app.layerMessage);
         }
     };

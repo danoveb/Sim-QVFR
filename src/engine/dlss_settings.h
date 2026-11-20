@@ -13,6 +13,7 @@
 #include <windows.h>
 
 #include "../ini_put.h"
+#include "../i18n.h"
 #include "dlss_math.h"
 
 namespace simqvfr {
@@ -29,6 +30,9 @@ struct DlssSettings {
     // car_vectors: the game's other cars' own motion in DLSS's vectors where the game's side tracks them (LMU:
     // games/lmu/mvr_pass.h mvr_car_slots); with DLSS on at launch only (next launch). On: moving cars stay clean.
     bool carVectors = true;
+    // upscaler: what runs the views, 0 NVIDIA DLSS ("dlss"), 1 AMD FSR ("fsr"; live). An experiment: taken only where the
+    // game's [experiment] key allows it (LMU: lmu_fsr=1), else DLSS (engine/dlss_views.h DlssRun::upscaler).
+    int upscaler = 0;
     bool operator==(const DlssSettings&) const = default;
 };
 
@@ -38,14 +42,20 @@ struct DlssChoice {
     const wchar_t* name;
 };
 inline constexpr DlssChoice kDlssFocusModes[] = {
-    {100, L"DLAA"}, {77, L"Ultra quality"}, {67, L"Quality"}, {58, L"Balanced"}, {50, L"Performance"}};
+    {100, L"DLAA"}, {77, I18N(L"Ultra quality")}, {67, I18N(L"Quality")}, {58, I18N(L"Balanced")},
+    {50, I18N(L"Performance")}};
+// The same modes as AMD FSR names them (engine/fsr_upscale.h): its native AA for DLAA; FSR takes any render size.
+inline constexpr DlssChoice kFsrFocusModes[] = {
+    {100, I18N(L"Native AA")}, {77, I18N(L"Ultra quality")}, {67, I18N(L"Quality")}, {58, I18N(L"Balanced")},
+    {50, I18N(L"Performance")}};
 // The focus views' preset: NGX's default for the mode (K; M at Performance), or either.
-inline constexpr DlssChoice kDlssFocusPresets[] = {{0, L"Default"}, {11, L"K"}, {13, L"M"}};
+inline constexpr DlssChoice kDlssFocusPresets[] = {{0, I18N(L"Default")}, {11, L"K"}, {13, L"M"}};
 // The eyes': K, the steadier, or F, the older model at about half the cost with more aliasing (eye tracking keeps that
 // out of where you look; K suits a fixed focus).
-inline constexpr DlssChoice kDlssEyePresets[] = {{11, L"K (steadier)"}, {6, L"F (cheaper)"}};
+inline constexpr DlssChoice kDlssEyePresets[] = {{11, I18N(L"K (steadier)")}, {6, I18N(L"F (cheaper)")}};
 // Textures sampled sharper where DLSS works (NVIDIA's mip bias): off, the focus views only, or the eyes too.
-inline constexpr DlssChoice kDlssTextureSharpening[] = {{0, L"Off"}, {1, L"Focus only"}, {2, L"Focus and periphery"}};
+inline constexpr DlssChoice kDlssTextureSharpening[] = {
+    {0, I18N(L"Off")}, {1, I18N(L"Focus only")}, {2, I18N(L"Focus and periphery")}};
 
 // `value`'s place in `list`: the exact one, else (`nearest`) the closest value, else the first.
 template <size_t N>
@@ -126,6 +136,8 @@ inline DlssSettings read_dlss_settings(const wchar_t* ini) {
             kDlssTextureSharpening[dlss_choice_index(kDlssTextureSharpening, _wtoi(sharpening.c_str()), true)].value;
     const std::wstring cars = dlss_detail::read_text(ini, L"dlss", L"car_vectors", found);
     s.carVectors = !found || cars.empty() || _wtoi(cars.c_str()) != 0;
+    const std::wstring upscaler = dlss_detail::read_text(ini, L"dlss", L"upscaler", found);
+    s.upscaler = found && (_wcsicmp(upscaler.c_str(), L"fsr") == 0 || upscaler == L"1") ? 1 : 0;
     return s;
 }
 
@@ -139,6 +151,7 @@ inline bool write_dlss_settings(const wchar_t* ini, const DlssSettings& s) {
     ok &= ini_put(ini, L"dlss", L"texture_sharpening",
                   kDlssTextureSharpening[dlss_choice_index(kDlssTextureSharpening, s.textureSharpening, true)].value);
     ok &= ini_put(ini, L"dlss", L"car_vectors", s.carVectors ? 1 : 0);
+    ok &= ini_put(ini, L"dlss", L"upscaler", s.upscaler == 1 ? L"fsr" : L"dlss");
     return ok;
 }
 

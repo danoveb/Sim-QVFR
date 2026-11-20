@@ -13,11 +13,13 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include "png_test_util.h"
 #include "quad/compositor.h"
 #include "quad/focus_turn.h"
 #include "quad/fov_crop.h"
 #include "quad/helmet.h"
 #include "quad/views4_layout.h"
+#include "test_util.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace simqvfr;
@@ -28,8 +30,6 @@ constexpr UINT kAppW = 128, kAppH = 32;  // double-wide app images (64 per eye)
 constexpr UINT kOutW = 256, kOutH = 64;  // double-wide output (128 per eye)
 constexpr DXGI_FORMAT kTypeless = DXGI_FORMAT_R8G8B8A8_TYPELESS;
 constexpr DXGI_FORMAT kView = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-
-int failures = 0;
 
 struct Gpu {
     ComPtr<ID3D12Device> device;
@@ -99,33 +99,6 @@ void clear_rects(Gpu& gpu, ID3D12Resource* image, const float (&fill)[4], const 
     gpu.flush();
 }
 
-// A 1-pixel-wide PNG of `rows` RGBA rows (straight alpha), for the helmet's pieces.
-bool write_png(const std::wstring& path, const std::vector<uint32_t>& rows) {
-    const UINT height = static_cast<UINT>(rows.size());
-    std::vector<uint8_t> bgra(height * 4);
-    for (UINT y = 0; y < height; ++y) {
-        const uint32_t c = rows[y];  // 0xRRGGBBAA
-        bgra[y * 4 + 0] = static_cast<uint8_t>(c >> 8);
-        bgra[y * 4 + 1] = static_cast<uint8_t>(c >> 16);
-        bgra[y * 4 + 2] = static_cast<uint8_t>(c >> 24);
-        bgra[y * 4 + 3] = static_cast<uint8_t>(c);
-    }
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    ComPtr<IWICImagingFactory> wic;
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapEncoder> encoder;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
-    return SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
-           SUCCEEDED(wic->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
-           SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
-           SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
-           SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
-           SUCCEEDED(frame->SetSize(1, height)) && SUCCEEDED(frame->SetPixelFormat(&format)) &&
-           SUCCEEDED(frame->WritePixels(height, 4, static_cast<UINT>(bgra.size()), bgra.data())) &&
-           SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
-}
-
 struct Pixels {
     std::vector<uint8_t> data;
     UINT pitch = 0;
@@ -166,11 +139,6 @@ Pixels read_back(Gpu& gpu, ID3D12Resource* image) {
     std::memcpy(p.data.data(), mapped, p.data.size());
     buffer->Unmap(0, nullptr);
     return p;
-}
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
 }
 
 void expect(const Pixels& p, int eye, float u, float v, const char* name, uint8_t r, uint8_t g, uint8_t b) {
@@ -262,9 +230,7 @@ int SIM_QVFR_TEST_MAIN() {
     failures += blended ? 0 : 1;
 
     // Debug captures: three PNGs of the left eye.
-    wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
-    const std::wstring prefix = std::wstring(temp) + L"simqvfr-compositor-test";
+    const std::wstring prefix = temp_path(L"simqvfr-compositor-test");
     const bool saved = compositor.save_captures(frameB.Get(), output.Get(), prefix);
     WIN32_FILE_ATTRIBUTE_DATA info{};
     const bool exists = GetFileAttributesExW((prefix + L"-output.png").c_str(), GetFileExInfoStandard, &info) &&
@@ -594,11 +560,9 @@ int SIM_QVFR_TEST_MAIN() {
         // top piece's first quarter is white, the bottom piece's last quarter yellow, the visor's second
         // quarter black; the rest of each is clear (white, so a fringe would show). The visor slid up by a
         // quarter takes its band with it.
-        wchar_t tempDir[MAX_PATH];
-        GetTempPathW(MAX_PATH, tempDir);
-        const std::wstring top = std::wstring(tempDir) + L"simqvfr-helmet-top.png",
-                           bottom = std::wstring(tempDir) + L"simqvfr-helmet-bottom.png",
-                           visor = std::wstring(tempDir) + L"simqvfr-helmet-visor.png";
+        const std::wstring top = temp_path(L"simqvfr-helmet-top.png"),
+                           bottom = temp_path(L"simqvfr-helmet-bottom.png"),
+                           visor = temp_path(L"simqvfr-helmet-visor.png");
         const uint32_t clear = 0xFFFFFF00;
         const bool written =
             write_png(top, {0xFFFFFFFF, 0xFFFFFFFF, clear, clear, clear, clear, clear, clear}) &&
@@ -831,7 +795,7 @@ int SIM_QVFR_TEST_MAIN() {
 
     // Sharpening on D3D12 (ACE): the same shader and root constants as the D3D11 compositor's (cas_sharpen_test checks
     // the filter itself). Flat views at 100% give the plain composition's pixels exactly; mid-grey stripes in the outer
-    // view (4 texels each, upscaled 2x) come out with more contrast, the stripes' middles unchanged.
+    // view (4 texels each, upscaled 2x) come out as bilinear's: the periphery is never sharpened.
     {
         clear_eyes(gpu, frameA.Get(), red, blue);
         bool same = compositor.capture_outer(frameA.Get());
@@ -860,21 +824,14 @@ int SIM_QVFR_TEST_MAIN() {
             composed = composed && compositor.compose(frameB.Get(), output.Get(), pass ? sharp : eyes);
             rows[pass] = read_back(gpu, output.Get());
         }
-        // Eye 0's row 6, above its focus box: all outer view.
+        // Eye 0's row 6, above its focus box: all outer view, as bilinear's at 100%.
         const UINT y = 6;
-        int variation[2] = {}, middleOff = 0;
-        for (int pass = 0; pass < 2; ++pass)
-            for (UINT x = 1; x < kOutW / 2; ++x)
-                variation[pass] += std::abs(static_cast<int>(rows[pass].at(x, y)[1]) - static_cast<int>(rows[pass].at(x - 1, y)[1]));
-        // The output pixels between a stripe's second and third texels (x = 2s + 3, 2s + 4 for a stripe from s): all
-        // their taps inside the stripe, so CAS leaves them as bilinear does.
-        for (UINT s = 8; s + 8 < kAppW / 2; s += 8)
-            for (const UINT x : {2 * s + 3, 2 * s + 4})
-                middleOff = std::max(middleOff, std::abs(static_cast<int>(rows[1].at(x, y)[1]) - static_cast<int>(rows[0].at(x, y)[1])));
+        int off = 0;
+        for (UINT x = 0; x < kOutW / 2; ++x)
+            off = std::max(off, std::abs(static_cast<int>(rows[1].at(x, y)[1]) - static_cast<int>(rows[0].at(x, y)[1])));
         char what[160];
-        std::snprintf(what, sizeof(what), "sharpening (D3D12): stripes' contrast up (variation %d against %d), their middles "
-                      "as bilinear's (off by %d at most)", variation[1], variation[0], middleOff);
-        check(composed && variation[1] > variation[0] * 11 / 10 && middleOff <= 1, what);
+        std::snprintf(what, sizeof(what), "sharpening (D3D12): the periphery's stripes as bilinear's at 100%% (off by %d)", off);
+        check(composed && off == 0, what);
     }
 
     compositor.shutdown();

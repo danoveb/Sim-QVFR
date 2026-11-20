@@ -10,6 +10,7 @@
 #include "../launcher.h"
 #include "../game_tabs.h"
 #include "../settings.h"
+#include "../update_check.h"
 #include "../../engine/nvapi_gpus.h"
 #include "../../games/game.h"
 #include "window_state.h"
@@ -46,13 +47,13 @@ void activate(Ctl id, int option) {
         return;
     case kSearchField: SetFocus(app.searchEdit); return;
     case kSheetButton: close_sheet(option); return;
-    case kChecksBadge: jump_to({L"Launch checks", L"Launch checks", Pane::Game}); return;
+    case kChecksBadge: jump_to({tr(L"Launch checks"), tr(L"Launch checks"), Pane::Game}); return;
     case kUndoBadge: undo_restore(); return;
     case kUndoChange: undo_change(); return;
     case kLaunchBadge: {
         const LaunchOutcome o = app.watch.outcome();
         if (o.link == LaunchLink::Diagnostics) {
-            jump_to({L"Diagnostics", L"Diagnostics", Pane::Game});
+            jump_to({tr(L"Diagnostics"), tr(L"Diagnostics"), Pane::Game});
         } else if (o.link == LaunchLink::Report) {
             if (o.state == LaunchState::Crashed)
                 app.reportKind = 1;  // kIssueKinds: Crash or freeze
@@ -84,23 +85,24 @@ void activate(Ctl id, int option) {
         if (id == kProfileUse || id == kProfileRevert) {
             use_profile(name);
             if (id == kProfileRevert && app.profileMatches)
-                app.profileMessage = L"Back to " + name + L".";
+                app.profileMessage = trf(L"Back to {name}.", {{L"name", name}});
         } else if (id == kProfileUpdate) {  // the settings now, into the profile in use: no question, it's its own button
             if (save_profile(profiles_folder(app.ini), settings_profile(app.s, name))) {
-                app.profileMessage = L"Updated " + name + L" with the settings you have now.";
+                app.profileMessage = trf(L"Updated {name} with the settings you have now.", {{L"name", name}});
             } else {
-                app.profileMessage = L"Couldn’t update " + name + L".";
+                app.profileMessage = trf(L"Couldn’t update {name}.", {{L"name", name}});
             }
             refresh_profiles();
         } else if (id == kProfileShare && load_profile(profiles_folder(app.ini), name, p, app.s.eyeTracking)) {
             app.profileMessage = copy_text(widen(share_profile(p)))
-                                     ? L"Copied " + name + L" to the clipboard: paste it in a chat or a post."
-                                     : L"Couldn’t copy to the clipboard.";
+                                     ? trf(L"Copied {name} to the clipboard: paste it in a chat or a post.",
+                                           {{L"name", name}})
+                                     : std::wstring(tr(L"Couldn’t copy to the clipboard."));
         } else if (id == kProfileDelete) {
             Sheet s;
-            s.title = L"Delete " + name + L"?";
-            s.text = L"It goes from Your profiles. The settings you have now stay as they are.";
-            s.buttons = {L"Cancel", L"Delete"};
+            s.title = trf(L"Delete {name}?", {{L"name", name}});
+            s.text = tr(L"It goes from Your profiles. The settings you have now stay as they are.");
+            s.buttons = {tr(L"Cancel"), tr(L"Delete")};
             s.focus = 0;
             s.danger = true;
             s.done = [name](int button, const std::wstring&) {
@@ -109,7 +111,7 @@ void activate(Ctl id, int option) {
                 delete_profile(profiles_folder(app.ini), name);
                 if (_wcsicmp(name.c_str(), app.profileCurrent.c_str()) == 0)
                     set_current_profile(app.ini.c_str(), L"");
-                app.profileMessage = L"Deleted " + name + L".";
+                app.profileMessage = trf(L"Deleted {name}.", {{L"name", name}});
                 refresh_profiles();
             };
             open_sheet(std::move(s));
@@ -131,6 +133,7 @@ void activate(Ctl id, int option) {
     case kDiagCapture: app.s.cpuProfile = !app.s.cpuProfile; changed(); return;
     case kDiagFrameCapture: app.s.frameCapture = !app.s.frameCapture; changed(); return;
     case kDiagBaseline: app.s.baselineNext = !app.s.baselineNext; changed(); return;
+    case kDiagDebugLogs: app.s.debugLogs = app.s.debugLogs > 0 ? 0 : kDebugLogLaunches; changed(); return;
     case kAntiCheat: {
         if (!games::launcher_game().antiCheatStart)
             return;
@@ -141,11 +144,11 @@ void activate(Ctl id, int option) {
         }
         // On: only once the player has read and accepted that a kick or a ban is theirs to risk.
         Sheet s;
-        s.title = L"Run " + short_name() + L" with its anti-cheat?";
-        s.text = L"This lets you join online servers with Sim-QVFR running. The game’s anti-cheat can kick you, or ban your "
-                 L"account, for using Sim-QVFR.\n\nSim-QVFR and its developer are not responsible for any kick or ban. By "
-                 L"turning this on, you accept that risk and the responsibility for it.";
-        s.buttons = {L"Cancel", L"I accept the risk"};
+        s.title = trf(L"Run {game} with its anti-cheat?", {{L"game", short_name()}});
+        s.text = tr(L"This lets you join online servers with Sim-QVFR running. The game’s anti-cheat can kick you, or "
+                    L"ban your account, for using Sim-QVFR.\n\nSim-QVFR and its developer are not responsible for any "
+                    L"kick or ban. By turning this on, you accept that risk and the responsibility for it.");
+        s.buttons = {tr(L"Cancel"), tr(L"I accept the risk")};
         s.focus = 0;
         s.danger = true;
         s.done = [](int button, const std::wstring&) {
@@ -157,7 +160,8 @@ void activate(Ctl id, int option) {
         open_sheet(std::move(s));
         return;
     }
-    case kDiagKind: open_popup(id); return;
+    case kDiagKind:
+    case kLanguage: open_popup(id); return;
     case kDiagDescription:
         if (app.panel != PanelKind::Report)
             return;
@@ -184,6 +188,7 @@ void activate(Ctl id, int option) {
     case kDiagZip: show_report_zip(); return;  // the keyboard's; the mouse drags it (drag_report_zip)
     case kDiagCopy: copy_summary(); return;
     case kDiagLogs: ShellExecuteW(app.hwnd, L"explore", logs_folder().c_str(), nullptr, nullptr, SW_SHOWNORMAL); return;
+    case kDiagClearCaptures: clear_captures(); return;
     case kLayerOn: app.layerRow = option; toggle_layer(option); break;
     case kLayerUp: move_layer(option, -1); break;
     case kLayerDown: move_layer(option, 1); break;
@@ -203,6 +208,7 @@ void activate(Ctl id, int option) {
     case kShape:
     case kVisor:
     case kHelmetDetail:
+    case kEyeOff:
     case kDlssFocusPreset:
     case kDlssEyePreset:
     case kNrOrder:
@@ -259,13 +265,13 @@ void activate(Ctl id, int option) {
         return;
     case kNrFolder: choose_nr_dll(); return;
     case kDlssOn:
-        if (own_dlss_available()) {  // greyed out without QVFR, an RTX card or multi-view rendering
+        if (own_upscaler_available()) {  // greyed out without QVFR (DLSS or, without an RTX card, FSR)
             app.s.dlss.on = !app.s.dlss.on;
             changed();
         }
         return;
     case kDlssCarVectors:
-        if (own_dlss_available() && app.s.dlss.on) {  // greyed out while DLSS is off
+        if (own_upscaler_available() && app.s.dlss.on) {  // greyed out while DLSS (or FSR) is off
             app.s.dlss.carVectors = !app.s.dlss.carVectors;
             changed();
         }
@@ -279,7 +285,9 @@ void activate(Ctl id, int option) {
         }
         return;
     case kOsdOn: app.s.osd.enabled = !app.s.osd.enabled; changed(); return;
+    case kClockOn: app.s.clock.enabled = !app.s.clock.enabled; changed(); return;
     case kHotkeyFooter: app.s.hotkeyFooter = !app.s.hotkeyFooter; changed(); return;
+    case kCpuIsolateMain: app.s.cpuIsolateMain = !app.s.cpuIsolateMain; changed(); return;
     case kUpdateCheck:
         app.s.updateCheck = !app.s.updateCheck;
         app.s.updateAsked = true;  // a choice: the first start's question is answered
@@ -289,11 +297,15 @@ void activate(Ctl id, int option) {
         return;
     case kUpdateNow: start_update_check(); InvalidateRect(app.hwnd, nullptr, FALSE); return;
     case kUpdateDownload:
-        if (!app.release.url.empty() && app.release.url.rfind(L"https://github.com/", 0) == 0)
+        // The page GitHub's API named: opened only if it is one of this repository's release pages.
+        if (trusted_release_page(app.release.url))
             ShellExecuteW(app.hwnd, L"open", app.release.url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
     case kUpdateBadge: open_panel(PanelKind::About); return;
     case kUpdateInstall: start_install(); InvalidateRect(app.hwnd, nullptr, FALSE); return;
+    case kUpdateRollback: start_restore(); InvalidateRect(app.hwnd, nullptr, FALSE); return;
+    case kUpdateSkip: skip_release(true); InvalidateRect(app.hwnd, nullptr, FALSE); return;
+    case kUpdateUnskip: skip_release(false); InvalidateRect(app.hwnd, nullptr, FALSE); return;
     case kGameShown: {
         std::size_t count = 0;
         const games::GameInfo* const* all = games::all_games(count);
@@ -304,9 +316,9 @@ void activate(Ctl id, int option) {
             return;  // the last tab stays
         // An installed game is hidden by its listing in hidden_games; one Steam doesn't find is shown by shown_games.
         if (installed(*all[option]))
-            app.s.hiddenGames = with_game_hidden(app.s.hiddenGames, game_id(*all[option]), hide);
+            app.s.hiddenGames = with_game_hidden(app.s.hiddenGames, games::wide_id(*all[option]), hide);
         else
-            app.s.shownGames = with_game_hidden(app.s.shownGames, game_id(*all[option]), !hide);
+            app.s.shownGames = with_game_hidden(app.s.shownGames, games::wide_id(*all[option]), !hide);
         changed();
         if (hide && all[option] == &games::launcher_game())  // the game in use went: the first shown takes over
             for (std::size_t i = 0; i < count; ++i)
@@ -323,7 +335,7 @@ void activate(Ctl id, int option) {
         InvalidateRect(app.hwnd, nullptr, FALSE);
         return;
     case kColorReset:
-        app.s.gameColors.erase(game_id(color_game()));
+        app.s.gameColors.erase(games::wide_id(color_game()));
         app.colorLoaded = -2;
         load_color_edit();
         apply_theme();
@@ -332,12 +344,6 @@ void activate(Ctl id, int option) {
     case kCropOn:
         if (app.s.mode == RenderMode::Qvfr && game_has(&games::GameFeatures::fovCrop)) {
             app.s.crop = !app.s.crop;
-            changed();
-        }
-        return;
-    case kNativeQuad:  // auto (1) or off (0); a hand-set 2 (asked for behind another layer) becomes off, then auto
-        if (app.s.mode == RenderMode::Qvfr && game_has(&games::GameFeatures::nativeQuadViews)) {
-            app.s.nativeQuad = app.s.nativeQuad ? 0 : 1;
             changed();
         }
         return;
@@ -353,6 +359,12 @@ void activate(Ctl id, int option) {
     case kOutline: app.s.outline = !app.s.outline; changed(); return;
     case kRegFocus: app.s.regulator.focus = !app.s.regulator.focus; changed(); return;
     case kRegPeriphery: app.s.regulator.periphery = !app.s.regulator.periphery; changed(); return;
+    case kGradeOn:
+        if (app.s.mode == RenderMode::Qvfr && game_has(&games::GameFeatures::sharpening)) {
+            app.s.grade.on = !app.s.grade.on;
+            changed();
+        }
+        return;
     case kCheekyUse: app.s.cheeky.load = !app.s.cheeky.load; changed(); return;
     case kCheekyOn: app.s.cheeky.processing = !app.s.cheeky.processing; changed(); return;
     case kCheekyOuter: app.s.cheeky.outerDlaa = !app.s.cheeky.outerDlaa; changed(); return;
@@ -404,6 +416,9 @@ bool push_button(Ctl id) {
     case kUpdateNow:
     case kUpdateDownload:
     case kUpdateInstall:
+    case kUpdateRollback:
+    case kUpdateSkip:
+    case kUpdateUnskip:
     case kUpdateBadge:
     case kLayerApply:
     case kLayerRevert:
@@ -442,6 +457,7 @@ bool push_button(Ctl id) {
     case kDiagExport:
     case kDiagCopy:
     case kDiagLogs:
+    case kDiagClearCaptures:
     case kReportOpen:
     case kPanelClose:
     case kColorPreset:
@@ -461,6 +477,7 @@ bool space_control(Ctl id) {
     case kOutline:
     case kRegFocus:
     case kRegPeriphery:
+    case kGradeOn:
     case kCheekyUse:
     case kCheekyOn:
     case kCheekyOuter:
@@ -489,14 +506,16 @@ bool space_control(Ctl id) {
     case kDlssEyePreset:
     case kDlssSharpening:
     case kOsdOn:
+    case kClockOn:
     case kHotkeyFooter:
+    case kCpuIsolateMain:
     case kUpdateCheck:
-    case kNativeQuad:
     case kCropOn:
     case kHelmetOn:
     case kVisor:
     case kShape:
     case kHelmetDetail:
+    case kEyeOff:
     case kLayerProfile:
     case kOverviewProfile:
     case kPreviewEye:
@@ -504,7 +523,9 @@ bool space_control(Ctl id) {
     case kDiagCapture:
     case kDiagFrameCapture:
     case kDiagBaseline:
+    case kDiagDebugLogs:
     case kDiagKind:
+    case kLanguage:
     case kGameShown:
     case kAntiCheat:
     case kColorGame: return true;
@@ -681,7 +702,8 @@ void on_key(WPARAM key) {
         break;
     }
     case kMenuPanel:
-    case kOsdPanel: {  // arrows move the panel a degree, Page Up / Page Down ten
+    case kOsdPanel:
+    case kClockPanel: {  // arrows move the panel a degree, Page Up / Page Down ten
         const int step = key == VK_PRIOR || key == VK_NEXT ? 10 : 1;
         const int dx = key == VK_RIGHT ? step : key == VK_LEFT ? -step : 0;
         const int dy = key == VK_UP || key == VK_PRIOR ? step : key == VK_DOWN || key == VK_NEXT ? -step : 0;

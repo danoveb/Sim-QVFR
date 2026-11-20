@@ -12,6 +12,8 @@
 #include "cheeky/cheeky_host.h"
 #include "log.h"
 #include "probe/cpu_load.h"
+#include "probe/cpu_placement.h"
+#include "probe/cpu_isolation.h"
 #include "probe/d3d11_capture.h"
 #include "probe/d3d11_compose_timer.h"
 #include "probe/d3d12_trace.h"
@@ -20,6 +22,7 @@
 #include "probe/gpu_load.h"
 #include "probe/hang_watch.h"
 #include "probe/pass_census.h"
+#include "games/ace/replay_probe.h"
 #include "probe/probe.h"
 #include "probe/vram_census.h"
 #include "quad/session_graphics.h"
@@ -38,6 +41,8 @@ XrResult XRAPI_CALL layerEnumerateViewConfigurationViews(XrInstance instance, Xr
         std::lock_guard guard(quad.mutex);
         quad.nativeW = views[0].recommendedImageRectWidth;
         quad.nativeH = views[0].recommendedImageRectHeight;
+        quad.maxW = views[0].maxImageRectWidth;
+        quad.maxH = views[0].maxImageRectHeight;
         runtime_info(L"recommended_width", std::to_wstring(views[0].recommendedImageRectWidth));
         runtime_info(L"recommended_height", std::to_wstring(views[0].recommendedImageRectHeight));
         runtime_info(L"max_width", std::to_wstring(views[0].maxImageRectWidth));
@@ -56,11 +61,11 @@ XrResult XRAPI_CALL layerEnumerateViewConfigurationViews(XrInstance instance, Xr
     const double viewHeight = layout.layer_height();
     const double widthScale = experiment.views4 ? (separate || oneSize ? viewWidth
                                                    : columns ? layout.column_eye_width() : layout.eye_width())
-                                                : experiment.eyeScale;
+                                                : experiment.eyeScale * (experiment.replayCompose ? experiment.crop().kept_width() : 1.0);
     const double heightScale = experiment.views4
                                    ? (separate ? viewHeight : oneSize ? 2 * viewHeight
                                                             : columns ? layout.column_eye_height() : layout.eye_height())
-                                   : experiment.eyeScale;
+                                   : experiment.eyeScale * (experiment.replayCompose ? experiment.crop().kept_height() : 1.0);
     if ((oneSize || separate) && stereo &&
         (layout.outer_width() != layout.focus || layout.outer_height() != layout.focusHeight || layout.layerFloor > 0 ||
          layout.secondViewRoom))
@@ -91,6 +96,8 @@ XrResult XRAPI_CALL layerEnumerateViewConfigurationViews(XrInstance instance, Xr
         quad.reportedW = views[0].recommendedImageRectWidth;
         quad.reportedH = views[0].recommendedImageRectHeight;
     }
+    if (stereo)
+        game->views_offered(views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight);
     if (XR_SUCCEEDED(r) && views && countOutput)
         for (uint32_t i = 0; i < *countOutput && i < capacity; ++i)
             logf("xrEnumerateViewConfigurationViews type=%d view=%u recommended=%ux%u max=%ux%u samples=%u", type, i,
@@ -112,6 +119,7 @@ XrResult XRAPI_CALL layerCreateSession(XrInstance instance, const XrSessionCreat
             sessionGraphics = session_graphics(binding);
         }
         hang_watch_arm(experiment.hangWatchSeconds);
+        log_async(true);  // while the session runs, the game's threads don't wait on the log's disk writes
         game->session_created(experiment.probes && probe_start());
         if (!experiment.probes)
             log_line(experiment.views3 ? "engine probes and D3D12 trace off (probes=0); views3 cannot report the view mode"
@@ -119,16 +127,15 @@ XrResult XRAPI_CALL layerCreateSession(XrInstance instance, const XrSessionCreat
         if (binding && binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
             ID3D11Device* device = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding)->device;
             d3d11_capture_start(device, experiment.d3d11CaptureFrame);
-            // Every D3D11 game adapter may inspect its OpenXR session device. Adapters that do not need it use the
-            // default no-op implementation. This also lets an experimental adapter run log-only D3D11 probes while
-            // mode=off, without enabling the D3D11 compositor or altering rendering.
-            game->d3d11_session(device);
+            if (experiment.views4ComposeD3D11 || game->observes_d3d11() || game->measure_only())
+                game->d3d11_session(device);
             cheeky_session_d3d11(device);  // when Cheeky runs in this game (loads_cheeky)
             if (experiment.views4 || experiment.measure) {  // as D3D12 below: the overlay's GPU split and busiest thread
                 const SessionGraphics graphics{nullptr, nullptr, device};
                 if (LUID adapter{}; graphics.adapter_luid(adapter))
                     gpu_load_start(static_cast<uint32_t>(adapter.HighPart), adapter.LowPart);
                 cpu_load_start();
+                cpu_placement_start();
                 if (experiment.views4ComposeD3D11)
                     d3d11_compose_timer_start(device);
             }
@@ -150,17 +157,66 @@ XrResult XRAPI_CALL layerCreateSession(XrInstance instance, const XrSessionCreat
                     pass_census_arm(experiment.passCensusFrame, 10);
                 }
             }
+            if (experiment.replayProbe) {  // API-level QVFR probes: G5 re-emission cost (1/2), R1 focus depth replay (3)
+                ReplayFocusSettings focusSettings;
+                focusSettings.boxFraction = experiment.replayFocusPercent / 100.0;
+                focusSettings.pixelScale = experiment.replayFocusScalePercent / 100.0;
+                if (experiment.replayCompose) {
+                    // The API path takes [quad]'s sizes: the box a share of the (cropped) view ACE renders, the focus
+                    // views focus_percent x focus_density of the native eye wide, against ACE's eye at periphery_scale.
+                    const double box = std::clamp(experiment.box_x(), 0.05, 0.6);
+                    const double eye = experiment.eyeScale * experiment.crop().kept_width();
+                    const double k = eye > 0 ? experiment.views4Layout.focus / eye : box * 2;
+                    focusSettings.boxFraction = box;
+                    focusSettings.pixelScale = std::clamp(k / box, 0.5, 12.0);
+                    // The same vertically: a crop keeps different shares of the eye's width and height, and the focus
+                    // height may be set on its own.
+                    const double boxY = std::clamp(experiment.box_y(), 0.05, 0.6);
+                    const double eyeY = experiment.eyeScale * experiment.crop().kept_height();
+                    const double kY = eyeY > 0 ? experiment.views4Layout.focusHeight / eyeY : boxY * 2;
+                    focusSettings.boxFractionY = boxY;
+                    focusSettings.pixelScaleY = std::clamp(kY / boxY, 0.5, 12.0);
+                    experiment.replayEyeShareX = eye;  // for the live sizes (live_ini)
+                    experiment.replayEyeShareY = eyeY;
+                }
+                focusSettings.saveFirst = experiment.replaySaveFirst;
+                focusSettings.saveEvery = experiment.replaySaveEvery;
+                focusSettings.saveCount = experiment.replaySaveCount;
+                focusSettings.allTargets = experiment.replayAllTargets;
+                focusSettings.tiles = experiment.replayTiles;
+                focusSettings.fog = experiment.replayFog;
+                focusSettings.shadows = experiment.replayShadows;
+                focusSettings.transparents = experiment.replayTransparents;
+                focusSettings.atmosphere = experiment.replayAtmosphere;
+                focusSettings.costAb = experiment.replayCostAb;
+                focusSettings.sky = experiment.replaySky;
+                focusSettings.tyres = experiment.replayTyres;
+                focusSettings.gpuSteps = experiment.replayGpuSteps;
+                focusSettings.maskAb = experiment.replayMaskAb && experiment.replayGpuSteps;
+                focusSettings.recordTiming = experiment.replayRecordTiming;
+                focusSettings.cullProbe = experiment.replayCullProbe;
+                focusSettings.cull = experiment.replayCull;
+                focusSettings.diag = experiment.replayDiag;
+                focusSettings.diagMode = experiment.replayDiagMode;
+                focusSettings.post = experiment.replayPost;
+                focusSettings.dlss = experiment.replayDlss;
+                focusSettings.dlssScale = experiment.replayDlssFocusScale / 100.0;
+                replay_probe_start(d3d12->device, experiment.replayProbe, d3d12->queue, focusSettings);
+            }
             if (experiment.d3d12Debug)
                 d3d12_debug_attach(d3d12->device);
             std::lock_guard guard(quad.mutex);
             quad.device = d3d12->device;
             quad.queue = d3d12->queue;
-            if (experiment.views4 && experiment.gpuFrameTiming)
+            // views4: up to ACE's eye-image release (and the composition); baseline (measure, no four views): up to
+            // the release of the swapchain the game submits (measuredEyeChain), its own frame.
+            if ((experiment.views4 || experiment.measure) && experiment.gpuFrameTiming)
                 gpu_frame_timer_start(d3d12->device, d3d12->queue);
             if (experiment.views4 || experiment.measure) {  // the whole GPU's and ACE's threads' load (the overlay, the log)
                 const LUID adapter = d3d12->device->GetAdapterLuid();
                 gpu_load_start(static_cast<uint32_t>(adapter.HighPart), adapter.LowPart);
                 cpu_load_start();
+                cpu_placement_start();
             }
             cheeky_session(d3d12->device, d3d12->queue);
         } else if (experiment.quad) {
@@ -180,6 +236,8 @@ XrResult XRAPI_CALL layerDestroySession(XrSession session) {
     ini_worker_sync();  // the menu's and hotkeys' last changes reach the ini
     menu_shutdown();  // its swapchain and space belong to the session
     osd_shutdown();
+    clock_shutdown();
+    eye_off_session_ended();
     probe_stop();
     game->session_destroyed();
     dred_stop();
@@ -190,14 +248,38 @@ XrResult XRAPI_CALL layerDestroySession(XrSession session) {
         v4d3d11.chains.clear();
         v4d3d11.outChain = XR_NULL_HANDLE;  // the session's: destroyed with it
         v4d3d11.outImages.clear();
+        v4d3d11.outDensity = {};
+        v4d3d11.retiredChain = XR_NULL_HANDLE;  // also the session's
+        v4d3d11.retiredFrames = 0;
+        v4d3d11.growFailed = false;
         v4d3d11.failed = false;
         v4d3d11.focusChain = XR_NULL_HANDLE;  // also the session's
         v4d3d11.focusImages.clear();
         v4d3d11.focusW = v4d3d11.focusH = 0;
         v4d3d11.focusFailed = false;
-        v4d3d11.peripheryChain = XR_NULL_HANDLE;  // also the session's
-        v4d3d11.peripheryImages.clear();
-        v4d3d11.peripheryFailed = v4d3d11.peripheryDrawFailed = v4d3d11.peripherySharpened = false;
+        for (ID3D11RenderTargetView* t : v4d3d11.padTargets)
+            if (t)
+                t->Release();
+        v4d3d11.padTargets.clear();
+        v4d3d11.padChain = v4d3d11.padRetired = XR_NULL_HANDLE;  // the session's
+        v4d3d11.padImages.clear();
+        v4d3d11.padFormat = 0;
+        v4d3d11.padW = v4d3d11.padH = 0;
+        v4d3d11.padRetiredFrames = 0;
+        v4d3d11.padFailed = false;
+        v4d3d11.padGradeFailed = false;
+        v4d3d11.padGradeRetry = 0;
+        v4d3d11.padGradeLogged = false;
+        v4d3d11.gradeLayerLogged = false;
+        v4d3d11.gradeState = 0;
+        if (v4d3d11.padded)
+            logf("native quad views: %llu frames with views 0-1 padded out to the runtime's eyes (%llu of them without "
+                 "focus views)",
+                 static_cast<unsigned long long>(v4d3d11.padded),
+                 static_cast<unsigned long long>(v4d3d11.paddedEyesOnly));
+        v4d3d11.padded = 0;
+        v4d3d11.paddedEyesOnly = 0;
+        v4d3d11.outPending = v4d3d11.focusPending = v4d3d11.padPending = {};  // gone with their chains
         v4d3d11.loggedTexelsPerPixel = 0;
         v4d3d11.layered = 0;
     }
@@ -224,6 +306,8 @@ XrResult XRAPI_CALL layerDestroySession(XrSession session) {
         quad.appChain = quad.outChain = XR_NULL_HANDLE;
         quad.appImages.clear();
         quad.outImages.clear();
+        quad.outPending = {};
+        quad.outDensity = {};
         quad.outerCaptured = quad.aViewsValid = quad.releaseHeld = false;
         quad.device = nullptr;
         quad.queue = nullptr;
@@ -241,8 +325,12 @@ XrResult XRAPI_CALL layerDestroySession(XrSession session) {
     }
     gpu_frame_timer_stop();
     d3d11_compose_timer_stop();
+    measuredEyeChain = XR_NULL_HANDLE;  // the session's swapchain
     gpu_load_stop();
     cpu_load_stop();
+    cpu_placement_stop();
+    cpu_isolation_end();
+    log_async(false);  // the session's last lines written before it goes
     pad_watch_stop();
     {
         std::lock_guard guard(gaze.mutex);  // the session's spaces and attachment go with it
@@ -370,8 +458,16 @@ void quad_adopt_chain(XrSession session, const XrSwapchainCreateInfo* info, XrSw
     }
     XrSwapchainCreateInfo out = *info;
     out.next = nullptr;
-    out.width = 2 * quad.nativeW;
-    out.height = quad.nativeH;
+    // views4: at the focus density's size (quad/output_density.h; made once, not grown live); the two loops at native.
+    if (experiment.views4Compose || experiment.replayCompose) {
+        views4_output_chain(quad.outDensity);
+    } else {
+        quad.outDensity = {};
+        quad.outDensity.eyeW = quad.nativeW;
+        quad.outDensity.eyeH = quad.nativeH;
+    }
+    out.width = 2 * quad.outDensity.eyeW;
+    out.height = quad.outDensity.eyeH;
     out.mipCount = 1;
     out.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     XrSwapchain outChain = XR_NULL_HANDLE;
@@ -422,7 +518,7 @@ XrResult XRAPI_CALL layerCreateSwapchain(XrSession session, const XrSwapchainCre
         std::lock_guard guard(v4d3d11.mutex);
         v4d3d11.chains[*swapchain].format = info->format;
     }
-    if (XR_SUCCEEDED(r) && (experiment.quad || experiment.views4Compose) &&
+    if (XR_SUCCEEDED(r) && (experiment.quad || experiment.views4Compose || experiment.replayCompose) &&
         (info->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT))
         quad_adopt_chain(session, info, *swapchain);
     return r;
@@ -485,6 +581,8 @@ XrResult XRAPI_CALL layerEnumerateSwapchainImages(XrSwapchain swapchain, uint32_
 XrResult XRAPI_CALL layerAcquireSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageAcquireInfo* info,
                                                uint32_t* index) {
     const XrResult r = next.AcquireSwapchainImage(swapchain, info, index);
+    if (XR_SUCCEEDED(r))
+        game->swapchain_acquired(swapchain, *index, next.EnumerateSwapchainImages);
     if (XR_SUCCEEDED(r) && index && game)
         game->qvfr_note_swapchain_acquired(swapchain, *index);
     if (XR_SUCCEEDED(r) && experiment.d3d11CaptureFrame)
@@ -498,12 +596,63 @@ XrResult XRAPI_CALL layerAcquireSwapchainImage(XrSwapchain swapchain, const XrSw
         std::lock_guard guard(v4outline.mutex);
         v4outline.acquired[swapchain] = *index;
     }
-    if (XR_SUCCEEDED(r) && (experiment.quad || experiment.views4Compose)) {
+    if (XR_SUCCEEDED(r) && (experiment.quad || experiment.views4Compose || experiment.replayCompose)) {
         std::lock_guard guard(quad.mutex);
         if (swapchain == quad.appChain)
             quad.appAcquired = *index;
     }
     return r;
+}
+
+// Everything kept for the game's swapchain goes before it does (its raw image pointers would dangle, and the runtime
+// may hand the handle value out again): its size, the outline's and the D3D11 compositor's images, the game adapter's
+// (ATS's corner), and, for the eye chain the quad pipeline adopted, the adoption with its output chain, so a chain
+// made again (a game's settings change) is adopted afresh.
+XrResult XRAPI_CALL layerDestroySwapchain(XrSwapchain swapchain) {
+    logf("xrDestroySwapchain handle=%p", static_cast<void*>(swapchain));
+    {
+        std::lock_guard guard(chainMutex);
+        chainSizes.erase(swapchain);
+    }
+    {
+        std::lock_guard guard(v4outline.mutex);
+        v4outline.formats.erase(swapchain);
+        v4outline.images.erase(swapchain);
+        v4outline.acquired.erase(swapchain);
+        if (v4outline.chain == swapchain)
+            v4outline.chain = XR_NULL_HANDLE;  // taken again from the next frame's projection layer
+    }
+    {
+        std::lock_guard guard(v4d3d11.mutex);
+        v4d3d11.chains.erase(swapchain);
+    }
+    {
+        std::lock_guard guard(quad.mutex);
+        if (swapchain == quad.appChain) {
+            log_line("quad: the game destroyed its adopted eye chain: output chain and compositor released, the next "
+                     "eye chain is adopted");
+            if (quad.outChain)
+                next.DestroySwapchain(quad.outChain);  // a pending (acquired) image goes with it
+            quad.appChain = quad.outChain = XR_NULL_HANDLE;
+            quad.appImages.clear();
+            quad.outImages.clear();
+            quad.outPending = {};
+            quad.outDensity = {};
+            quad.appAcquired = 0;
+            quad.outerCaptured = quad.releaseHeld = quad.v4Composed = false;
+            // The compositor was made for that chain's format; the helmet's pieces load again into the next one.
+            quad.compositor.shutdown();
+            for (int p = 0; p < 3; ++p) {
+                quad.helmetPiecesTried[p].clear();
+                quad.helmetPiecesWritten[p] = {};
+            }
+            quad.helmetPiecesLoaded = false;
+        }
+    }
+    XrSwapchain measured = swapchain;
+    measuredEyeChain.compare_exchange_strong(measured, XR_NULL_HANDLE);
+    game->swapchain_destroyed(swapchain);
+    return next.DestroySwapchain(swapchain);
 }
 
 }  // namespace simqvfr::layer

@@ -20,9 +20,9 @@ inline constexpr int kRegulatorMsMin = 30, kRegulatorMsMax = 200;
 inline constexpr int kRegulatorLowerFramesMin = 1, kRegulatorLowerFramesMax = 50;
 inline constexpr int kRegulatorRaiseFramesMin = 50, kRegulatorRaiseFramesMax = 300;
 inline constexpr int kRegulatorDecreaseDefault = 100;  // 10.0 ms: pacing holds up to about this on a 90 Hz headset
-inline constexpr int kRegulatorIncreaseDefault = 85;   // 8.5 ms
-inline constexpr int kRegulatorLowerFramesDefault = 10;   // about 0.1 s at 90 Hz: react fast to a heavy scene
-inline constexpr int kRegulatorRaiseFramesDefault = 300;  // about 3 s at 90 Hz: come back slowly
+inline constexpr int kRegulatorIncreaseDefault = 90;   // 9.0 ms
+inline constexpr int kRegulatorLowerFramesDefault = 1;   // react at once to a heavy scene
+inline constexpr int kRegulatorRaiseFramesDefault = 50;  // about 0.6 s at 90 Hz
 
 struct GpuRegulatorSettings {
     bool focus = false;      // [regulator] focus: Focus density is regulated

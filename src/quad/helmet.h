@@ -33,12 +33,13 @@
 
 #include <windows.h>
 
-#include "../ini_put.h"
+#include "../ini.h"
+#include "../i18n.h"
 
 namespace simqvfr {
 
 enum class VisorPosition { Closed, Half, Open };
-inline constexpr const wchar_t* kVisorPositionNames[] = {L"Closed", L"Half", L"Open"};
+inline constexpr const wchar_t* kVisorPositionNames[] = {I18N(L"Closed"), I18N(L"Half"), I18N(L"Open")};
 
 struct HelmetSettings {
     bool on = false;      // enabled
@@ -62,7 +63,7 @@ inline constexpr int kHelmetRimMax = 20, kHelmetCornersMax = 100, kHelmetLightMa
 inline constexpr int kHelmetSizeMin = 40, kHelmetSizeMax = 160, kHelmetHeightMax = 30, kHelmetTravelMax = 100;
 inline constexpr uint32_t kHelmetPerformanceSide = 2048, kHelmetDetailSide = 4096;
 inline uint32_t helmet_layer_side(const HelmetSettings& h) { return h.detail ? kHelmetDetailSide : kHelmetPerformanceSide; }
-inline constexpr const wchar_t* kHelmetDetailNames[] = {L"Performance", L"Detail"};
+inline constexpr const wchar_t* kHelmetDetailNames[] = {I18N(L"Performance"), I18N(L"Detail")};
 inline constexpr int kHelmetDepthMin = 3, kHelmetDepthMax = 150;  // centimetres; 0 is far (kHelmetFarM)
 inline int helmet_depth(int cm) { return cm <= 0 ? 0 : std::clamp(cm, kHelmetDepthMin, kHelmetDepthMax); }
 inline constexpr double kHelmetFarM = 10;  // depth 0: the quad's distance (no parallax to speak of)
@@ -110,15 +111,10 @@ inline void helmet_far_centre(double distance, float rise, const float (&offset)
 }
 
 inline HelmetSettings read_helmet_settings(const wchar_t* ini) {
-    const auto number = [ini](const wchar_t* key, int fallback) {
-        wchar_t text[16] = {};  // as a string: GetPrivateProfileInt reads negative values as 0
-        GetPrivateProfileStringW(L"helmet", key, L"", text, 16, ini);
-        return text[0] ? _wtoi(text) : fallback;
-    };
+    const auto number = [ini](const wchar_t* key, int fallback) { return ini_signed(ini, L"helmet", key, fallback); };
     const auto path = [ini](const wchar_t* key, const std::wstring& fallback) {
-        wchar_t text[MAX_PATH] = {};
-        const DWORD n = GetPrivateProfileStringW(L"helmet", key, L"\x01", text, MAX_PATH, ini);
-        return n == 1 && text[0] == L'\x01' ? fallback : std::wstring(text);  // unset: the default
+        const std::wstring text = ini_get(ini, L"helmet", key, kIniAbsent);
+        return text == kIniAbsent ? fallback : text;  // unset: the default
     };
     HelmetSettings h;
     h.on = number(L"enabled", 0) != 0;

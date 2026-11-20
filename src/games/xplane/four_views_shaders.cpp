@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -31,6 +32,17 @@ using namespace fv;
 namespace {
 
 using simqvfr::logf;
+
+// The n-th shader module given an edit: the first three and every 25th logged (they show the edit takes, and how
+// often), every one with debug logs.
+bool sampled(int n) { return n <= 3 || n % 25 == 0 || simqvfr::log_debug(); }
+
+// One edited module's line, the format's last %d its count `n`.
+template <typename... Args>
+void module_note(int n, const char* format, Args... args) {
+    if (sampled(n))
+        logf(format, args..., n);
+}
 
 }  // namespace
 
@@ -146,15 +158,28 @@ bool final_resolve(const ShaderModuleCreateInfo* info) {
 
 }  // namespace
 
-namespace fv {
+namespace {
 
-// X-Plane's vkCreateShaderModule call lands here (kShaderModuleLoad). The final resolve's fragment shader gets
-// v_eye + 2 (it then shows layers 2-3); every other module goes through as it is.
-std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* info, const void* allocator,
-                                  std::uint64_t* module) {
-    const auto real = *reinterpret_cast<CreateShaderModule*>(simqvfr::module_base() + kVkCreateShaderModuleSlot);
+std::atomic<int> g_ownPushModules{0};  // modules with push constants of their own: edited without the focus block
+std::atomic<int> g_rejectedModules{0}, g_failedEdits{0};
+
+// Every edit a module gets, into `words` (true: edited). The final resolve's fragment shader gets v_eye + 2 (it then
+// shows layers 2-3) or the eye columns' edit, `resolve` then saying how; other modules the per-view edits below.
+bool edit_module(const ShaderModuleCreateInfo* info, std::vector<std::uint32_t>& words, std::string& resolve) {
+    if (!info || !info->pCode || info->codeSize < 20)
+        return false;
+    words.assign(info->pCode, info->pCode + info->codeSize / 4);
+    // One push constant block per entry point: a module with its own gets the baked edits, without ours.
+    const bool ownPush = spirv_has_push_constants(words);
+    if (ownPush && g_focusPush.load()) {
+        const int n = ++g_ownPushModules;
+        if (sampled(n))
+            logf("xplane: shader module (%zu bytes) has push constants of its own: edits baked (launch size, eye's "
+                 "axis), module %d",
+                 info->codeSize, n);
+    }
+    const bool push = g_focusPush.load() && !ownPush;
     if (final_resolve(info)) {
-        std::vector<std::uint32_t> words(info->pCode, info->pCode + info->codeSize / 4);
         std::string why;
         const bool columns = g_eyeColumns.load();
         if (columns ? spirv_eye_columns_resolve(words, &why) : spirv_add_to_input(words, "v_eye", 2, &why)) {
@@ -162,52 +187,48 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
             // rect, so it fills its part of the column (the composition reads whole parts).
             int rectSamples = 0;
             std::string rectWhy;
-            if (columns && g_focusPush.load() && g_viewRects.load())
+            const bool rects = columns && push && g_viewRects.load();
+            if (rects)
                 rectSamples = spirv_sample_view_rects(words, &rectWhy);
-            ShaderModuleCreateInfo edited = *info;
-            edited.codeSize = words.size() * 4;
-            edited.pCode = words.data();
-            const std::int32_t result = real(device, &edited, allocator, module);
-            logf("xplane: final resolve shader (%zu bytes) edited (%s; view rects: %s), vkCreateShaderModule %d, edit %d",
-                 info->codeSize, columns ? "eye columns: each eye's view over its focus view" : "v_eye + 2: layers 2-3",
-                 rectSamples > 0 ? (std::to_string(rectSamples) + " samples from each view's rect").c_str()
-                                 : (columns && g_focusPush.load() && g_viewRects.load() ? ("NOT: " + rectWhy).c_str()
-                                                                                        : "off"),
-                 result, ++g_finalResolveEdits);
-            return result;
+            resolve = std::string(columns ? "eye columns: each eye's view over its focus view" : "v_eye + 2: layers 2-3") +
+                      "; view rects: " +
+                      (rectSamples > 0 ? std::to_string(rectSamples) + " samples from each view's rect"
+                                       : rects ? "NOT: " + rectWhy : std::string("off"));
+            return true;
         }
         logf("xplane: final resolve shader NOT edited: %s", why.c_str());
-    } else if (info && info->pCode && info->codeSize >= 20) {
+        words.assign(info->pCode, info->pCode + info->codeSize / 4);
+    } else {
         save_resolve_family(info);
     }
     // Every shader reading X-Plane's per-eye arrays: views 2-3 read their eye's entry (index & 1).
-    if (info && info->pCode && info->codeSize >= 20) {
-        std::vector<std::uint32_t> words(info->pCode, info->pCode + info->codeSize / 4);
+    {
         // The light billboards' size: projected and un-projected with the eye's pair (docs/recon-xplane.md, "Measured:
         // focus views darker"), so a light covers the same angle in a focus view as in its eye. The fold then takes the
         // inverse's index & 1.
         const int inverted = spirv_eye_projection_beside(words, "u_ogl_light_data", "u_proj_inv",
                                                          "u_transform_block_fat", "projection_matrix");
         if (inverted > 0)
-            logf("xplane: light size from the eye's projection in shader module (%d accesses), %d so far", inverted,
-                 ++g_inverseModules);
+            module_note(++g_inverseModules,
+                        "xplane: light size from the eye's projection in shader module (%d accesses), %d so far",
+                        inverted);
         // Shadows (docs/recon-xplane.md "Measured: dark shadow edges in the focus views"): deferred shading's right-eye
         // test (v_eye == 1) takes v_eye & 1, so the right focus view's shadow lookups come from its eye, not 6 cm off.
         const int parity = spirv_eye_parity_test(words, "u_shadow_data", "u_eye_right_to_left", "v_eye");
         if (parity > 0)
-            logf("xplane: shadows: the right-eye test takes v_eye & 1 in shader module (%d tests), %d so far", parity,
-                 ++g_parityModules);
+            module_note(++g_parityModules,
+                        "xplane: shadows: the right-eye test takes v_eye & 1 in shader module (%d tests), %d so far",
+                        parity);
         int skipped = 0;
         const int folded = spirv_fold_eye_arrays(words, kEyeArrayBlocks, &skipped);
         if (folded > 0 || skipped > 0) {
             const int n = ++g_eyeArrayModules;
-            if (skipped > 0 || n <= 3 || n % 25 == 0)
+            if (skipped > 0 || sampled(n))
                 logf("xplane: per-eye arrays folded in shader module %d: %d accesses, %d skipped", n, folded, skipped);
         }
         // The focus box's size and centre: this frame's, from the push constants, in every edit that places the box
         // (docs/recon-xplane.md "Live focus size"). Without them (the pipeline calls not wrapped), the size wanted now
         // is baked in, the box on the eye's axis.
-        const bool push = g_focusPush.load();
         const float bakedFx = static_cast<float>(g_focusFraction.load()), bakedFy = static_cast<float>(g_focusFractionY.load());
         // The projection coefficients (view rays from screen positions): the focus views' own, from their eye's and
         // the focus box (docs/recon-xplane.md "Measured: the sky and positions in the focus views").
@@ -217,9 +238,10 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
                                                        &coefByPixels)
                        : 0;
         if (coefficients > 0 || coefSkipped > 0)
-            logf("xplane: projection coefficients: focus views' own in shader module (%d loads, %d by pixels taking the "
-                 "view rects, %d component reads left), %d so far",
-                 coefficients, coefByPixels, coefSkipped, ++g_coefficientModules);
+            module_note(++g_coefficientModules,
+                        "xplane: projection coefficients: focus views' own in shader module (%d loads, %d by pixels taking the "
+                        "view rects, %d component reads left), %d so far",
+                        coefficients, coefByPixels, coefSkipped);
         // SSR in the focus views. From the eye (default; docs/recon-xplane.md "Measured: focus views reflect only what
         // is in the box"): a focus pixel's ray is projected with its eye's u_proj (the fold's) and marched in its eye's
         // hi-Z and lit history, so it reflects what lies outside the box too. Or in the focus view's own screen
@@ -242,12 +264,14 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
         else if (folded > 0 && ssrModule)
             ssrProjections = spirv_focus_projection_matrix(words, "u_ssr_data", "u_proj", bakedFx, bakedFy, push);
         if (ssrRays > 0)
-            logf("xplane: SSR: focus views march in their eye's screen in shader module (%d reads, rays from the eye "
-                 "pixel's start %s), %d so far",
-                 ssrRays, ssrStarts > 0 ? "yes" : "NO: not found", ++g_ssrModules);
+            module_note(++g_ssrModules,
+                        "xplane: SSR: focus views march in their eye's screen in shader module (%d reads, rays from the eye "
+                        "pixel's start %s), %d so far",
+                        ssrRays, ssrStarts > 0 ? "yes" : "NO: not found");
         if (ssrProjections > 0)
-            logf("xplane: SSR: focus views trace with their own projection in shader module (%d loads), %d so far",
-                 ssrProjections, ++g_ssrModules);
+            module_note(++g_ssrModules,
+                        "xplane: SSR: focus views trace with their own projection in shader module (%d loads), %d so far",
+                        ssrProjections);
         // SSR over each view's rect (docs/recon-xplane.md "Measured: SSR's saw-tooth at 30%"): its projection takes the
         // view's place in the layer, so the march runs in the layer's texel grid. After the edits above (the eye's
         // projection, the eye-pixel start).
@@ -255,8 +279,9 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
         if (ssrModule && g_viewRects.load() && push) {
             ssrRects = spirv_ssr_view_rects(words, ssrRays > 0, nullptr);
             if (ssrRects > 0)
-                logf("xplane: SSR marches in each view's rect of the layer (%d projections) in shader module, %d so far",
-                     ssrRects, ++g_ssrRectModules);
+                module_note(++g_ssrRectModules,
+                            "xplane: SSR marches in each view's rect of the layer (%d projections) in shader module, %d so far",
+                            ssrRects);
         }
         // Diagnostics ([experiment] xplane_diag=1; docs/recon-xplane.md "Measured: the wing after the SSR edit"): the
         // SSR results and CACAO's output can be switched off live, to see which pass draws an artefact.
@@ -266,23 +291,25 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
                    spirv_diag_override_write(words, "u_ffx_cacao_data", "g_RwOutput", 1, 1.0f, nullptr) +
                    spirv_diag_override_sample(words, "u_shadow_data", "tex_smap0", 2, 1.0f, nullptr);
             if (diag > 0)
-                logf("xplane: diagnostics: switchable output in shader module (%d writes), %d so far", diag,
-                     ++g_diagModules);
+                module_note(++g_diagModules,
+                            "xplane: diagnostics: switchable output in shader module (%d writes), %d so far", diag);
         }
         // Tiled lights (docs/recon-xplane.md "Measured: right-eye popping near the wing"): the focus views pick the
         // tile of their pixel's position in the eye. After the coefficient edit, which would otherwise turn the eye's
         // coefficients this reads into the focus box's.
         const int tiles = spirv_focus_light_tiles(words, bakedFx, bakedFy, nullptr, push);
         if (tiles > 0)
-            logf("xplane: tiled lights: focus views take their eye's tile in shader module (%d coordinates), %d so far",
-                 tiles, ++g_tileModules);
+            module_note(++g_tileModules,
+                        "xplane: tiled lights: focus views take their eye's tile in shader module (%d coordinates), %d so far",
+                        tiles);
         // AO at the focus views' edges from the eye (docs/recon-xplane.md "Measured: a dark rim at the top of the focus
         // views").
         if (g_aoEdgesFromEye.load()) {
             const int aoEdges = spirv_focus_ao_edges_from_eye(words, bakedFx, bakedFy, kAoEdgeBand, nullptr, push);
             if (aoEdges > 0)
-                logf("xplane: AO: focus views take their eye's at their edges (%s) in shader module (%d samples), %d so far",
-                     push ? "band following the focus size" : "12% band", aoEdges, ++g_aoEdgeModules);
+                module_note(++g_aoEdgeModules,
+                            "xplane: AO: focus views take their eye's at their edges (%s) in shader module (%d samples), %d so far",
+                            push ? "band following the focus size" : "12% band", aoEdges);
         }
         // One viewport per view (docs/recon-xplane.md "Measured: the zoom with one viewport per view"): X-Plane's blit
         // vertex shader splits its source into u_viewport_count side-by-side parts; in four-view passes it takes 1.
@@ -290,8 +317,9 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
         if (g_viewRects.load()) {
             splitOff = spirv_viewport_split_off(words, nullptr, push);
             if (splitOff > 0)
-                logf("xplane: view rects: the blit's side-by-side split off in four-view passes (%d loads), module %d",
-                     splitOff, ++g_splitOffModules);
+                module_note(++g_splitOffModules,
+                            "xplane: view rects: the blit's side-by-side split off in four-view passes (%d loads), module %d",
+                            splitOff);
         }
         // The auto exposure's histogram over the outer view's rect, not the whole layer (docs/recon-xplane.md
         // "Measured: the smaller periphery traced"): the undrawn rest of the layer counted as black and raised the
@@ -300,13 +328,15 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
         if (g_viewRects.load() && push) {
             histogram = spirv_histogram_view_rect(words, nullptr);
             if (histogram > 0)
-                logf("xplane: auto exposure histogram reads the outer view's rect (%d fetches), module %d", histogram,
-                     ++g_histogramModules);
+                module_note(++g_histogramModules,
+                            "xplane: auto exposure histogram reads the outer view's rect (%d fetches), module %d",
+                            histogram);
         }
         // Compute shaders taking their eye from the dispatch depth (the cloud render): write layer z, eye = z & 1.
         const bool layered = spirv_layer_from_dispatch_z(words);
         if (layered)
-            logf("xplane: compute shader writes layer = dispatch z (eye from z & 1), module %d", ++g_layerFromZModules);
+            module_note(++g_layerFromZModules,
+                        "xplane: compute shader writes layer = dispatch z (eye from z & 1), module %d");
         // Bloom from the eye (docs/recon-xplane.md "Measured: bloom per view"): vertex shaders pass each view's map
         // into its eye's view, and the bloom apply samples the eye's bloom there, so a focus view gets its eye's glow.
         bool mapped = false, bloom = false;
@@ -314,7 +344,7 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
             mapped = spirv_view_to_eye_map_out(words, kEyeMapLocation, nullptr);
             if (mapped) {
                 const int n = ++g_eyeMapModules;
-                if (n <= 3 || n % 25 == 0)
+                if (sampled(n))
                     logf("xplane: vertex shader passes the view-to-eye map, module %d", n);
             }
             if (info->codeSize == kBloomApplyFsBytes && sha256_hex(info->pCode, info->codeSize) == kBloomApplyFsSha256) {
@@ -342,7 +372,7 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
             layerOut = spirv_layer_out(words, kLayerLocation);
             if (layerOut) {
                 const int n = ++g_layerOutModules;
-                if (n <= 3 || n % 25 == 0)
+                if (sampled(n))
                     logf("xplane: vertex shader passes its layer to the fragment shader, module %d", n);
             }
             const float bias = static_cast<float>(0.5 * std::log2(static_cast<double>(bakedFx) * bakedFy));
@@ -350,7 +380,7 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
             alphaLod = spirv_alpha_test_lod_bias(words, kLayerLocation, bias, &why, push);
             if (alphaLod > 0) {
                 const int n = ++g_alphaLodModules;
-                if (n <= 3 || n % 25 == 0)
+                if (sampled(n))
                     logf("xplane: alpha test takes the focus view's mip in the periphery (bias %s %.2f, %d samples), "
                          "module %d",
                          push ? "following the focus size, now" : "baked,", push ? g_frame.load().values[0] : bias,
@@ -363,8 +393,9 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
         if (g_viewRects.load() && push) {
             hizRects = spirv_hiz_view_rects(words, nullptr);
             if (hizRects > 0)
-                logf("xplane: depth chain reads each view's rect (%d limits) in shader module, %d so far", hizRects,
-                     ++g_hizRectModules);
+                module_note(++g_hizRectModules,
+                            "xplane: depth chain reads each view's rect (%d limits) in shader module, %d so far",
+                            hizRects);
         }
         // u_viewport_size as the whole layer (docs/recon-xplane.md "Measured: u_viewport_size follows the first rect"):
         // X-Plane fills it from the pass's first viewport, the outer view's rect once that is smaller. After every edit
@@ -374,19 +405,70 @@ std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* in
             viewportSize = spirv_viewport_size_from_gbuffer(words, nullptr);
             if (viewportSize > 0) {
                 const int n = ++g_viewportSizeModules;
-                if (n <= 3 || n % 25 == 0)
+                if (sampled(n))
                     logf("xplane: u_viewport_size read as the layer (u_gbuffer_size) in shader module (%d reads), %d so far",
                          viewportSize, n);
             }
         }
-        if (inverted > 0 || parity > 0 || folded > 0 || layered || mapped || bloom || fullRate > 0 || coefficients > 0 ||
-            ssrProjections > 0 || ssrRays > 0 || tiles > 0 || layerOut || alphaLod > 0 || splitOff > 0 || histogram > 0 ||
-            ssrRects > 0 || diag > 0 || viewportSize > 0 || hizRects > 0) {
-            ShaderModuleCreateInfo edited = *info;
-            edited.codeSize = words.size() * 4;
-            edited.pCode = words.data();
-            return real(device, &edited, allocator, module);
-        }
+        return inverted > 0 || parity > 0 || folded > 0 || layered || mapped || bloom || fullRate > 0 ||
+               coefficients > 0 || ssrProjections > 0 || ssrRays > 0 || tiles > 0 || layerOut || alphaLod > 0 ||
+               splitOff > 0 || histogram > 0 || ssrRects > 0 || diag > 0 || viewportSize > 0 || hizRects > 0;
+    }
+}
+
+// A module the driver refused once edited: logged once per shader (its size and hash).
+void note_rejected(const ShaderModuleCreateInfo* info, std::int32_t result) {
+    const std::string sha = sha256_hex(info->pCode, info->codeSize);
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    {
+        std::lock_guard guard(mutex);
+        if (!seen.insert(sha).second)
+            return;
+    }
+    logf("xplane: the driver refused an edited shader module (%zu bytes, sha256 %s): vkCreateShaderModule %d; made "
+         "from X-Plane's original instead (%d so far)",
+         info->codeSize, sha.c_str(), result, ++g_rejectedModules);
+}
+
+}  // namespace
+
+namespace fv {
+
+// X-Plane's vkCreateShaderModule call lands here (kShaderModuleLoad): the module edited (edit_module), or as it is
+// when an edit throws or the driver refuses the edited code. No exception reaches X-Plane's C code.
+std::int32_t create_shader_module(void* device, const ShaderModuleCreateInfo* info, const void* allocator,
+                                  std::uint64_t* module) {
+    const auto real = *reinterpret_cast<CreateShaderModule*>(simqvfr::module_base() + kVkCreateShaderModuleSlot);
+    std::vector<std::uint32_t> words;
+    std::string resolve;
+    bool edited = false;
+    try {
+        edited = edit_module(info, words, resolve);
+    } catch (const std::exception& e) {  // bad_alloc included
+        edited = false;
+        if (++g_failedEdits <= 3)
+            logf("xplane: a shader module's edit failed (%s): made as it is", e.what());
+    } catch (...) {
+        edited = false;
+        if (++g_failedEdits <= 3)
+            logf("xplane: a shader module's edit failed (unknown exception): made as it is");
+    }
+    if (!edited)
+        return real(device, info, allocator, module);
+    ShaderModuleCreateInfo changed = *info;
+    changed.codeSize = words.size() * 4;
+    changed.pCode = words.data();
+    const std::int32_t result = real(device, &changed, allocator, module);
+    if (result == 0) {
+        if (!resolve.empty())
+            logf("xplane: final resolve shader (%zu bytes) edited (%s), edit %d", info->codeSize, resolve.c_str(),
+                 ++g_finalResolveEdits);
+        return result;
+    }
+    try {
+        note_rejected(info, result);
+    } catch (...) {
     }
     return real(device, info, allocator, module);
 }

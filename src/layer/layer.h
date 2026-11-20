@@ -9,6 +9,7 @@
 #include "cheeky/cheeky_settings.h"
 #include "input/hotkeys.h"
 #include "quad/compositor.h"
+#include "quad/eye_off.h"
 #include "quad/helmet.h"
 #include "quad/osd.h"
 #include "quad/session_graphics.h"
@@ -55,6 +56,12 @@ bool quad_ready();
 void turn_view(XrView& view, double fractionX, double fractionY, double tanX, double tanY);
 void focus_centre(const EyeComposition& eye, float& tanX, float& tanY);
 bool sampled(uint64_t count);
+// An image of the layer's own swapchain `chain` to write: the next one acquired (or the one a timed-out wait left
+// acquired, `pending`) and waited for, up to `tries` waits of `timeout` each (`stage`: the hang watch's name for the
+// wait, or null). XR_SUCCESS: `index` is ready; release it after. XR_TIMEOUT_EXPIRED: still acquired and not waited for:
+// don't release it (OpenXR), the next call waits on it again. A failure code: the acquire's or the wait's.
+XrResult acquire_wait(XrSwapchain chain, PendingImage& pending, XrDuration timeout, int tries, uint32_t& index,
+                      const char* stage = nullptr);
 
 // reports.cpp
 int64_t qpc_now();
@@ -81,18 +88,25 @@ XrResult XRAPI_CALL layerEnumerateSwapchainImages(XrSwapchain swapchain, uint32_
                                                   XrSwapchainImageBaseHeader* images);
 XrResult XRAPI_CALL layerAcquireSwapchainImage(XrSwapchain swapchain, const XrSwapchainImageAcquireInfo* info,
                                                uint32_t* index);
+XrResult XRAPI_CALL layerDestroySwapchain(XrSwapchain swapchain);
 
 // helmet_layer.cpp
 void helmet_layer_release();
 
-// views4.cpp
-XrExtent2Di views4_output_extent();
+// views4.cpp (under quad.mutex; quad/output_density.h)
+XrExtent2Di views4_output_extent(const OutputDensity& d);
+// A new output chain's size for `d`: the launch focus density or what the last compositions wanted, if more.
+void views4_output_chain(OutputDensity& d);
+// After a composition: the next one's scale from what its eyes wanted (views4_helmet_eye); `who` names the path in the log.
+void views4_output_density(OutputDensity& d, const char* who);
 
 // helmet_layer.cpp
 void log_helmet_light();
 V4Helmet views4_helmet_start(const HelmetSettings& helmet);
+// `out`: the output's density (its scale this frame; the eye's wish added); `focusTexels`: the focus view's width in
+// its source, texels (0: unknown, the output's scale not measured from this eye).
 void views4_helmet_eye(const HelmetSettings& helmet, V4Helmet& h, int e, EyeComposition& c, XrFovf& submitFov,
-                       XrExtent2Di& extent);
+                       XrExtent2Di& extent, OutputDensity& out, double focusTexels);
 void views4_helmet_layer(const HelmetSettings& helmet, const V4Helmet& h, const EyeComposition (&eyes)[2],
                          ID3D11Texture2D* views11);
 void views4_helmet_submit(XrSession session, int layer, XrCompositionLayerQuad (&quads)[kHelmetQuadsMax], int& count,
@@ -115,6 +129,20 @@ void log_submitted_fov(uint32_t eye, const XrFovf& submitted, const XrFovf& comp
 // views4.cpp
 XrResult views4_submit(XrSession session, const XrFrameEndInfo* info);
 
+// views4_d3d11.cpp (v4d3d11_tracks_chains: state.h)
+// The game's image (eye columns: the whole target in the first eye's swapchain) to the game's adapter, with each
+// view's rect in it (GameAdapter::qvfr_game_image), before anything composes it.
+void v4d3d11_game_image(const XrCompositionLayerProjection* proj, const Views4Layout& layout);
+// Composes both eyes of `proj` into the D3D11 output chain and points `copy` at it; false: nothing changed. With
+// focus_layer (`focus` given): the periphery in `copy`, the focus views' layer in `focus`, `*layered` true.
+// Native quad views with the FOV crop, a frame with the game's own views 0-1: padded out to the runtime's eyes (`copy`
+// pointed at the pad chain). False: `copy` as it was.
+bool v4d3d11_pad_eyes(XrSession session, std::vector<XrCompositionLayerProjectionView>& copy, XrTime displayTime);
+bool v4d3d11_compose(XrSession session, const XrCompositionLayerProjection* proj,
+                     std::vector<XrCompositionLayerProjectionView>& copy,
+                     XrCompositionLayerProjectionView (*focus)[2] = nullptr, bool* layered = nullptr,
+                     XrTime displayTime = 0);
+
 // views.cpp
 XrResult XRAPI_CALL layerLocateViews(XrSession session, const XrViewLocateInfo* info, XrViewState* state,
                                      uint32_t capacity, uint32_t* countOutput, XrView* views);
@@ -124,6 +152,15 @@ void cheeky_apply_ini();
 uint64_t ini_write_later(std::function<void()> write, IniWrite kind = IniWrite::Once);
 void ini_worker_sync();
 void live_reload();
+// [launcher] language (lang.h) made current when it changed: at start-up (config), then on every ini worker pass.
+void follow_language(const wchar_t* ini);
+// How long the headset menu stays after the last press: kMenuHideOverlayMs with the performance overlay on, else
+// kMenuHideMs (overlay.cpp).
+int64_t menu_hide_ms();
+// The menu's frame line from what the overlay shows (or how to see it), redrawing the menu when it changed (overlay.cpp).
+void menu_frame_line();
+// The session record's first stint: the settings the launch read, for live_reload to compare with (reports.cpp, once).
+void stint_key_init();
 
 // hotkey_watch.cpp
 void pad_watch_ensure();
@@ -154,11 +191,14 @@ void osd_waited(XrDuration period);
 bool frame_generation_on();
 bool osd_shown(OsdSummary& out);
 void osd_wait_returned(double waitMs);
-void osd_measure();
+void osd_measure(XrTime displayTime);  // xrEndFrame's: the frame's display time
 void osd_placement_changed();
 void osd_placement_changed(const OsdPlacement& placement, const CheekySettings& cheeky);
 const XrCompositionLayerBaseHeader* osd_frame(XrSession session, int64_t now);
 void osd_shutdown();
+void clock_placement_changed(const ClockPlacement& placement);
+const XrCompositionLayerBaseHeader* clock_frame(XrSession session);  // the clock's card while it is on
+void clock_shutdown();
 
 // optimizer.cpp
 void optimize_tick(int64_t now);
@@ -181,12 +221,22 @@ bool runtime_gaze(XrSpace space, XrTime time, XrVector3f& direction);
 // (tangents left, right, up, down); the latest located when none was for `time` (`exact` false). False: none located
 // (no quad view session, or before its first locate). Views 2-3 go to the runtime over exactly these.
 bool runtime_focus_regions(XrTime time, float (&tan)[2][4], bool* exact = nullptr);
+// A quad view session: the runtime's eyes (views 0-1) as located for `time` (the latest located when none was), each
+// eye's FOV in tangents (left, right, up, down). Views 0-1 go to the runtime over at least these (native_quad.h
+// eye_union): it may draw them over its own eyes whatever FOV they carry. False: none located.
+bool runtime_eye_tangents(XrTime time, float (&tan)[2][4]);
 // With the extension on the instance (nativeQuad.extension): the wrappers into `next`, after it is loaded.
 void native_quad_install(XrInstance instance, PFN_xrGetInstanceProcAddr gipa);
 // At xrCreateSession: whether the session will be begun as a quad view one (the system has it, the run wants it).
 void native_quad_plan(XrInstance instance, XrSystemId system);
 // At xrDestroySession: the session's counts logged, the state reset.
 void native_quad_session_ended();
+
+// eye_off.cpp (quad/eye_off.h): one eye off at the runtime's xrEndFrame. Installed into `next` before native quad
+// views' wrappers, so it is the last of the layer's before the runtime.
+void eye_off_install();
+// At xrDestroySession: its black image released, the counts logged.
+void eye_off_session_ended();
 
 // xr_layer.cpp
 XrResult XRAPI_CALL layerGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function);

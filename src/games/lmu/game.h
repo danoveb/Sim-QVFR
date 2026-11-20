@@ -23,13 +23,20 @@ inline constexpr simqvfr::games::GameInfo kGame = {
     nullptr,  // no DLSS (FSR 1 only)
     // The helmet overlay (the layer's, over the composed views: crop-aware), the FOV crop (through the located FOV) and
     // NVIDIA multi-view rendering (mvr_pass.h), runtime-composed quad views on a Pimax or Varjo runtime, sharpening, and
-    // Sim-QVFR's own DLSS on its views (engine/dlss_views.h; with multi-view).
-    {false, true, false, true, false, false, true, true, true, true},
+    // Sim-QVFR's own DLSS on its views (engine/dlss_views.h; with multi-view), and one eye off (qvfr_frame.cpp: that
+    // eye's pass with no focus view, its scene cut to a few pixels, no DLSS), and the focus mask (mvr_pass_focus_mask.h).
+    // Live resolution on (the adapter's qvfr_live_resolution: every QVFR run), so the launcher's Resolution and Foveation
+    // cards say what the launch size allows, as for the other games.
+    {false, true, true, true, false, false, true, true, true, true, false, true, true},
     kBuilds, std::size(kBuilds),
     false,
     nullptr,  // crash reports: BugSplat's, not looked at yet
     kAntiCheat,
     L"start_protected_game.exe",
+    {},
+    // QVFR on any build (qvfr_frame.h qvfr_frame_known_build): a game update or the studio's beta and alpha branches
+    // run it, and Sim-QVFR's DLSS, from what OpenXR and Direct3D show.
+    true,
 };
 
 }  // namespace lmu

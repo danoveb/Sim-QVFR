@@ -18,17 +18,11 @@
 
 #include "games/lmu/mvr_pass.h"
 #include "games/lmu/mvr_probe.h"
+#include "test_util.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
-    failures += ok ? 0 : 1;
-}
 
 int fake_two_views(ID3D11DeviceContext*, bool) { return 0; }
 
@@ -221,7 +215,7 @@ int SIM_QVFR_TEST_MAIN(int argc, char** argv) {
     const lmu::MvrPassStats installed = lmu::mvr_pass_stats();
     std::snprintf(what, sizeof(what), "%llu entries hooked (seventeen with car tracking, ExecuteCommandList among them)",
                   static_cast<unsigned long long>(installed.contextEntries));
-    check(installed.contextEntries == 17, what);
+    check(installed.contextEntries == 18, what);
 
     int mapsOk = 0, maps = 0;
     // A draw as LMU makes it: the per-draw buffer written (Map discard, Unmap), the mesh's buffers bound, DrawIndexed.
@@ -318,6 +312,5 @@ int SIM_QVFR_TEST_MAIN(int argc, char** argv) {
                     (after - untimed) / 5 * 36000 / 1e6);
     }
 
-    std::printf("RESULT: %s\n", failures ? "FAIL" : "pass");
-    return failures ? 1 : 0;
+    return test_result();
 }

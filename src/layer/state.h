@@ -24,6 +24,7 @@
 #include "games/adapter.h"
 #include "input/hotkeys.h"
 #include "probe/cpu_load.h"
+#include "quad/color_grade.h"
 #include "quad/compositor.h"
 #include "quad/d3d11_compositor.h"
 #include "quad/focus_offset.h"
@@ -91,6 +92,9 @@ struct Experiment {
     bool views3 = false;          // single-frame quad views step 1: VR runs the renderer's 3-view mode
     bool views4 = false;          // QVFR: 4 views in one game frame (the game's adapter, games/adapter.h)
     wchar_t mode[32] = L"off";    // [experiment] mode in effect (baseline=1: off), for the game's adapter
+    // The layer may change the game's CPU scheduling ([cpu], probe/cpu_isolation.h): not in a baseline or a log-only run.
+    bool cpuSettings = false;
+    int cpuIsolate = 0;  // core isolation's mode in effect (LiveSettings::cpuIsolate)
     bool views4ShowCopies = false;         // views4 debug: submit quarters 2-3 (the copies) instead of 0-1
     bool views4Compose = false;            // views4: blend the focus views into the outer views (native-size output)
     bool views4ComposeD3D11 = false;       // views4_compose for a D3D11 game (qvfr_compose_d3d11; V4D3D11 below)
@@ -106,9 +110,41 @@ struct Experiment {
     std::atomic<int> focusQuadDistance = 100;
     bool views4NoMask = false;             // views4: empty hidden-area mesh (default when composing)
     bool views4TestVisibleMask = false;    // views4 test: a full-view visible-area mesh, as VDXR gives (diagnostic)
-    bool views4TestHiddenMask = false;     // views4 test: a hidden-area mesh of our own (corners, centre; diagnostic)
+    // views4 test: a hidden-area mesh of our own (diagnostic): 1 the FOV's corners and a triangle straight ahead; 2 the
+    // fixed focus box's top corners cut views4TestMaskCut percent of its width in (a trapezoid's waste, measured).
+    int views4TestHiddenMask = 0;
+    int views4TestMaskCut = 30;
     bool views4EyeCamera = false;          // views4: focus views render the eyes' own cameras (diagnostic)
     bool passCensus = false;              // log a per-pipeline draw/dispatch census (probe/pass_census.h)
+    int replayProbe = 0;                  // replay_probe=1/2: re-emission cost; 3: focus depth replay (games/ace/replay_probe.h)
+    UINT replayFocusPercent = 20;          // replay_focus_percent: the focus box, % of each eye's extent (half extent in NDC)
+    UINT replayFocusScalePercent = 200;    // replay_focus_scale_percent: focus pixels per eye pixel, in %
+    UINT replaySaveFirst = 1800, replaySaveEvery = 900, replaySaveCount = 0;  // replay_save_first/_every/_count
+    bool replayAllTargets = false;         // replay_targets=all: every stereo scene list (R2), else depth only (R1)
+    bool replayTiles = false;              // replay_tiles=1: the focus views' own light tiles (R2b)
+    int replayFog = 0;                     // replay_fog=1: focus fog replayed; 2: ACE's grids resampled (R2c, with tiles)
+    int replayShadows = 0;                 // replay_shadows=1: the focus views' own deferred shadow (R2c, with tiles); 2 A/B
+    int replayTransparents = 0;            // replay_transparents=1: per-eye lists + OIT composite (R2c); 2 A/B
+    int replayCull = 0;                    // replay_cull=1|2|3: focus culling (computed only, used, used in alternate windows)
+    bool replayCullProbe = false;          // replay_cull_probe=1 (diagnostic): focus replays without one kind of draw by window
+    bool replayRecordTiming = false;       // replay_record_timing=1 (diagnostic): the focus replays' recording by phase
+    bool replayMaskAb = false;             // replay_mask_ab=1 (diagnostic, with replay_gpu_steps): the focus mask by window
+    bool replayGpuSteps = false;           // replay_gpu_steps=1 (diagnostic): GPU time by step ("replay gpu:" lines)
+    bool replayEyeCapture = false;         // replay_eye_capture=1 (diagnostic): PNGs after each live periphery change
+    int replayDlssEyePreset = 0;           // replay_dlss_eye_preset=F|K|M..: the eyes' (periphery's) NGX preset (empty: ACE's)
+    int replayDlssFocusPreset = 0;         // replay_dlss_focus_preset: our focus features' (empty: ACE's)
+    double replayDlssJitterX = 0.5;        // replay_dlss_jitter_x_percent=50: the share of ACE's x jitter NGX is told
+    bool replayDlssPeripheryDlaa = true;   // replay_dlss_periphery_dlaa=1: the eyes at DLAA in every in-game DLSS mode
+    int replayDlssFocusScale = 100;        // [dlss] focus_scale: the focus views' DLSS mode on the API path (launch)
+    double replayEyeShareX = 0, replayEyeShareY = 0;  // the API path: ACE's eye size as a share of the native eye (launch)
+    int replayDlss = 0;                    // replay_dlss=1: our DLSS per focus view (P2a)
+    bool replayPost = false;               // replay_post=1: the focus views' tonemap + fxaa + bloom (P1)
+    bool replayTyres = true;               // replay_tyres=0: ACE's left-eye-only tyres left as they are (single-pass stereo)
+    bool replaySky = false;                // replay_sky=1: the sky draw's clouds through the focus box
+    bool replayCostAb = false;
+    int replayDiagMode = 0;                // replay_diag=2: MSAA refraction-source A/B by sample
+    bool replayDiag = false;               // replay_diag=1: per-sample fog / atmosphere schedule (the haze band)             // replay_cost_ab=1: all focus replays on / off every 1800 frames
+    int replayAtmosphere = 0;              // replay_atmosphere=1: focus copies of the atmosphere maps (R2c); 2 A/B
     UINT d3d11CaptureFrame = 0;           // D3D11 games: save each swapchain's image from this frame (probe/d3d11_capture.h)
     bool d3d11CaptureHotkey = false;      // D3D11 games: the frame capture hotkey saves the next frame's images
     bool views4FocusCull = false;          // views4: focus views skip draws outside their frustum (views4.h)
@@ -133,6 +169,7 @@ struct Experiment {
     bool d3d12Debug = false;               // D3D12 debug layer, errors into the log (slow; diagnosis only)
     bool gpuValidation = false;            // d3d12_debug=2: plus GPU-based validation (very slow)
     UINT pixCaptureFrame = 0;              // PIX GPU capture from this xrEndFrame (probe/pix_capture.h), 0 = off
+    bool pixCaptureHotkey = false;         // pix_capture_hotkey=1: the frame capture hotkey takes a PIX capture (D3D12)
     bool twoLoops = false;        // round 7: two complete ACE frames per display frame
     bool focusInB = false;        // round 8: two_loops frame B renders the focus FOV (A keeps the full FOV)
     double eyeScale = 1.0;        // round 8: scales the recommended eye size ACE sees (linear)
@@ -160,14 +197,30 @@ struct Experiment {
     double box_x() const { return box_x(focusFraction); }
     double box_y() const { return box_y(focus_y()); }
     // QVFR composes the views itself, by either compositor (views4_compose: ACE's D3D12 one; views4ComposeD3D11).
-    bool composing() const { return views4Compose || views4ComposeD3D11; }
-    bool quad = false;            // quad pipeline: two_loops + b_focus, composited into one native-size image
+    bool composing() const { return views4Compose || views4ComposeD3D11 || replayCompose; }
+    // replay_compose=1 (with replay_probe=3 and replay_post): ACE's two eyes composed with the replay probe's focus
+    // images (P3, the API-level path), at native size, through the views4 compositor and output chain.
+    bool replayCompose = false;
+    // ACE's QVFR is the API path (2026-11-14): mode=views4 (what the launcher writes for QVFR) runs ACE's own two eyes
+    // with the focus views replayed at the D3D12 level, no game code hooked; the replay_* keys default to that set.
+    // [experiment] ace_legacy_views4=1 keeps the old 4views path (deprecated, to be removed).
+    bool apiPath = false;
+    // QVFR runs on the game's own path below the layer (ACE's API path, the SCS games' D3D11 corner; GameAdapter::own_qvfr)
+    // with the layer at mode=off: the reports say QVFR, and the CPU settings apply.
+    bool ownQvfr = false;
+    bool quad = false;           // quad pipeline: two_loops + b_focus, composited into one native-size image
     std::atomic<double> feather = 0.10;    // quad: blend band, as a fraction of the focus box
     std::atomic<double> cornerRadius = 0;  // rounded focus box: radius as a share of half its shorter side (0 = square)
     std::atomic<uint64_t> focusShape = 0;  // the focus area's pulled-in corners (focus_shape.h's bits; 0 = the box)
-    // [quad] sharpen_percent (a game with GameFeatures::sharpening): CAS as the views are composed
+    // [quad] sharpen_percent (a game with GameFeatures::sharpening): CAS on the focus views as they are composed
     // (EyeComposition::sharpness), percent; 0 off.
     std::atomic<int> sharpen = 0;
+    // [quad] color_correction and its values (a game with GameFeatures::sharpening; quad/color_grade.h's bits): the
+    // composed image's exposure, brightness, contrast and saturation (EyeComposition::color). Live.
+    std::atomic<uint64_t> colorGrade = kColorGradeNone;
+    // [quad] output_density_max (quad/output_density.h): the most the composed output grows past the native eye for
+    // the focus density, percent; 100 composes at native size (as before). Live.
+    std::atomic<int> outputDensityMax = 400;
     std::atomic<bool> border = false;      // quad: debug outline (borderColor) on the focus box (views4: on the outer views)
     bool borderAtLaunch = false;           // views4 without composition tracks the outline's chains only if on at launch
     float borderColor[4] = {0, 1, 0, 1};   // debug outline colour (linear RGBA): debug_border_color green|magenta|teal
@@ -207,7 +260,15 @@ struct LiveSettings {
     HelmetSettings helmet;  // views4 composing only
     int objectDetail = 100;  // [experiment] object_detail, percent (a game with GameFeatures::objectDetail)
     int sharpen = 0;         // [quad] sharpen_percent, percent (a game with GameFeatures::sharpening); 0 off
+    ColorGrade color;        // [quad] color_correction and its values (a game with GameFeatures::sharpening)
+    int outputDensityMax = 400;  // [quad] output_density_max, percent of the native eye (100: composed at native size)
+    int eyeOff = -1;         // [quad] eye_off (a game with GameFeatures::eyeOff; quad/eye_off.h): -1 none, 0 left, 1 right
     int focusQuadDistance = 100;  // [experiment] focus_quad_distance, metres (focus_layer=2)
+    bool focusMask = true;        // [quad] focus_mask (quad/focus_mask.h)
+    // Core isolation's mode (probe/cpu_isolation.h): [experiment] cpu_isolate when above 0 (1 on, N > 1 an A/B of N frames
+    // a side), else [cpu] isolate_main_thread (1 on, 0 off).
+    int cpuIsolate = 0;
+    int focusMaskMargin = 16;     // [experiment] focus_mask_margin, focus view texels
 };
 
 // views4: the outer and focus views' sizes, linear scales of the native eye (views4_layout.h), from
@@ -272,6 +333,10 @@ struct Gaze {
     // syncs it itself before each lookup (and the settings menu before reading its controllers).
     bool syncsOwn = false;
     uint64_t appSyncs = 0;
+    // Attached alone: when the gaze thread last synced the set, and the settings menu (qpc_now; 0: never). The menu
+    // reads its controllers from the thread's sync while it is recent; it syncs at most every kMenuSyncMs itself (a
+    // runtime call of ~0.45 ms on the game's thread with Pimax's runtime, 2026-11-16, when it ran every frame).
+    int64_t threadSyncQpc = 0, menuSyncQpc = 0;
     XrSpace space = XR_NULL_HANDLE;
     XrVector3f direction{0, 0, -1};  // last tracked gaze, in the space ACE locates its views in
     XrTime directionTime = 0;
@@ -298,6 +363,11 @@ struct HeadSpaces {
     bool skipLogged = false;
 };
 
+// Set by DllMain at DLL_PROCESS_DETACH when the process is ending (lpReserved non-null), before this DLL's globals are
+// destroyed (globals.cpp): the other threads are already gone then, perhaps holding a mutex, so the destructors
+// below neither lock nor join.
+extern std::atomic<bool> processTerminating;
+
 // The gaze thread ([quad] gaze_thread, on by default): ACE's xrLocateViews only reads the latest gaze; this
 // thread looks it up (xrLocateSpace on the gaze action's space) at gaze_poll_hz, at the display time ACE last
 // located its views for, in the space it located them in. The lookup can be slow (~1.5 ms on the Pimax
@@ -307,6 +377,10 @@ struct HeadSpaces {
 // The lookup runs outside gaze.mutex, so ACE's xrSyncActions never waits for it.
 struct GazeThread {
     std::mutex mutex;
+    // Held by the thread from reading `base` to the end of its xrLocateSpace (taken before `mutex`, and before
+    // gaze.mutex): the game's xrDestroySpace (layerDestroySpace) takes it to clear `base` before the space goes, so no
+    // lookup runs on a destroyed space.
+    std::mutex locateMutex;
     std::condition_variable wake;
     std::thread thread;
     bool stop = false;
@@ -321,8 +395,13 @@ struct GazeThread {
     uint64_t lookups = 0;
     double lookupMs = 0, lookupMaxMs = 0;
     // A running thread left at exit (no xrDestroySession) would end the process in std::terminate. At a
-    // process exit it has already ended, so the join returns at once.
+    // process exit it has already ended, perhaps holding `mutex`: detached, not locked or joined.
     ~GazeThread() {
+        if (processTerminating.load()) {
+            if (thread.joinable())
+                thread.detach();
+            return;
+        }
         {
             std::lock_guard guard(mutex);
             stop = true;
@@ -357,9 +436,36 @@ struct EyeView {
 // The helmet layer's quads: two bands, each once (far depth) or once per eye (near depth).
 inline constexpr int kHelmetQuadsMax = 4;
 
+// One of the layer's own swapchains' image acquired and not yet waited for (acquire_wait): a wait that timed out leaves
+// it acquired, and OpenXR has the next wait be on that same image (no second acquire, no release before it), so the
+// next frame waits on it again. Reset whenever its swapchain goes.
+struct PendingImage {
+    bool acquired = false;
+    uint32_t index = 0;
+};
+
+// The bounded wait for a layer image inside the game's own calls: kImageWaitTries waits of kImageWaitNs (about a
+// second), never XR_INFINITE_DURATION under the layer's mutexes; the frame goes out without that image if it times out.
+inline constexpr XrDuration kImageWaitNs = 100'000'000;
+inline constexpr int kImageWaitTries = 10;
+
+// Output density (quad/output_density.h): the composed output's scale of the native eye, this frame's and its chain's.
+// Above 1 the runtime gets the focus views' texels instead of their average down to the native eye.
+struct OutputDensity {
+    double scale = 1;       // this frame's: each eye composed into native x scale (times the FOV crop's kept share)
+    double chainScale = 1;  // the output chain's eye is native x this
+    double target = 1;      // the scale the focus density wants (output_density_next); above chainScale: a larger chain
+    double wanting = 0;     // the most an eye wants this composition (views4_helmet_eye), taken by views4_output_density
+    double wanted = 0;      // ... at the last composition; 0 none yet
+    double cap = 1;         // output_density_cap: the runtime's largest image and [quad] output_density_max
+    uint32_t eyeW = 0, eyeH = 0;  // the chain's eye, pixels
+    double logged = 0;      // the scale last logged
+};
+
 struct Quad {
     std::mutex mutex;
     uint32_t nativeW = 0, nativeH = 0;      // runtime's recommended eye size (before eye_scale)
+    uint32_t maxW = 0, maxH = 0;            // the runtime's largest eye image (output_density_cap)
     uint32_t reportedW = 0, reportedH = 0;  // what ACE was offered
     XrSwapchain appChain = XR_NULL_HANDLE;  // ACE's double-wide colour swapchain
     uint32_t appW = 0, appH = 0;
@@ -369,6 +475,7 @@ struct Quad {
     bool releaseHeld = false;               // B's image, released at B's xrEndFrame
     XrSwapchain outChain = XR_NULL_HANDLE;  // this layer's double-wide output
     std::vector<ID3D12Resource*> outImages;
+    PendingImage outPending;  // outChain's image left acquired by a timed-out wait
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
     QuadCompositor compositor;
@@ -395,6 +502,7 @@ struct Quad {
     XrSpace helmetSpace = XR_NULL_HANDLE;
     std::vector<ID3D12Resource*> helmetImages;
     std::vector<ID3D11Texture2D*> helmetImages11;  // the same, for a D3D11 session (ACC)
+    PendingImage helmetPending;  // helmetChain's image left acquired by a timed-out wait
     bool helmetPiecesLoaded = false;  // the composing compositor holds pieces (helmet_pieces), for the menu and submit
     bool helmetLayerFailed = false, helmetDrawn = false;
     // Its quads this frame: the bands the pieces draw on (helmet_bands), one or two, from the same image; with a
@@ -408,6 +516,7 @@ struct Quad {
     ULONGLONG helmetLightLogAt = 0;  // when to ask the compositor for the helmet's light again (log_helmet_light)
     bool v4FovValid = false;
     XrExtent2Di v4Extent[2] = {};  // each composed eye's size in the output (views4_compose), for views4_submit
+    OutputDensity outDensity;      // the D3D12 output chain's (made at launch density; not grown live)
     XrFovf v4SubmitFov[2] = {};  // the FOV the composed output covers (views4_compose), for views4_submit
     XrFovf v4LoggedGameFov[2] = {};  // ACE's submitted FOV, as last logged against v4SubmitFov
     bool v4Composed = false;
@@ -432,7 +541,13 @@ struct V4D3D11 {
     std::map<XrSwapchain, Chain> chains;  // the game's
     XrSwapchain outChain = XR_NULL_HANDLE;
     std::vector<ID3D11Texture2D*> outImages;
+    PendingImage outPending, focusPending;  // each chain's image left acquired by a timed-out wait
     uint32_t outW = 0, outH = 0;  // one eye's size in it
+    OutputDensity outDensity;     // its scale of the native eye; grown live (v4d3d11_resources)
+    // A chain replaced by a larger one: destroyed once the runtime is surely done with its last image.
+    XrSwapchain retiredChain = XR_NULL_HANDLE;
+    int retiredFrames = 0;  // compositions left before it goes
+    bool growFailed = false;  // a larger chain failed: the output keeps the size it has
     bool failed = false;          // no compositor or output chain: views 0-1 as they are
     // experiment.focusLayer: the focus views' own swapchain (kHelmetLayerFormat, alpha the feather), eye e from
     // x = e x focusW; made at the first frame with four views, the size of the game's view images.
@@ -440,13 +555,30 @@ struct V4D3D11 {
     std::vector<ID3D11Texture2D*> focusImages;
     uint32_t focusW = 0, focusH = 0;
     bool focusFailed = false;  // its swapchain failed: composed as without focus_layer
-    // Sharpening with focus_layer (native quad views): the periphery's sharpened copy (the game's format, the focus
-    // chain's size), made the first time sharpening is on.
-    XrSwapchain peripheryChain = XR_NULL_HANDLE;
-    std::vector<ID3D11Texture2D*> peripheryImages;
-    bool peripheryFailed = false;      // its swapchain failed: the periphery goes unsharpened
-    bool peripheryDrawFailed = false;  // the last copy failed (logged once)
-    bool peripherySharpened = false;   // the last layered frame's periphery was the sharpened copy
+    // Native quad views with the FOV crop (v4d3d11_pad_periphery): each eye's periphery as rendered copied texel for
+    // texel into a chain of the game's format over the runtime's whole eye, black around it (eye e from x = e x padW),
+    // since the runtime may draw views 0-1 over its eye whatever FOV they carry (issue 29). Made at the first such race
+    // frame, again larger when a frame needs more (the old one destroyed a few frames later).
+    XrSwapchain padChain = XR_NULL_HANDLE;
+    std::vector<ID3D11Texture2D*> padImages;
+    std::vector<ID3D11RenderTargetView*> padTargets;  // per image, made at its first use; owned
+    int64_t padFormat = 0;
+    uint32_t padW = 0, padH = 0;
+    PendingImage padPending;
+    XrSwapchain padRetired = XR_NULL_HANDLE;
+    int padRetiredFrames = 0;
+    bool padFailed = false;  // a chain, view or copy that can't be made: views 0-1 as rendered from then on
+    // Colour correction can't grade the periphery's copy (an array or a view the compositor can't read): no colour
+    // correction under native quad views from then on, so the focus views never differ from it.
+    bool padGradeFailed = false;
+    int padGradeRetry = 0;          // frames left before a failed graded copy is tried again (the focus views ungraded)
+    bool padGradeLogged = false;    // that failure, logged once a session
+    bool gradeLayerLogged = false;  // focus_layer without native quad views: "colour correction isn't applied", once
+    // How the last race frame's colour correction went (the headset menu's Color page): 0 applied or off, 1 paused
+    // (the periphery couldn't be graded this frame), 2 not available in this mode.
+    std::atomic<int> gradeState = 0;
+    uint64_t padded = 0;     // frames padded
+    uint64_t paddedEyesOnly = 0;  // of them, frames without focus views (v4d3d11_pad_eyes)
     float loggedTexelsPerPixel = 0;    // the focus views' texels per display pixel last logged (sharpening)
     uint64_t layered = 0;      // frames submitted as two layers
     // Native quad views: race frames whose views 2-3 covered the runtime's focus views (FocusLayerPS's region), how
@@ -555,6 +687,7 @@ struct IniSnapshot {
     MenuValues menu;
     MenuPlacement menuPlacement;
     OsdPlacement osd;
+    ClockPlacement clock;
     Hotkeys hotkeys;
     std::wstring restartKeys;
     uint64_t writesBefore = 0;  // ini_write_later's writes done before it was read (menu_values_changed)
@@ -600,8 +733,14 @@ struct PadWatch {
     bool stop = false;
     Hotkeys bindings;              // a copy for the thread
     std::atomic<uint32_t> held{0};  // bit per HotkeyAction
-    // Left running at exit (no xrDestroySession), the thread would end the process in std::terminate.
+    // Left running at exit (no xrDestroySession), the thread would end the process in std::terminate. At a
+    // process exit it has already ended, perhaps holding `mutex`: detached, not locked or joined.
     ~PadWatch() {
+        if (processTerminating.load()) {
+            if (thread.joinable())
+                thread.detach();
+            return;
+        }
         {
             std::lock_guard guard(mutex);
             stop = true;
@@ -626,6 +765,7 @@ struct Menu {
     XrSpace view = XR_NULL_HANDLE;
     XrSwapchain chain = XR_NULL_HANDLE;
     std::vector<void*> images;  // the session API's textures
+    PendingImage pending;       // chain's image left acquired by a timed-out wait
     std::unique_ptr<PanelUpload> upload;
     XrCompositionLayerQuad layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     int heldKey = -1;  // keyboard repeat: the held arrow (index into kMenuKeys)
@@ -639,6 +779,8 @@ struct Menu {
 };
 
 inline constexpr int64_t kMenuHideMs = 6000, kRepeatDelayMs = 400, kRepeatMs = 90;
+// With the performance overlay on, the menu stays this long after the last press: a step, then its frame times.
+inline constexpr int64_t kMenuHideOverlayMs = 15000;
 
 // ---- Performance overlay ---------------------------------------------------------------------
 // [osd] (quad/osd.h): a head-locked card where the launcher's Headset menu pane or the menu places it, redrawn every kOsdDrawMs from the
@@ -654,6 +796,7 @@ struct Osd {
     XrSpace view = XR_NULL_HANDLE;
     XrSwapchain chain = XR_NULL_HANDLE;
     std::vector<void*> images;  // the session API's textures
+    PendingImage pending;       // chain's image left acquired by a timed-out wait (the notice's and the card's)
     std::unique_ptr<PanelUpload> upload;
     XrCompositionLayerQuad layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     std::atomic<int64_t> periodNs{0};  // the display's, from xrWaitFrame (any thread)
@@ -664,8 +807,9 @@ struct Osd {
     int64_t tscStartQpc = 0;
     uint64_t tscStart = 0;
     double cyclesPerMs = 0;  // the TSC's rate, measured against QPC
+    XrTime lastDisplay = 0;        // the previous frame's display time (xrEndFrame's displayTime)
     std::vector<OsdFrame> frames;  // since the last draw
-    std::deque<double> history;    // the graph: the last kOsdHistory frame times
+    std::deque<OsdFrame> history;  // the graph: the last kOsdHistory frames
     int64_t nextDraw = 0;
     uint64_t gazeQueries = 0, gazeTracked = 0;  // at the last draw
     uint64_t runtimeGazeMoves = 0;  // nativeQuad.gazeMoves at the last draw
@@ -682,6 +826,22 @@ struct Osd {
     double waitMs = -1;
     OsdSummary shown;  // the card's numbers at its last draw (for the log)
     bool shownValid = false;
+};
+
+// ---- Clock -----------------------------------------------------------------------------------
+// [clock] (quad/osd.h): the local time on a small head-locked card of its own, placed as the overlay's card. Redrawn
+// (on a worker, like the overlay's card) when the minute turns over.
+struct Clock {
+    ClockPlacement placement;  // [clock] when last read
+    bool read = false, failed = false, uploaded = false;
+    XrSpace view = XR_NULL_HANDLE;
+    XrSwapchain chain = XR_NULL_HANDLE;
+    std::vector<void*> images;  // the session API's textures
+    PendingImage pending;       // chain's image left acquired by a timed-out wait
+    std::unique_ptr<PanelUpload> upload;
+    XrCompositionLayerQuad layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    std::wstring shown;  // the time on the card (or being drawn)
+    std::future<std::vector<uint32_t>> drawing;
 };
 
 // A notice in the performance overlay's card, for the first kNoticeMs of the session's frames, when the layer
@@ -733,6 +893,7 @@ struct NativeQuad {
     struct Located {
         XrTime time = 0;
         float tan[2][4] = {};
+        float eyeTan[2][4] = {};  // the runtime's eyes (views 0-1) as located: tangents left, right, up, down
         bool valid = false;
     };
     std::mutex regionMutex;
@@ -743,6 +904,10 @@ struct NativeQuad {
     // Render thread: copy frames whose copies were cut to the runtime's focus views; frames that took the latest
     // located views (none at their display time).
     uint64_t croppedFrames = 0, regionMisses = 0;
+    // Render thread: frames whose views 0-1 reached the runtime narrower than its located eyes (the FOV crop, where
+    // nothing padded them out: native_quad.h eye_pad_image), logged at the first and counted for the session's end.
+    uint64_t narrowFrames = 0;
+    bool loggedNarrow = false;
 };
 
 // The globals (globals.cpp).
@@ -765,10 +930,16 @@ extern SessionGraphics sessionGraphics;
 extern V4D3D11 v4d3d11;
 extern Views4Outline v4outline;
 extern uint64_t endFrames;
+// measure=1 without the four views (baseline): the game's projection swapchain, recorded at xrEndFrame, whose image
+// release ends the GPU frame timer's frame (gpu_frame_timing=1).
+extern std::atomic<XrSwapchain> measuredEyeChain;
 extern uint64_t locates;
 extern CpuTimes cpu;
 extern Pacing pacing;
 extern SessionSummary summary;
+// The settings' generation for the session record's stints (quad/session_stint.h): live_reload counts a change of a
+// setting that changes the picture or its cost; the report windows of an older one end its stint.
+extern std::atomic<uint32_t> stintGeneration;
 extern std::string layersBelow;
 extern IDXGIAdapter3* vramAdapter;
 extern bool visibilityMaskLogged;
@@ -780,6 +951,7 @@ extern Hotkeys hotkeys;
 extern PadWatch padWatch;
 extern Menu menu;
 extern Osd osd;
+extern Clock clockCard;
 extern Notice notice;
 extern bool visorHotkeyHeld;
 extern bool cpuProfileHotkeyHeld;

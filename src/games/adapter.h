@@ -77,8 +77,6 @@ public:
     // performance overlay and the reports, as mode=off with measure=1. The game gets the runtime's own eye size, and
     // none of the layer's views4 or quad methods (which resize the eyes and compose) start, whatever the ini says.
     virtual bool measure_only() const { return false; }
-    // A measure_only game's view sizes as shares of the native eye ([experiment] periphery_scale, focus_density; the
-    // focus box's share applied), at the start and live.
     // A measure_only game's GPU regulator ([regulator], quad/regulator_settings.h; at the start and live): it lowers the
     // periphery and/or the focus density a percent at a time while the GPU time per frame runs over its limit, and back up
     // while it runs under. `density`: the set focus density as a share (1.0 = 100%).
@@ -86,6 +84,8 @@ public:
         (void)settings;
         (void)density;
     }
+    // A measure_only game's view sizes as shares of the native eye ([experiment] periphery_scale, focus_density; the
+    // focus box's share applied), at the start and live.
     virtual void qvfr_set_density(double peripheryScale, double focusWidth, double focusHeight) {
         (void)peripheryScale; (void)focusWidth; (void)focusHeight;
     }
@@ -94,6 +94,19 @@ public:
     virtual void qvfr_set_focus_look(double feather, double cornerRadius, bool outline, const float (&outlineColor)[4],
                                      double offsetDegrees) {
         (void)feather; (void)cornerRadius; (void)outline; (void)outlineColor; (void)offsetDegrees;
+    }
+    // xrEnumerateViewConfigurationViews (stereo): the size each eye's view was offered to the game, after the layer's
+    // own change to it (LMU: its eye targets' size, on any game build).
+    virtual void views_offered(uint32_t width, uint32_t height) {
+        (void)width;
+        (void)height;
+    }
+    // True: a game without the layer's views4 QVFR (has_qvfr false) that runs QVFR on a path of its own below the layer
+    // (the SCS games' D3D11 corner), decided from `ini` at load, before the adapter's instance_created. The layer then
+    // still runs as mode=off, but its reports say QVFR and the CPU settings apply.
+    virtual bool own_qvfr(const wchar_t* ini) const {
+        (void)ini;
+        return false;
     }
     // False while the layer can't compose this game's views (its graphics API isn't supported yet): QVFR then
     // runs uncomposed, the headset showing views 0-1.
@@ -151,6 +164,15 @@ public:
     virtual bool qvfr_live_resolution() const { return info() && info()->features.liveResolution; }
     // Live focus box and focus cull, from the next frame the game fills on.
     virtual void qvfr_set_live(double focusFraction, double focusFractionY, double cullScale, bool gaze) = 0;
+    // The focus mask ([quad] focus_mask; quad/focus_mask.h), live: the focus shape as the compositor composes it (the
+    // pulled-in corners' insets, focus_shape_insets' order; the corner radius, unused with corners) and the margin in
+    // focus view texels. A game that can mask its focus views skips their texels outside it.
+    virtual void qvfr_set_focus_mask(bool on, const float (&inset)[8], double cornerRadius, int marginTexels) {
+        (void)on;
+        (void)inset;
+        (void)cornerRadius;
+        (void)marginTexels;
+    }
     // QVFR: object and tree detail, percent (GameFeatures::objectDetail; [experiment] object_detail), at launch and
     // live. 100: the LOD the focus views' pixel density needs, 0: the game's own for its render size.
     virtual void qvfr_set_object_detail(int percent) { (void)percent; }
@@ -225,14 +247,61 @@ public:
     }
     // xrCreateSession; `probed`: the engine probes started (probe.h).
     virtual void session_created(bool probed) { (void)probed; }
-    // xrCreateSession with a D3D11 binding: the game's device.
+    // xrCreateSession with a D3D11 binding: the game's device. Called when the layer composes D3D11 views, or when
+    // observes_d3d11() asks for it (a game's log-only D3D11 probes, ATS).
     virtual void d3d11_session(ID3D11Device* device) { (void)device; }
+    virtual bool observes_d3d11() const { return false; }
+    // A game without the layer's QVFR pipeline that follows the gaze itself (ATS's API-level focus view): the layer
+    // sets its gaze actions up and calls qvfr_note_views and qvfr_set_gaze at every stereo xrLocateViews.
+    virtual bool wants_gaze() const { return false; }
+    // A game whose QVFR runs through none of the layer's own methods (no compositor of ours: the game's own layers go
+    // on) but still shows the overlay and the headset menu, and takes the menu's sizes live: the periphery's and the
+    // focus box's shares of the eye (0..1) and eye tracking on or off, at every live read of the ini.
+    virtual bool shows_overlay() const { return false; }
+    struct LiveView {
+        double periphery = 1;           // the eye's own density, a share of native (0..1)
+        double focusX = 0.3, focusY = 0.3;  // the focus box's shares of the eye's screen
+        double density = 1;             // the focus view's density, a share of native
+        double feather = 0.1;           // the box's blended edge, a share of half its shorter side
+        double cornerRadius = 0;        // rounded corners, a share of half its shorter side
+        bool border = false;            // the outline
+        float borderColor[4] = {0, 1, 0, 1};
+        bool gaze = true;               // eye tracking
+    };
+    virtual void live_view(const LiveView& view) { (void)view; }
+    // The focus box's look at launch (the ini's feather, corner radius, outline and its colour), before any live_view: a
+    // game composing its own box (the SCS corner) starts from it, not from defaults until the ini first changes.
+    virtual void qvfr_set_look(double feather, double cornerRadius, bool border, const float (&color)[4]) {
+        (void)feather;
+        (void)cornerRadius;
+        (void)border;
+        (void)color;
+    }
     // The OpenXR session began (true: xrBeginSession succeeded) or is being created or destroyed (false). Until
     // it begins, the runtime may have no views to answer with.
     virtual void session_running(bool running) { (void)running; }
     virtual void session_destroyed() {}
     // Every xrEndFrame.
     virtual void frame_end() {}
+    // Every xrEndFrame of a game without the layer's own submission (identity games): the frame to submit, `info` itself
+    // or a copy the adapter keeps until its next call (ATS's corner: each eye image's rectangle cut).
+    // xrAcquireSwapchainImage succeeded for one of the game's swapchains (`enumerate`: the next layer's
+    // xrEnumerateSwapchainImages), and xrReleaseSwapchainImage is about to hand an image back to the runtime: the last
+    // moment to change it (ATS's corner scales its eye back over the whole image there).
+    virtual void swapchain_acquired(XrSwapchain chain, uint32_t index, PFN_xrEnumerateSwapchainImages enumerate) {
+        (void)chain;
+        (void)index;
+        (void)enumerate;
+    }
+    virtual void swapchain_releasing(XrSwapchain chain) { (void)chain; }
+    // xrDestroySwapchain for one of the game's swapchains, before it goes on (any thread the game destroys it on):
+    // whatever the adapter keeps for `chain` (its images' raw pointers) must go now; the handle may come back for another.
+    virtual void swapchain_destroyed(XrSwapchain chain) { (void)chain; }
+    // `enumerate`: the next layer's xrEnumerateSwapchainImages (the swapchains' images, if the adapter draws into them).
+    virtual const XrFrameEndInfo* adjust_frame_end(const XrFrameEndInfo* info, PFN_xrEnumerateSwapchainImages enumerate) {
+        (void)enumerate;
+        return info;
+    }
 };
 
 // The adapter for `game` (null: the one that does nothing). Lives for the process.
