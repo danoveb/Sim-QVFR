@@ -48,6 +48,16 @@ XrResult end_frame(XrSession session, const XrFrameEndInfo* frameInfo) {
     XrFrameEndInfo withMenu{};
     std::vector<const XrCompositionLayerBaseHeader*> menuLayers;
     const XrFrameEndInfo* info = menu_frame(session, frameInfo, withMenu, menuLayers);
+    // Observe the application's original projection submission at the common xrEndFrame boundary.
+    // Do this before views4/quad composition can replace swapchains, rectangles or FOV.
+    if (game && frameInfo && frameInfo->layers) {
+        for (uint32_t i = 0; i < frameInfo->layerCount; ++i) {
+            const XrCompositionLayerBaseHeader* layer = frameInfo->layers[i];
+            if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION)
+                game->qvfr_note_projection(
+                    reinterpret_cast<const XrCompositionLayerProjection*>(layer));
+        }
+    }
     ++endFrames;
     if (experiment.pixCaptureFrame)
         pix_capture_frame(endFrames);

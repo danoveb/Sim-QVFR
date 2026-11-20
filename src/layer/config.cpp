@@ -176,6 +176,14 @@ void load_experiment() {
         logf("experiment: %ls has no QVFR yet: log only, running as mode=off (ini mode=%ls)", game->info()->name, mode);
     if (logOnly)
         wcscpy_s(mode, L"off");
+    // A game that renders QVFR itself (RF2): the layer only measures. mode=off whatever the ini says (its views4 would
+    // resize the eyes the game renders at), the performance overlay and the reports on.
+    const bool measureOnly = !logOnly && game->measure_only();
+    if (measureOnly) {
+        logf("experiment: %ls renders QVFR itself: the layer only measures, running as mode=off (ini mode=%ls)",
+             game->info()->name, mode);
+        wcscpy_s(mode, L"off");
+    }
     experiment.focusOnly = _wcsicmp(mode, L"focus_only") == 0;
     experiment.doubleRender = _wcsicmp(mode, L"double_render") == 0;
     experiment.views3 = _wcsicmp(mode, L"views3") == 0;
@@ -234,7 +242,8 @@ void load_experiment() {
     experiment.cpuProfileSlowMs =
         std::clamp(static_cast<int>(GetPrivateProfileIntW(L"experiment", L"cpu_profile_slow_ms", 0, ini.c_str())), 0, 1000);
     experiment.measure =
-        GetPrivateProfileIntW(L"experiment", L"measure", 0, ini.c_str()) != 0 || experiment.cpuProfile || baseline;
+        GetPrivateProfileIntW(L"experiment", L"measure", 0, ini.c_str()) != 0 || experiment.cpuProfile || baseline ||
+        measureOnly;
     experiment.passCensusFrame = std::max(1u, GetPrivateProfileIntW(L"experiment", L"pass_census_frame", 1500, ini.c_str()));
     experiment.views4FocusCull = GetPrivateProfileIntW(L"experiment", L"views4_focus_cull", 0, ini.c_str()) != 0;
     experiment.views4FocusCullMargin =
@@ -298,7 +307,7 @@ void load_experiment() {
     if (GetFileAttributesExW(ini.c_str(), GetFileExInfoStandard, &attributes))
         live.written = attributes.ftLastWriteTime;
     experiment.captureEverySeconds = GetPrivateProfileIntW(L"quad", L"capture_every_s", 0, ini.c_str());
-    experiment.probes = logOnly || GetPrivateProfileIntW(L"experiment", L"probes", 1, ini.c_str()) != 0;
+    experiment.probes = logOnly || measureOnly || GetPrivateProfileIntW(L"experiment", L"probes", 1, ini.c_str()) != 0;
     experiment.hangWatchSeconds = GetPrivateProfileIntW(L"experiment", L"hang_watch_s", game->hang_watch_s(), ini.c_str());
     // Above 100 supersamples (in quad mode this is the outer view's resolution). Only the modes that render
     // through it scale what ACE is offered: with mode=off (baseline=1 too) ACE gets the runtime's own size, the

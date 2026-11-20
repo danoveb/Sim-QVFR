@@ -82,7 +82,7 @@ void menu_placement_changed(const MenuPlacement& placement) {
     live.menuPlacement = placement;
     menu_place(placement);
     logf("settings menu: moved to %d deg right, %d deg up, %d deg wide", placement.yaw, placement.pitch, placement.width);
-    if (experiment.views4 || experiment.quad)
+    if (experiment.views4 || experiment.quad || (game && game->measure_only()))
         menu_open(qpc_now());
 }
 
@@ -175,6 +175,7 @@ void menu_open(int64_t now) {
         }
         menu.model.launch.cropWidth = l.cropWidth * 100;  // the launch crop
         menu.model.launch.cropHeight = l.cropHeight * 100;
+        menu.model.launch.selfRendered = game && game->measure_only();  // RF2: the game renders QVFR, the menu steers it
         const games::GameFeatures features = game_features();  // what the game has: the rest is left out
         menu.model.launch.cropPage = features.fovCrop;
         menu.model.launch.helmetPage = features.helmet;
@@ -242,8 +243,9 @@ void menu_press(MenuKey key, int64_t now) {
     menu.lastWrite = ini_write_later([ini = live.ini, settings = menu.settingsIni, values = menu.model.values,
                      cheeky = menu.model.cheeky, qvfr = menu.model.launch.qvfr, detail = menu.model.launch.objectDetail,
                      quads = menu.model.launch.focusQuads, sharpening = menu.model.launch.sharpening,
-                     ownDlss = menu.model.launch.ownDlss, ownNr = menu.model.launch.ownNr] {
-        write_menu_values(ini.c_str(), values, qvfr, detail, quads, sharpening);
+                     ownDlss = menu.model.launch.ownDlss, ownNr = menu.model.launch.ownNr,
+                     selfRendered = menu.model.launch.selfRendered] {
+        write_menu_values(ini.c_str(), values, qvfr, detail, quads, sharpening, selfRendered);
         if (cheeky.available)
             write_cheeky_settings(ini.c_str(), cheeky.values, false);
         if (ownDlss)
@@ -252,7 +254,7 @@ void menu_press(MenuKey key, int64_t now) {
             write_nr_settings(ini.c_str(), values.nr);
         if (!settings.empty()) {
             const std::wstring target = game_settings_ini(settings);
-            write_menu_values(target.c_str(), values, qvfr, detail, quads, sharpening);
+            write_menu_values(target.c_str(), values, qvfr, detail, quads, sharpening, selfRendered);
             if (cheeky.available)
                 write_cheeky_settings(target.c_str(), cheeky.values, false);
             if (ownDlss)
@@ -470,9 +472,11 @@ void menu_render() {
 const XrFrameEndInfo* menu_frame(XrSession session, const XrFrameEndInfo* info, XrFrameEndInfo& storage,
                                  std::vector<const XrCompositionLayerBaseHeader*>& layers) {
     // The performance overlay also while measuring without QVFR (baseline=1), to compare the two; the settings
-    // menu only with a method of the layer's (its settings would change nothing in mode=off).
+    // menu only with a method of the layer's (its settings would change nothing in mode=off), or for a game that
+    // renders QVFR itself (RF2): its settings are live there too (live_ini.cpp), with the layer's menu to steer them.
     const bool method = experiment.views4 || experiment.quad;
-    if (live.ini.empty() || (!method && !experiment.measure && !notice_pending()))
+    const bool menuOn = method || (game && game->measure_only());
+    if (live.ini.empty() || (!menuOn && !experiment.measure && !notice_pending()))
         return info;
     // For the launcher's Center PPD: once, when ACE has rendered.
     static bool ppdReported = false;
@@ -486,11 +490,12 @@ const XrFrameEndInfo* menu_frame(XrSession session, const XrFrameEndInfo* info, 
         }
     }
     const int64_t now = qpc_now();
-    if (method) {
+    if (menuOn) {
         menu_keyboard(now);
         menu_controllers(session, now);
-        optimize_tick(now);
     }
+    if (method)
+        optimize_tick(now);
     if (menu.visible && now >= menu.hideAt) {
         menu.visible = false;
         log_line("settings menu: hidden");

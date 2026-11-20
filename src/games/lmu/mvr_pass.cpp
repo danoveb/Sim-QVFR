@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <d3d11_4.h>
+#include <d3dcompiler.h>
 #include <intrin.h>
 #include <wrl/client.h>
 
@@ -26,6 +27,8 @@
 #include "../../engine/nvapi_stereo.h"
 #include "../../log.h"
 #include "../../probe/d3d11_capture.h"
+#include "../../quad/offaxis_focus.h"
+#include "../rf2/session_backend.h"
 #include "../../engine/dlss_views.h"
 #include "car_motion.h"
 #include "focus_post.h"
@@ -53,7 +56,7 @@ enum Hook : int {
     kHookVS, kHookGS, kHookOM, kHookOMUav, kHookSO, kHookVP, kHookSC, kHookResolve, kHookHS, kHookDS, kHookDrawIndexed,
     kHookDraw, kHookDrawIndexedInstanced, kHookDrawInstanced, kHookCopy, kHookDrawAuto, kHookDrawIndexedIndirect,
     kHookDrawInstancedIndirect, kHookPS, kHookVSCB, kHookMap, kHookUnmap, kHookIAVB, kHookIAIB, kHookBlend, kHookDepth,
-    kHookExecute, kHooks
+    kHookExecute, kHookCopyResource, kHookClearRtv, kHookClearUavUint, kHookClearUavFloat, kHookGenerateMips, kHooks
 };
 constexpr unsigned kSlotOf[kHooks] = {kVSSetShader,   kGSSetShader,    kOMSetRenderTargets, kOMSetRenderTargetsAndUavs,
                                       kSOSetTargets,  kRSSetViewports, kRSSetScissorRects,  kResolveSubresource,
@@ -61,7 +64,8 @@ constexpr unsigned kSlotOf[kHooks] = {kVSSetShader,   kGSSetShader,    kOMSetRen
                                       kDrawIndexedInstanced,           kDrawInstanced,      kCopySubresourceRegion,
                                       kDrawAuto,      kDrawIndexedInstancedIndirect,        kDrawInstancedIndirect,
                                       kPSSetShader,   kVSSetConstantBuffers, kMap, kUnmap,  kIASetVertexBuffers,
-                                      kIASetIndexBuffer, kOMSetBlendState, kOMSetDepthStencilState, kExecuteCommandList};
+                                      kIASetIndexBuffer, kOMSetBlendState, kOMSetDepthStencilState, kExecuteCommandList,
+                                      47, 50, 51, 52, 54};  // ID3D11DeviceContext: CopyResource, ClearRTV, ClearUAV uint/float, GenerateMips
 constexpr const char* kHookName[kHooks] = {"VSSetShader",    "GSSetShader",       "OMSetRenderTargets",
                                            "OMSetRenderTargetsAndUnorderedAccessViews", "SOSetTargets",
                                            "RSSetViewports", "RSSetScissorRects", "ResolveSubresource",
@@ -70,7 +74,9 @@ constexpr const char* kHookName[kHooks] = {"VSSetShader",    "GSSetShader",     
                                            "CopySubresourceRegion", "DrawAuto", "DrawIndexedInstancedIndirect",
                                            "DrawInstancedIndirect", "PSSetShader", "VSSetConstantBuffers", "Map",
                                            "Unmap", "IASetVertexBuffers", "IASetIndexBuffer", "OMSetBlendState",
-                                           "OMSetDepthStencilState", "ExecuteCommandList"};
+                                           "OMSetDepthStencilState", "ExecuteCommandList", "CopyResource",
+                                           "ClearRenderTargetView", "ClearUnorderedAccessViewUint",
+                                           "ClearUnorderedAccessViewFloat", "GenerateMips"};
 // Car tracking's hooks (mvr_car_track).
 constexpr bool is_car_hook(int h) {
     return h == kHookVSCB || h == kHookMap || h == kHookUnmap || h == kHookIAVB || h == kHookIAIB;
@@ -355,6 +361,9 @@ struct State {
     // The focus post (mvr_focus_replay): on; this pass's post-processing has begun (its multisample resolve is done);
     // its copy and composite replayed.
     bool focusReplay = false, postWindow = false, focusCopied = false, focusComposited = false;
+    // mvr_rf2_policy: RF2's hook set (every draw hook on; the resource-copy and
+    // clear hooks off) and instancing forced. Off for every other game.
+    bool rf2Policy = false;
     bool compositeOk = false;  // this pass's focus composite made (the blit's input)
     // In the post window before the focus copy: the last draw into a single-sample texture of the resolve's size other
     // than the resolve's target (a stage between the resolve and YEBIS, whose copy then starts from it: reflections
@@ -1385,7 +1394,6 @@ inline void vs_set_constant_buffers(VsCbFn real, ID3D11DeviceContext* context, U
     real(context, start, n, buffers);
 }
 
-// Map and Unmap: any resource but the per-draw buffer passes with one comparison.
 inline HRESULT map_resource(MapFn real, ID3D11DeviceContext* context, ID3D11Resource* resource, UINT sub, D3D11_MAP type,
                             UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     const HRESULT hr = real(context, resource, sub, type, flags, mapped);
@@ -1395,6 +1403,7 @@ inline HRESULT map_resource(MapFn real, ID3D11DeviceContext* context, ID3D11Reso
         g.worldMapped = mapped->pData;
     return hr;
 }
+
 
 // The per-draw buffer's matrix, read as its update ends (its memory is still ours to read until the call passes on).
 inline void unmap_resource(UnmapFn real, ID3D11DeviceContext* context, ID3D11Resource* resource, UINT sub) {
@@ -1957,8 +1966,20 @@ void fsr_final(UINT n, ID3D11RenderTargetView* const* rtvs) {
     }
 }
 
+// RF2's backend state. The hooks below only forward to it (src/games/rf2/session_backend.h).
+simqvfr::games::rf2::SessionBackend rf2;
+
+// Observer's view of a draw: the hook layer's stage tracking and twin lookup, for the twin the passes draw with now
+// (NVIDIA's single-pass stereo's, or the instanced one).
+void rf2_scene_draw(ID3D11DeviceContext* context) {
+    rf2.note_draw(context, g.context, g.replaying, {g.gsBound, g.hsBound, g.dsBound, g.soBound},
+                  g.instanced ? kMvrInstancedTwinGuid : kMvrTwinGuid,
+                  [](ID3D11VertexShader* vs) { return twin_of(vs) != nullptr; });
+}
+
 void STDMETHODCALLTYPE om_set_render_targets(ID3D11DeviceContext* context, UINT n, ID3D11RenderTargetView* const* rtvs,
                                              ID3D11DepthStencilView* dsv) {
+    rf2.note_target_bind(context, g.context, g.replaying, n, rtvs, dsv);
     if (!ours(context)) {
         realOMSetRenderTargets(context, n, rtvs, dsv);
         if (tr.on && context == g.context && !g.replaying)
@@ -1995,6 +2016,7 @@ void STDMETHODCALLTYPE om_set_render_targets_and_uavs(ID3D11DeviceContext* conte
                                                       ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv,
                                                       UINT uavStart, UINT uavCount,
                                                       ID3D11UnorderedAccessView* const* uavs, const UINT* counts) {
+    rf2.note_target_bind(context, g.context, g.replaying, n, rtvs, dsv);
     if (!ours(context)) {
         realOMSetRenderTargetsAndUavs(context, n, rtvs, dsv, uavStart, uavCount, uavs, counts);
         if (tr.on && context == g.context && !g.replaying && n != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
@@ -2076,6 +2098,7 @@ void post_begins(ID3D11DeviceContext* context, ID3D11Resource* scene, ID3D11Reso
 
 void STDMETHODCALLTYPE resolve_subresource(ID3D11DeviceContext* context, ID3D11Resource* dst, UINT dstSub,
                                            ID3D11Resource* src, UINT srcSub, DXGI_FORMAT format) {
+    rf2.note_resolve(context, g.context, g.replaying, src);
     if (pt.recording && context == g.context && !g.replaying) {
         const std::string from = pt_tex(src), to = pt_tex(dst);
         pt_event("R %s > %s, %s", from.c_str(), to.c_str(),
@@ -2116,6 +2139,7 @@ void STDMETHODCALLTYPE resolve_subresource(ID3D11DeviceContext* context, ID3D11R
         return;
     }
     realResolveSubresource(context, dst, dstSub, src, srcSub, format);
+    rf2.note_resolved(context, g.context, g.replaying, dst, dstSub, src);
     if (!multisample)
         return;
     ++g.stats.resolves;
@@ -2563,10 +2587,18 @@ void doubled_draw(ID3D11DeviceContext* context, A... a) {
 // The game's draw H in a pass as it reaches d3d11: doubled with instancing while two views are on, else as it was.
 template <int H, typename... A>
 void game_draw(ID3D11DeviceContext* context, A... a) {
-    if (g.instanced && g.on && ours(context))
-        doubled_draw<H>(context, a...);
-    else
-        call_real<H>(context, a...);
+    if (rf2.draw_eye(
+            context, g.context, g.replaying, kMvrInstancedTwinGuid, kMvrTwinGuid,
+            [&](ID3D11VertexShader* shader, ID3D11ClassInstance* const* instances, UINT count) {
+                realVSSetShader(context, shader, instances, count);
+            },
+            [&](UINT count, const D3D11_VIEWPORT* viewports) { realRSSetViewports(context, count, viewports); },
+            [&](UINT count, const D3D11_RECT* scissors) { realRSSetScissorRects(context, count, scissors); },
+            [&] { doubled_draw<H>(context, a...); },  // instancing: twice the instances
+            [&] { call_real<H>(context, a...); },     // single-pass stereo: the draw once, the driver makes both views
+            [] { return take_over_with_instancing(); }))  // the driver refused the two views: instancing, if it can
+        return;
+    call_real<H>(context, a...);
 }
 
 // mvr_ui_mips: for the panel's canvas `canvas` (the draw's pixel shader input 0), a copy of it with its mips, made once a
@@ -3229,6 +3261,7 @@ void learn_by_signature(ID3D11DeviceContext* context) {
 }
 
 void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* context, UINT count, UINT start, INT base) {
+    rf2_scene_draw(context);
     if (g.slotsBound && g.vsRole == VsRole::lensMask && ours(context))
         bind_slot_view(-1);  // car slots: the lens mask is no car part (it may return before the parts' step below)
     if (context == g.context && !g.replaying) {
@@ -3281,6 +3314,7 @@ void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* context, UINT count, UI
 // Draw also the final blit's replay (focus_blit).
 template <int H, typename... A>
 void STDMETHODCALLTYPE draw_traced(ID3D11DeviceContext* context, A... a) {
+    rf2_scene_draw(context);
     if (g.slotsBound && ours(context))
         bind_slot_view(-1);  // car slots: these draws are no car part's
     if (context == g.context && !g.replaying) {
@@ -3344,6 +3378,8 @@ void STDMETHODCALLTYPE draw_traced(ID3D11DeviceContext* context, A... a) {
 // while two views are on the game's own shader draws it, into the eye's viewport alone; logged once.
 template <int H, typename... A>
 void STDMETHODCALLTYPE undoubled_draw(ID3D11DeviceContext* context, A... a) {
+    rf2_scene_draw(context);
+    rf2.note_unsupported_draw(context, g.context, g.replaying);
     if (context == g.context && !g.replaying)
         ++tr.draws;
     if (!(g.instanced && g.on && ours(context))) {
@@ -3370,6 +3406,7 @@ void read_bindings();
 // (the twin, a second viewport beside the atlas tile). So: the two views off, the replay passed on untouched, and the
 // state read again after it (RestoreContextState FALSE leaves the context cleared, TRUE as it was: the views back on).
 void STDMETHODCALLTYPE execute_command_list(ID3D11DeviceContext* context, ID3D11CommandList* list, BOOL restore) {
+    rf2.note_execute(context, g.context, g.replaying);
     if (context != g.context || g.replaying) {  // ours (the focus post's) or another context's
         call_real<kHookExecute>(context, list, restore);
         return;
@@ -3392,13 +3429,37 @@ void STDMETHODCALLTYPE execute_command_list(ID3D11DeviceContext* context, ID3D11
     call_real<kHookExecute>(context, list, restore);
     g.replaying = false;
     g.inList = false;
-    if (!plain)
-        return;
+
     if (!restore) {  // the context's state cleared to its defaults: nothing of ours (twin, cb13, two viewports) bound
         read_bindings();
         g.on = false;
     }
     update();
+}
+
+// Log every context that reaches any of the hooked D3D11 functions. This census is observational only: it does not
+// change which context the LMU pass tracker treats as its own.
+std::mutex contextCensusMutex;
+std::vector<ID3D11DeviceContext*> contextCensus;
+
+void context_census(ID3D11DeviceContext* context, int hook) {
+    if (!context)
+        return;
+    {
+        std::lock_guard guard(contextCensusMutex);
+        if (std::find(contextCensus.begin(), contextCensus.end(), context) != contextCensus.end())
+            return;
+        contextCensus.push_back(context);
+    }
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    const D3D11_DEVICE_CONTEXT_TYPE type = context->GetType();
+    simqvfr::logf("lmu mvr: context census: context=%p device=%p type=%s firstHook=%s trackedContext=%p same=%d",
+                  static_cast<void*>(context), static_cast<void*>(device.Get()),
+                  type == D3D11_DEVICE_CONTEXT_IMMEDIATE ? "immediate" :
+                  type == D3D11_DEVICE_CONTEXT_DEFERRED ? "deferred" : "unknown",
+                  hook >= 0 && hook < kHooks ? kHookName[hook] : "unknown", static_cast<void*>(g.context),
+                  context == g.context ? 1 : 0);
 }
 
 // The detours of hook H's functions, one per function (N): straight through inside the handling of one (depth), else
@@ -3407,6 +3468,7 @@ template <int H, auto Handler, typename... A>
 struct Detours {
     template <int N>
     static void STDMETHODCALLTYPE fn(ID3D11DeviceContext* context, A... a) {
+        context_census(context, H);
         if (depth[H] > 0) {
             reinterpret_cast<void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, A...)>(functions[H].real[N])(context, a...);
             return;
@@ -3512,6 +3574,18 @@ void* detour_for(int h, int n) {
 // from single-pass stereo (it happens mid-pass, where d3d11's other modes can't be looked for): without either MVR's
 // hooks are as before.
 bool wanted(int h) {
+    if (g.rf2Policy) {
+        // RF2's submitted OpenXR images live on another D3D11 device. Resource-operation hooks cannot
+        // correlate them with the renderer and only add noise/overhead, so they stay off.
+        if (h == kHookCopyResource || h == kHookClearRtv || h == kHookClearUavUint ||
+            h == kHookClearUavFloat || h == kHookGenerateMips)
+            return false;
+        // VSSetConstantBuffers, Map and Unmap stay unhooked unless car tracking asks for them (is_car_hook): they
+        // only feed LMU's car tracking, and RF2's remap CB13 is bound through the context directly.
+        // Every draw-family hook: the observer and the eye-pass doubling need them all.
+        if (is_draw(h) || is_undoubled_draw(h))
+            return true;
+    }
     if (h == kHookPS)
         return g.biasHooks || g.slotsOn;
     if (is_car_hook(h))
@@ -3912,17 +3986,103 @@ void compare_sample(unsigned long long frame) {
 
 }  // namespace
 
+
+void mvr_rf2_note_fov(const float (&tanFov)[2][4]) { rf2.note_fov(tanFov); }
+
+void mvr_rf2_set_focus(double fractionX, double fractionY) { rf2.set_focus_fraction(fractionX, fractionY); }
+
+void mvr_rf2_set_density(double outerScale, double focusW, double focusH) { rf2.set_density(outerScale, focusW, focusH); }
+
+void mvr_rf2_set_focus_look(double feather, double cornerRadius, bool outline, const float (&outlineColor)[4],
+                            double offsetDegrees) {
+    rf2.set_focus_look(feather, cornerRadius, outline, outlineColor, offsetDegrees);
+}
+
+void mvr_rf2_set_gpu_timing(int mode) { rf2.set_gpu_timing(mode); }
+
+void mvr_rf2_set_regulator(bool focus, bool periphery, int decreaseAboveTenths, int increaseBelowTenths, int lowerFrames,
+                           int raiseFrames, double density) {
+    simqvfr::GpuRegulatorSettings s;
+    s.focus = focus;
+    s.periphery = periphery;
+    s.decreaseAbove = decreaseAboveTenths;
+    s.increaseBelow = increaseBelowTenths;
+    s.lowerFrames = lowerFrames;
+    s.raiseFrames = raiseFrames;
+    rf2.set_regulator(s, density);
+}
+
+bool mvr_rf2_regulator_status(bool& focus, bool& periphery, double& peripheryPercent, double& densityPercent,
+                              int& cutPeriphery, int& cutDensity) {
+    return rf2.regulator_status(focus, periphery, peripheryPercent, densityPercent, cutPeriphery, cutDensity);
+}
+
+void mvr_rf2_policy(bool on) {
+    g.rf2Policy = on;
+    if (!on || g.context)  // the instancing choice is made once, before the first install
+        return;
+    // How the eye passes draw their two views: NVIDIA's multi-view rendering (single-pass stereo through NVAPI: each draw
+    // once, with the game shader's NVAPI twin, the clip remap in cb13) where the device has it, else Sim-QVFR's
+    // instancing (each Draw* with two instances, the instanced twin writing SV_ViewportArrayIndex). [experiment]
+    // multi_view_software=1 asks for instancing where NVIDIA's is there too (mvr_probe_backend). If the driver refuses
+    // the two-view mode at the first draw, instancing takes over (take_over_with_instancing).
+    const bool available = mvr_probe_instanced();
+    const bool nvidia = mvr_probe_backend() == MvrBackend::nvapi;
+    g.instanced = !nvidia && available;
+    g.canInstance = available;
+    if (nvidia)
+        rf2.use_single_pass_stereo(g.twoViews);
+    simqvfr::logf("rf2 multi-view backend: %s (instancing available=%d; multi_view_software=1 forces instancing)",
+                  nvidia ? "NVIDIA's single-pass stereo" : g.instanced ? "instancing" : "none", available ? 1 : 0);
+}
+
+// CB13's remap constants (identity until a pass sets them) on `device`, replacing any earlier buffer.
+static bool create_remap_cb(ID3D11Device* device) {
+    g.remapCb.Reset();
+    const D3D11_BUFFER_DESC desc = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    const float identity[4] = {1, 0, 1, 0};
+    const D3D11_SUBRESOURCE_DATA init = {identity, 0, 0};
+    return SUCCEEDED(device->CreateBuffer(&desc, &init, &g.remapCb));
+}
+
 bool mvr_pass_install(ID3D11Device* device) {
-    if (g.context)
-        return true;
     if (!device)
         return false;
     ComPtr<ID3D11DeviceContext> context;
     device->GetImmediateContext(&context);
-    const D3D11_BUFFER_DESC cd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
-    const float identity[4] = {1, 0, 1, 0};
-    const D3D11_SUBRESOURCE_DATA init = {identity, 0, 0};
-    if (FAILED(device->CreateBuffer(&cd, &init, &g.remapCb)))
+    if (!context)
+        return false;
+    if (g.context) {
+        if (g.context == context.Get()) {
+            simqvfr::logf("lmu mvr: context census: install repeated for device=%p immediateContext=%p",
+                          static_cast<void*>(device), static_cast<void*>(context.Get()));
+            return true;
+        }
+
+        ID3D11DeviceContext* previous = g.context;
+        g.context = context.Get();
+        g.context1.Reset();
+        g.multithread.Reset();
+        context.As(&g.context1);
+        context.As(&g.multithread);
+
+        // D3D11 resources are owned by their creating device. A game's OpenXR session can use one device and its
+        // renderer a second one (RF2 through OpenComposite), so a remapCb made on the first is invalid on the
+        // renderer's context: CB13 would be rebound before each draw without effect. Recreate it on this device.
+        if (!create_remap_cb(device)) {
+            simqvfr::log_line("lmu mvr: failed to recreate remap CB13 on the renderer device");
+            return false;
+        }
+        simqvfr::logf("lmu mvr: recreated remap CB13=%p on renderer device=%p",
+                      static_cast<void*>(g.remapCb.Get()), static_cast<void*>(device));
+
+        simqvfr::logf("lmu mvr: context census: switched tracked context from %p to %p for device=%p type=%s; "
+                      "existing global D3D11 hooks kept",
+                      static_cast<void*>(previous), static_cast<void*>(g.context), static_cast<void*>(device),
+                      g.context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE ? "immediate" : "not-immediate");
+        return true;
+    }
+    if (!create_remap_cb(device))
         return false;
     if (g.biasHooks) {  // texture sharpening's constants (no rectangle, no bias until a pass sets them)
         const D3D11_BUFFER_DESC bd = {sizeof(g.biasConstants), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
@@ -3978,12 +4138,10 @@ bool mvr_pass_install(ID3D11Device* device) {
     }
     if (const MH_STATUS s = MH_Initialize(); s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED)
         return false;
-    // The probe's way to the two views (tests set it with mvr_use_instanced): instancing hooks the draws too.
-    if (mvr_probe_backend() == MvrBackend::instanced)
-        g.instanced = true;
-    if (mvr_probe_instanced())
-        g.canInstance = true;
     g.context = context.Get();
+    simqvfr::logf("lmu mvr: context census: install device=%p immediateContext=%p type=%s",
+                  static_cast<void*>(device), static_cast<void*>(g.context),
+                  g.context && g.context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE ? "immediate" : "not-immediate");
     context.As(&g.multithread);
     hook_every_mode();
     for (int h = 0; h < kHooks; ++h)
@@ -4315,16 +4473,9 @@ void mvr_redraw_panel(ID3D11DeviceContext* context, ID3D11RenderTargetView* rtv,
         }
     }
     D3D11_VIEWPORT vp = n ? vps[0] : D3D11_VIEWPORT{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    if (n) {
-        vp.TopLeftX *= sx;
-        vp.TopLeftY *= sy;
-        vp.Width *= sx;
-        vp.Height *= sy;
-    }
+    // Composite a complete eye. Do not inherit the game's transient viewport/scissor here.
+    vp = D3D11_VIEWPORT{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     D3D11_RECT sc = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-    if (sn)
-        sc = {static_cast<LONG>(std::lround(scs[0].left * sx)), static_cast<LONG>(std::lround(scs[0].top * sy)),
-              static_cast<LONG>(std::lround(scs[0].right * sx)), static_cast<LONG>(std::lround(scs[0].bottom * sy))};
     const bool was = g.replaying;
     g.replaying = true;
     realOMSetRenderTargets(context, 1, &rtv, nullptr);
@@ -4346,6 +4497,8 @@ void mvr_redraw_panel(ID3D11DeviceContext* context, ID3D11RenderTargetView* rtv,
 void mvr_frame_end(unsigned long long frame) {
     if (!g.context)
         return;
+    rf2.end_frame(frame, g.stats.stereoErrors);
+
     if (g.gpuSlot >= 0) {  // a frame of fewer than four passes (two, with the focus finals): its timing complete now
         g.context->End(g.gpu[g.gpuSlot].disjoint.Get());
         g.gpu[g.gpuSlot].pending = true;

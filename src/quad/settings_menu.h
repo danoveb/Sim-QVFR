@@ -133,6 +133,10 @@ struct MenuLaunch {
     // Texture sharpening was on at launch, so its hook and shader twins were made: its settings are live. Off at launch,
     // turning it on applies at the next launch (the page says so).
     bool sharpeningReady = false;
+    // The game renders QVFR itself (GameAdapter::measure_only: RF2) and the layer only adds this menu: periphery, focus
+    // density, the focus area's size, feather, corners, outline and its up/down place; no eye tracking, shape, crop,
+    // helmet or optimizer (the layer has no views of its own there).
+    bool selfRendered = false;
 };
 
 // Cheeky Foveated DLSS, when the layer runs it: its version (for the credit line) and [cheeky]'s live keys.
@@ -180,9 +184,9 @@ bool menu_key(SettingsMenu& menu, MenuKey key);
 // The values in an ini, read as the launcher reads them (unset periphery and density follow eye_scale).
 MenuValues read_menu_values(const wchar_t* ini);
 // Writes the menu's keys (resolution, the crop and the helmet only for QVFR; object detail only with `objectDetail`,
-// sharpening only with `sharpening`, a game that has it). False if the file cannot be written.
+// sharpening only with `sharpening`, a game that has it; `selfRendered` also writes the two views' resolution). False if the file cannot be written.
 bool write_menu_values(const wchar_t* ini, const MenuValues& values, bool qvfr, bool objectDetail = false,
-                       bool focusQuads = false, bool sharpening = false);
+                       bool focusQuads = false, bool sharpening = false, bool selfRendered = false);
 
 // What the values ask for against the launch (QVFR), by the layer's rule (views4_layout.h's
 // views4_fit): the views share ACE's launch target, so periphery and focus trade width; the focus

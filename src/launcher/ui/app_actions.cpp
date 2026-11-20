@@ -283,6 +283,10 @@ int* slider_value(Ctl id) {
     case kCorner: return &app.s.corner;
     case kFocusOffset: return &app.s.offset.for_mode(app.s.eyeTracking);
     case kGazeDeadzone: return &app.s.gazeDeadzone;
+    case kRegDecrease: return &app.s.regulator.decreaseAbove;
+    case kRegIncrease: return &app.s.regulator.increaseBelow;
+    case kRegLowerFrames: return &app.s.regulator.lowerFrames;
+    case kRegRaiseFrames: return &app.s.regulator.raiseFrames;
     case kShapeTopLeftIn:
     case kShapeTopLeftDown:
     case kShapeTopRightIn:
@@ -336,6 +340,10 @@ Range slider_range(Ctl id) {
     case kCorner: return kCornerRange;
     case kFocusOffset: return kFocusOffsetRange;
     case kGazeDeadzone: return kGazeDeadzoneRange;
+    case kRegDecrease:
+    case kRegIncrease: return kRegulatorMsRange;
+    case kRegLowerFrames: return kRegulatorLowerFramesRange;
+    case kRegRaiseFrames: return kRegulatorRaiseFramesRange;
     case kShapeTopLeftIn:
     case kShapeTopLeftDown:
     case kShapeTopRightIn:

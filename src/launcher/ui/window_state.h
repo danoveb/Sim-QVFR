@@ -70,6 +70,9 @@ enum Ctl {
     kNativeQuad,
     // Sharpening ([quad] sharpen_percent, Resolution pane).
     kSharpen,
+    // The GPU regulator ([regulator], Foveation card; a game with GameFeatures::gpuRegulator): the two switches (Focus
+    // density, Periphery), the GPU time over which it lowers them and under which it raises them, the frames before a 1% step down and before a 1% step up.
+    kRegFocus, kRegPeriphery, kRegDecrease, kRegIncrease, kRegLowerFrames, kRegRaiseFrames,
     // The FOV crop ([crop], Resolution pane).
     kCropOn, kCropTop, kCropBottom, kCropOuter, kCropInner,
     // The helmet overlay ([helmet], Resolution pane).

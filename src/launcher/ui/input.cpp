@@ -351,6 +351,8 @@ void activate(Ctl id, int option) {
     case kCheekyMotionFix: app.s.cheeky.motionFix = !app.s.cheeky.motionFix; changed(); return;
     case kCheekyNr: app.s.cheeky.nr = !app.s.cheeky.nr; changed(); return;
     case kOutline: app.s.outline = !app.s.outline; changed(); return;
+    case kRegFocus: app.s.regulator.focus = !app.s.regulator.focus; changed(); return;
+    case kRegPeriphery: app.s.regulator.periphery = !app.s.regulator.periphery; changed(); return;
     case kCheekyUse: app.s.cheeky.load = !app.s.cheeky.load; changed(); return;
     case kCheekyOn: app.s.cheeky.processing = !app.s.cheeky.processing; changed(); return;
     case kCheekyOuter: app.s.cheeky.outerDlaa = !app.s.cheeky.outerDlaa; changed(); return;
@@ -457,6 +459,8 @@ bool space_control(Ctl id) {
     case kMethod:
     case kMode:
     case kOutline:
+    case kRegFocus:
+    case kRegPeriphery:
     case kCheekyUse:
     case kCheekyOn:
     case kCheekyOuter:

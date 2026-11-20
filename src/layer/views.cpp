@@ -41,8 +41,15 @@ XrResult locate_views(XrSession session, const XrViewLocateInfo* info, XrViewSta
     if (stereo)
         for (int i = 0; i < 2; ++i)
             views[i].fov = crop_fov(views[i].fov, crop, i);
-    if (experiment.views4 && XR_SUCCEEDED(r) && views && countOutput) {
+
+    // RF2 needs the real stereo OpenXR FOV even though views4 is not enabled.
+    if (stereo)
         game->qvfr_note_views(views, std::min(*countOutput, capacity));
+
+    if (experiment.views4 && XR_SUCCEEDED(r) && views && countOutput) {
+        
+        
+        
         if (views4_outline_on() && *countOutput >= 2 && capacity >= 2) {
             std::lock_guard guard(v4outline.mutex);
             v4outline.fov[0] = views[0].fov;

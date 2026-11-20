@@ -52,6 +52,28 @@ constexpr Help kHelp[] = {
     {L"Corner radius", L"Rounds the focus area’s corners, so its edge is harder to spot. No cost: the area renders as a rectangle "
                        L"either way."},
     {L"Feather", L"The band where the focus area blends into the outer view. Wider hides the edge better; no measurable cost."},
+    // The GPU regulator card (rFactor 2).
+    {L"Regulate focus density",
+     L"Takes Focus density down 1% at a time while the GPU time per frame stays over Lower above, and back up while it stays "
+     L"under Raise below. The density you set is the most it uses; it is never written over. It stops at 50%."},
+    {L"Regulate periphery resolution",
+     L"Takes Periphery resolution down 1% at a time while the GPU time per frame stays over Lower above, and back up while it "
+     L"stays under Raise below. The resolution you set is the most it uses; it is never written over. It stops at 20%."},
+    {L"Lower above",
+     L"The GPU time per frame, in ms, over which the regulator lowers what it regulates. It is the time the layer measures on "
+     L"the GPU for the eye passes (the log’s scene span), not the overlay’s GPU number. At 90 Hz a frame has 11.1 ms; frames "
+     L"start to miss a little under that, so 10 ms is a start."},
+    {L"Raise below",
+     L"The GPU time per frame, in ms, under which the regulator raises what it regulates again. Keep it a ms or more under "
+     L"Lower above, so it does not go up and down: between the two limits nothing changes."},
+    {L"Frames before lowering",
+     L"How many frames in a row must run over Lower above before the regulator takes a 1% step down (1-300). Keep it low to "
+     L"react quickly: at 90 Hz, 10 frames is about a tenth of a second per step. A frame under Raise below starts the count "
+     L"again."},
+    {L"Frames before raising",
+     L"How many frames in a row must run under Raise below before the regulator takes a 1% step back up (100-1000). Keep it "
+     L"high to come back slowly: at 90 Hz, 300 frames is about three seconds per step. A frame over Lower above starts the "
+     L"count again."},
     {L"Gaze dead-zone",
      L"How far your eyes move before the focus area follows. A little keeps it still against eye-tracker noise; too much "
      L"makes it lag when you look around. No GPU cost."},

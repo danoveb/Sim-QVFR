@@ -21,6 +21,7 @@
 #include "../quad/gaze_deadzone.h"
 #include "../quad/helmet.h"
 #include "../quad/osd.h"
+#include "../quad/regulator_settings.h"
 
 namespace simqvfr::launcher {
 
@@ -56,6 +57,9 @@ struct Settings {
     int menuWidth = 33;       // [menu] width
     bool hotkeyFooter = true; // [menu] hotkey_footer: the in-game hotkeys under the headset menu
     OsdPlacement osd;         // [osd]: the performance overlay, its corner and size (live)
+    // [regulator] (a game with GameFeatures::gpuRegulator: rFactor 2): Periphery and/or Focus density go down 1% at a time
+    // while the GPU time per frame runs over a limit, and back up (never above the set values) while it runs under one (live).
+    GpuRegulatorSettings regulator;
     // [crop] (QVFR): shares of each eye's field of view ACE does not render, each side on its own (the
     // layer's fov_crop.h): outer is the temple side, inner the nose side. Applies at the next launch.
     bool crop = false;        // [crop] enabled
@@ -104,6 +108,14 @@ inline constexpr Range kOuterRange{10, 100}, kInnerRange{50, 400}, kSizeRange{10
 // Dragging Inner resolution moves it in steps of this many percent, as the headset menu's Focus density does: its
 // 350 values span fewer pixels than that, so a plain drag skipped round values such as 100% (99, then 101).
 inline constexpr int kInnerDragStep = 5;
+// The GPU regulator's sliders (quad/regulator_settings.h): the limits in tenths of a ms, the frames before a step down and before a step up. Dragging a limit
+// moves it in steps of this many tenths (0.5 ms); the arrow keys move it by one (0.1 ms).
+inline constexpr Range kRegulatorMsRange{kRegulatorMsMin, kRegulatorMsMax},
+    kRegulatorLowerFramesRange{kRegulatorLowerFramesMin, kRegulatorLowerFramesMax},
+    kRegulatorRaiseFramesRange{kRegulatorRaiseFramesMin, kRegulatorRaiseFramesMax};
+inline constexpr int kRegulatorMsDragStep = 5;
+// Dragging Frames before raising (100-1000) moves it in steps of this many frames; the arrow keys move it by one.
+inline constexpr int kRegulatorRaiseFramesDragStep = 10;
 // A slider's value at `share` (0..1) of its travel: on a grid of `step` from range.min, never past range.max.
 int slider_value_at(Range range, double share, int step = 1);
 // The layer's kMenuYawMax, kMenuPitchMax, kMenuWidthMin and kMenuWidthMax.

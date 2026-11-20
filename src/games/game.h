@@ -29,6 +29,9 @@ struct GameFeatures {
     // Sim-QVFR's own DLSS for a game that ships none, "side-loaded" ([dlss], engine/dlss_settings.h, live): NGX called
     // at the API level on the game's views (engine/dlss_views.h); needs the multi-view path (LMU).
     bool sideLoadedDlss = false;
+    // The GPU regulator ([regulator], quad/regulator_settings.h, live): the game renders QVFR itself and the layer times its eye
+    // passes, so it can take Periphery and Focus density down while frames run over a GPU time limit (rFactor 2).
+    bool gpuRegulator = false;
 };
 
 struct GameInfo {

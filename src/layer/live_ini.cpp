@@ -103,6 +103,15 @@ void live_apply(const LiveSettings& l) {
                         experiment.box_y(l.focusFractionY > 0 ? l.focusFractionY : l.focusFraction),
                         1.0 + l.feather + experiment.views4FocusCullMargin,
                         l.gaze && experiment.composing());
+    else if (!experiment.views4 && game->measure_only()) {  // renders QVFR itself (RF2): its focus box and sizes, from the ini
+        const double fy = l.focusFractionY > 0 ? l.focusFractionY : l.focusFraction;
+        game->qvfr_set_live(l.focusFraction, fy, 1.0 + l.feather, l.gaze);
+        const Views4Sizes sizes = views4_sizes(live.ini.c_str(), l.focusFraction, l.focusFractionY);
+        game->qvfr_set_density(sizes.outer, sizes.focus, sizes.focusHeight);
+        game->qvfr_set_regulator(read_regulator(live.ini.c_str()), sizes.density);  // [regulator], from the set sizes down
+        // The look, and the offset of the mode the menu edits (focus_offset.h: eye tracked or fixed).
+        game->qvfr_set_focus_look(l.feather, l.cornerRadius, l.border, l.borderColor, l.offset.for_mode(l.gaze));
+    }
     logf("live: focus box %.0f%% x %.0f%%, feather %.0f%%, corners %.0f%%, outline %d, gaze %d, offset fixed %d deg, "
          "gaze %d deg, gaze dead-zone %.1f deg",
          l.focusFraction * 100, experiment.focus_y() * 100, l.feather * 100, l.cornerRadius * 100, l.border ? 1 : 0,
@@ -262,7 +271,9 @@ void live_reload() {
     osd_placement_changed(s->osd, s->cheeky);
     hotkeys_changed(s->hotkeys);
     if (s->restartKeys != live.restartKeys) {
-        logf("live: %ls-> %ls(applies at the next launch)", live.restartKeys.c_str(), s->restartKeys.c_str());
+        // A game that renders QVFR itself (RF2) applies its sizes at once (live_apply above): nothing waits for a launch.
+        if (!game->measure_only())
+            logf("live: %ls-> %ls(applies at the next launch)", live.restartKeys.c_str(), s->restartKeys.c_str());
         live.restartKeys = s->restartKeys;
     }
 }

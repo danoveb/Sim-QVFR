@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -49,10 +50,39 @@ constexpr int kCreateInputLayoutSlot = 11, kCreateVertexShaderSlot = 12, kCreate
 
 CreateDeviceFn originalCreateDevice = nullptr;
 CreateDeviceAndSwapChainFn originalCreateDeviceAndSwapChain = nullptr;
-CreateVertexShaderFn originalCreateVertexShader = nullptr;
-CreatePixelShaderFn originalCreatePixelShader = nullptr;
-CreateInputLayoutFn originalCreateInputLayout = nullptr;
-std::atomic<bool> shaderHookTried{false};
+struct DeviceHook {
+    ID3D11Device* device = nullptr;  // not referenced: identity only
+    simqvfr::ObjectVtable vtable;
+    CreateVertexShaderFn createVertexShader = nullptr;
+    CreatePixelShaderFn createPixelShader = nullptr;
+    CreateInputLayoutFn createInputLayout = nullptr;
+};
+std::mutex deviceHooksMutex;
+std::vector<std::unique_ptr<DeviceHook>> deviceHooks;
+
+DeviceHook* device_hook(ID3D11Device* device) {
+    std::lock_guard guard(deviceHooksMutex);
+    for (const auto& hook : deviceHooks)
+        if (hook->device == device)
+            return hook.get();
+    return nullptr;
+}
+
+CreateVertexShaderFn original_vertex_shader(ID3D11Device* device) {
+    if (DeviceHook* hook = device_hook(device))
+        return hook->createVertexShader;
+    return nullptr;
+}
+CreatePixelShaderFn original_pixel_shader(ID3D11Device* device) {
+    if (DeviceHook* hook = device_hook(device))
+        return hook->createPixelShader;
+    return nullptr;
+}
+CreateInputLayoutFn original_input_layout(ID3D11Device* device) {
+    if (DeviceHook* hook = device_hook(device))
+        return hook->createInputLayout;
+    return nullptr;
+}
 std::atomic<bool> supportLogged{false};
 bool dump = false;
 bool attach = false;  // lmu_mvr=1: each game shader gets its converted twin as private data (kMvrTwinGuid)
@@ -178,7 +208,7 @@ Microsoft::WRL::ComPtr<ID3D11VertexShader> make_instanced(ID3D11Device* device, 
     Microsoft::WRL::ComPtr<ID3D11VertexShader> twin;
     HRESULT hr = E_FAIL;
     if (!iv.bytecode.empty())
-        hr = originalCreateVertexShader(device, iv.bytecode.data(), iv.bytecode.size(), nullptr, &twin);
+        hr = original_vertex_shader(device)(device, iv.bytecode.data(), iv.bytecode.size(), nullptr, &twin);
     const double ms = ms_since(start);
     std::lock_guard guard(statsMutex);
     stats.instancedMs += ms;
@@ -284,16 +314,14 @@ void examine(ID3D11Device* device, const uint8_t* code, size_t size, ID3D11Verte
 
 std::atomic<uint64_t> shaderGeneration{0};
 
-// The game's device points at a vtable copy with our shader creation (engine/object_vtable.h): d3d11.dll's code stays
-// as it is. D3D11's device creation is hooked only from xrCreateInstance to xrCreateSession (the game creates its first
-// shaders before its session), then removed.
-simqvfr::ObjectVtable deviceVtable;
-ID3D11Device* hookedDevice = nullptr;  // not referenced: compared only
+// Every game device points at its own vtable copy with our shader creation (engine/object_vtable.h): d3d11.dll's code
+// stays as it is. D3D11's device creation is hooked only from xrCreateInstance to xrCreateSession, then removed.
+ID3D11Device* hookedDevice = nullptr;  // first hooked device; not referenced, used for diagnostics only
 void* deviceCreation[2] = {};          // D3D11CreateDevice, D3D11CreateDeviceAndSwapChain while hooked
 
 HRESULT STDMETHODCALLTYPE create_vertex_shader(ID3D11Device* device, const void* code, SIZE_T size,
                                                ID3D11ClassLinkage* linkage, ID3D11VertexShader** shader) {
-    const HRESULT hr = originalCreateVertexShader(device, code, size, linkage, shader);
+    const HRESULT hr = original_vertex_shader(device)(device, code, size, linkage, shader);
     if (SUCCEEDED(hr) && code && size && !inProbe)
         examine(device, static_cast<const uint8_t*>(code), size, shader ? *shader : nullptr);
     uint32_t checksum[4];
@@ -341,7 +369,7 @@ HRESULT STDMETHODCALLTYPE create_vertex_shader(ID3D11Device* device, const void*
 // the same shader bytecode and attached for mvr_pass's doubled draws.
 HRESULT STDMETHODCALLTYPE create_input_layout(ID3D11Device* device, const D3D11_INPUT_ELEMENT_DESC* elements, UINT count,
                                               const void* code, SIZE_T size, ID3D11InputLayout** layout) {
-    const HRESULT hr = originalCreateInputLayout(device, elements, count, code, size, layout);
+    const HRESULT hr = original_input_layout(device)(device, elements, count, code, size, layout);
     if (FAILED(hr) || !layout || !*layout || !elements || !attach || inProbe)
         return hr;
     log_support(device, "first input layout");  // a layout may come before the first vertex shader
@@ -362,7 +390,7 @@ HRESULT STDMETHODCALLTYPE create_input_layout(ID3D11Device* device, const D3D11_
         if (e.InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA)
             e.InstanceDataStepRate *= 2;  // 0 (never steps) stays 0
     Microsoft::WRL::ComPtr<ID3D11InputLayout> twin;
-    if (SUCCEEDED(originalCreateInputLayout(device, doubled.data(), count, code, size, &twin)) && twin) {
+    if (SUCCEEDED(original_input_layout(device)(device, doubled.data(), count, code, size, &twin)) && twin) {
         (*layout)->SetPrivateDataInterface(kMvrInstancedLayoutGuid, twin.Get());
         perInstanceLayouts.fetch_add(1, std::memory_order_release);
         std::lock_guard guard(statsMutex);
@@ -374,7 +402,7 @@ HRESULT STDMETHODCALLTYPE create_input_layout(ID3D11Device* device, const D3D11_
 // YEBIS's copy and composite marked with their role (yebis_shaders.h), for the focus post (mvr_pass.cpp, focus_post.h).
 HRESULT STDMETHODCALLTYPE create_pixel_shader(ID3D11Device* device, const void* code, SIZE_T size,
                                               ID3D11ClassLinkage* linkage, ID3D11PixelShader** shader) {
-    const HRESULT hr = originalCreatePixelShader(device, code, size, linkage, shader);
+    const HRESULT hr = original_pixel_shader(device)(device, code, size, linkage, shader);
     if (FAILED(hr) || !shader || !*shader)
         return hr;
     const YebisRole role = noRoles ? YebisRole::none : yebis_role(code, size);
@@ -410,7 +438,7 @@ HRESULT STDMETHODCALLTYPE create_pixel_shader(ID3D11Device* device, const void* 
             const dxbc::FocusMipBias b = dxbc::add_focus_mip_bias(bytes, size);
             if (b.bytecode.empty())
                 refusedWhy = b.error;
-            else if (FAILED(originalCreatePixelShader(device, b.bytecode.data(), b.bytecode.size(), nullptr, &twin)))
+            else if (FAILED(original_pixel_shader(device)(device, b.bytecode.data(), b.bytecode.size(), nullptr, &twin)))
                 failed = true;
             std::lock_guard guard(twinMutex);
             biasTwins[id] = twin;
@@ -445,14 +473,14 @@ HRESULT STDMETHODCALLTYPE create_pixel_shader(ID3D11Device* device, const void* 
             const dxbc::SlotOutput s = dxbc::add_slot_output(bytes, size);
             if (s.bytecode.empty())
                 refusedWhy = s.error;
-            else if (FAILED(originalCreatePixelShader(device, s.bytecode.data(), s.bytecode.size(), nullptr, &pair.first)))
+            else if (FAILED(original_pixel_shader(device)(device, s.bytecode.data(), s.bytecode.size(), nullptr, &pair.first)))
                 ++failed;
             if (makeBiasTwins) {
                 const dxbc::FocusMipBias b = dxbc::add_focus_mip_bias(bytes, size);
                 const dxbc::SlotOutput sb = b.bytecode.empty() ? dxbc::SlotOutput{}
                                                                : dxbc::add_slot_output(b.bytecode.data(), b.bytecode.size());
                 if (!sb.bytecode.empty() &&
-                    FAILED(originalCreatePixelShader(device, sb.bytecode.data(), sb.bytecode.size(), nullptr, &pair.second)))
+                    FAILED(original_pixel_shader(device)(device, sb.bytecode.data(), sb.bytecode.size(), nullptr, &pair.second)))
                     ++failed;
             }
             std::lock_guard guard(twinMutex);
@@ -474,20 +502,35 @@ HRESULT STDMETHODCALLTYPE create_pixel_shader(ID3D11Device* device, const void* 
 }
 
 void hook_shaders(ID3D11Device* device, const char* when) {
-    if (!device || shaderHookTried.exchange(true))
+    if (!device)
         return;
-    const bool ok = deviceVtable.install(device, simqvfr::kD3D11DeviceSlots,
-                                         {{kCreateInputLayoutSlot, reinterpret_cast<void*>(&create_input_layout),
-                                           reinterpret_cast<void**>(&originalCreateInputLayout)},
-                                          {kCreateVertexShaderSlot, reinterpret_cast<void*>(&create_vertex_shader),
-                                           reinterpret_cast<void**>(&originalCreateVertexShader)},
-                                          {kCreatePixelShaderSlot, reinterpret_cast<void*>(&create_pixel_shader),
-                                           reinterpret_cast<void**>(&originalCreatePixelShader)}});
-    if (ok)
-        hookedDevice = device;
-    simqvfr::logf("lmu mvr probe: input layout, vertex and pixel shader creation %s (%s; the device on a vtable copy, %zu "
-                  "entries)",
-                  ok ? "hooked" : "NOT hooked", when, deviceVtable.slots());
+    std::lock_guard guard(deviceHooksMutex);
+    for (const auto& existing : deviceHooks)
+        if (existing->device == device) {
+            simqvfr::logf("lmu mvr probe: device %p already has shader creation hooked (%s)",
+                          static_cast<void*>(device), when);
+            return;
+        }
+
+    auto hook = std::make_unique<DeviceHook>();
+    hook->device = device;
+    const bool ok = hook->vtable.install(
+        device, simqvfr::kD3D11DeviceSlots,
+        {{kCreateInputLayoutSlot, reinterpret_cast<void*>(&create_input_layout),
+          reinterpret_cast<void**>(&hook->createInputLayout)},
+         {kCreateVertexShaderSlot, reinterpret_cast<void*>(&create_vertex_shader),
+          reinterpret_cast<void**>(&hook->createVertexShader)},
+         {kCreatePixelShaderSlot, reinterpret_cast<void*>(&create_pixel_shader),
+          reinterpret_cast<void**>(&hook->createPixelShader)}});
+    const std::size_t slots = hook->vtable.slots();
+    if (ok) {
+        if (!hookedDevice)
+            hookedDevice = device;
+        deviceHooks.push_back(std::move(hook));
+    }
+    simqvfr::logf("lmu mvr probe: input layout, vertex and pixel shader creation %s on device %p (%s; the device on a "
+                  "vtable copy, %zu entries; %zu devices hooked)",
+                  ok ? "hooked" : "NOT hooked", static_cast<void*>(device), when, slots, deviceHooks.size());
 }
 
 void unhook_device_creation() {
@@ -506,6 +549,13 @@ HRESULT WINAPI create_device(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODUL
                              const D3D_FEATURE_LEVEL* levels, UINT count, UINT sdk, ID3D11Device** device,
                              D3D_FEATURE_LEVEL* level, ID3D11DeviceContext** context) {
     const HRESULT hr = originalCreateDevice(adapter, type, software, flags, levels, count, sdk, device, level, context);
+    simqvfr::logf("lmu mvr probe: device census: D3D11CreateDevice hr=0x%08lx device=%p context=%p adapter=%p "
+                  "driverType=%u flags=0x%08x featureLevel=0x%04x",
+                  static_cast<unsigned long>(hr),
+                  device && *device ? static_cast<void*>(*device) : nullptr,
+                  context && *context ? static_cast<void*>(*context) : nullptr,
+                  static_cast<void*>(adapter), static_cast<unsigned>(type), static_cast<unsigned>(flags),
+                  level ? static_cast<unsigned>(*level) : 0u);
     if (SUCCEEDED(hr) && device && *device)
         hook_shaders(*device, "at D3D11CreateDevice");
     return hr;
@@ -518,6 +568,17 @@ HRESULT WINAPI create_device_and_swap_chain(IDXGIAdapter* adapter, D3D_DRIVER_TY
                                             ID3D11DeviceContext** context) {
     const HRESULT hr = originalCreateDeviceAndSwapChain(adapter, type, software, flags, levels, count, sdk, desc,
                                                         swapChain, device, level, context);
+    simqvfr::logf("lmu mvr probe: device census: D3D11CreateDeviceAndSwapChain hr=0x%08lx device=%p context=%p "
+                  "swapChain=%p adapter=%p driverType=%u flags=0x%08x featureLevel=0x%04x size=%ux%u format=%u",
+                  static_cast<unsigned long>(hr),
+                  device && *device ? static_cast<void*>(*device) : nullptr,
+                  context && *context ? static_cast<void*>(*context) : nullptr,
+                  swapChain && *swapChain ? static_cast<void*>(*swapChain) : nullptr,
+                  static_cast<void*>(adapter), static_cast<unsigned>(type), static_cast<unsigned>(flags),
+                  level ? static_cast<unsigned>(*level) : 0u,
+                  desc ? static_cast<unsigned>(desc->BufferDesc.Width) : 0u,
+                  desc ? static_cast<unsigned>(desc->BufferDesc.Height) : 0u,
+                  desc ? static_cast<unsigned>(desc->BufferDesc.Format) : 0u);
     if (SUCCEEDED(hr) && device && *device)
         hook_shaders(*device, "at D3D11CreateDeviceAndSwapChain");
     return hr;
@@ -571,21 +632,31 @@ bool mvr_probe_install(const wchar_t* ini, bool attachTwins, bool nameShaders) {
 }
 
 void mvr_probe_device(ID3D11Device* device) {
+    const bool alreadyHooked = device_hook(device) != nullptr;
+    simqvfr::logf("lmu mvr probe: device census: xrCreateSession device=%p firstHookedDevice=%p same=%d alreadyHooked=%d",
+                  static_cast<void*>(device), static_cast<void*>(hookedDevice),
+                  device && hookedDevice && device == hookedDevice ? 1 : 0, alreadyHooked ? 1 : 0);
     unhook_device_creation();
     log_support(device, "xrCreateSession");
-    if (hookedDevice && device != hookedDevice)
-        simqvfr::log_line("lmu mvr probe: the session's device isn't the first one created (the one hooked): its "
-                          "shaders aren't seen");
+    if (!alreadyHooked)
+        simqvfr::log_line("lmu mvr probe: the session's device wasn't hooked yet: shaders created before xrCreateSession "
+                          "aren't seen");
     hook_shaders(device, "at xrCreateSession: shaders created before it aren't seen");
 }
 
 void mvr_probe_frame_end() {
-    // The device's vtable is d3d11's and never changes (unlike the context's): its pointer replaced means another tool.
-    static bool copyLostLogged = false;
-    if (hookedDevice && !copyLostLogged && !deviceVtable.installed()) {
-        copyLostLogged = true;
-        simqvfr::log_line("lmu mvr probe: the device's vtable pointer was replaced since (another tool?): vertex shaders "
-                          "created from now on get no twin");
+    // A D3D11 device's vtable is stable. Report once for each hooked device if another tool replaces our copy.
+    static std::vector<ID3D11Device*> copyLostLogged;
+    {
+        std::lock_guard guard(deviceHooksMutex);
+        for (const auto& hook : deviceHooks) {
+            if (hook->vtable.installed() ||
+                std::find(copyLostLogged.begin(), copyLostLogged.end(), hook->device) != copyLostLogged.end())
+                continue;
+            copyLostLogged.push_back(hook->device);
+            simqvfr::logf("lmu mvr probe: device %p's vtable pointer was replaced since (another tool?): vertex shaders "
+                          "created from now on get no twin", static_cast<void*>(hook->device));
+        }
     }
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);

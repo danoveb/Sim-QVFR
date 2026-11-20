@@ -67,6 +67,11 @@ struct OsdInput {
     uint64_t vramUsed = 0, vramBudget = 0;  // bytes, 0: unknown
     OsdMultiView multiView = OsdMultiView::None;
     bool dlss = false;  // DLSS evaluated views since the card was last drawn (said beside the multi-view badge)
+    // A game's GPU regulator (RF2): the periphery and the focus density it has brought the set ones down to (percent), and by
+    // how many percentage points. While it runs, its row takes the render thread's place.
+    bool regulatorOn = false, regulatorPeriphery = false, regulatorFocus = false;
+    double regulatorPeripheryPercent = 0, regulatorDensityPercent = 0;
+    int regulatorCutPeriphery = 0, regulatorCutDensity = 0;
 };
 
 // What the card takes from Cheeky's runtime snapshot (CheekyRuntime_Snapshot's JSON): whether frame
